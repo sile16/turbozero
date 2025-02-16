@@ -1,0 +1,41 @@
+{
+  "os": "Linux-6.8.0-52-generic-x86_64-with-glibc2.35",
+  "python": "3.12.8",
+  "startedAt": "2025-02-14T02:22:35.407147Z",
+  "program": "<python with no main file>",
+  "git": {
+    "remote": "https://github.com/sile16/turbozero.git",
+    "commit": "74cdb9cbd736b396141df4a07db268f28b687f9a"
+  },
+  "email": "sile16@gmail.com",
+  "root": "/home/sile/github/turbozero/notebooks",
+  "host": "Jarvis",
+  "username": "sile",
+  "executable": "/home/sile/.cache/pypoetry/virtualenvs/turbozero-xeK5_s1I-py3.12/bin/python",
+  "cpu_count": 8,
+  "cpu_count_logical": 16,
+  "gpu": "NVIDIA GeForce RTX 4090",
+  "gpu_count": 1,
+  "disk": {
+    "/": {
+      "total": "980799373312",
+      "used": "458446233600"
+    }
+  },
+  "memory": {
+    "total": "67311407104"
+  },
+  "cpu": {
+    "count": 8,
+    "countLogical": 16
+  },
+  "gpu_nvidia": [
+    {
+      "name": "NVIDIA GeForce RTX 4090",
+      "memoryTotal": "25757220864",
+      "cudaCores": 16384,
+      "architecture": "Ada"
+    }
+  ],
+  "cudaVersion": "12.4"
+}

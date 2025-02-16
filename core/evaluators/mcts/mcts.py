@@ -228,8 +228,9 @@ class MCTS(Evaluator):
         )
 
 
-    def backpropagate(self, key: chex.PRNGKey, tree: MCTSTree, parent: int, value: float) -> MCTSTree: #pylint: disable=unused-argument
+    def backpropagate(self, key: chex.PRNGKey, tree: MCTSTree, parent: int, value: float) -> MCTSTree:
         """Backpropagate the value estimate from the leaf node to the root node and update visit counts.
+        Handles both regular nodes and stochastic (chance) nodes.
         
         Args:
         - `key`: rng
@@ -240,14 +241,31 @@ class MCTS(Evaluator):
         Returns:
         - (MCTSTree): updated search tree
         """
-
         def body_fn(state: BackpropState) -> Tuple[int, MCTSTree]:
             node_idx, value, tree = state.node_idx, state.value, state.tree
             # apply discount to value estimate
             value *= self.discount
             node = tree.data_at(node_idx)
-            # increment visit count and update value estimate
-            new_node = self.visit_node(node, value)
+            
+            if node.is_stochastic_node:
+                # For stochastic nodes (e.g., dice rolls):
+                # Get all child values
+                child_values = tree.get_child_data('q', node_idx)
+                child_visits = tree.get_child_data('n', node_idx)
+                
+                # Mask out unvisited children
+                valid_children = child_visits > 0
+                masked_values = jnp.where(valid_children, child_values, 0.0)
+                
+                # Compute expected value using predefined probabilities
+                value = jnp.sum(node.stochastic_probs * masked_values)
+                
+                # Update node (still increment visit count)
+                new_node = self.visit_node(node, value)
+            else:
+                # Regular game nodes - standard MCTS update
+                new_node = self.visit_node(node, value)
+                
             tree = tree.update_node(node_idx, new_node)
             # go to parent 
             return BackpropState(node_idx=tree.parents[node_idx], value=value, tree=tree)

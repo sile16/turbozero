@@ -297,15 +297,16 @@ class Trainer:
             )
         
         # store experience in replay buffer
-        buffer_state = self.memory_buffer.add_experience(
-            state = state.buffer_state,
-            experience = BaseExperience(
-                observation_nn=self.state_to_nn_input_fn(state.env_state),
-                policy_mask=state.metadata.action_mask,
-                policy_weights=eval_output.policy_weights,
-                reward=jnp.empty_like(state.metadata.rewards),
-                cur_player_id=state.metadata.cur_player_id
-            )
+        if cur_player_id > -1:
+            state.metadata.cur_player_id = self.memory_buffer.add_experience(
+                state = state.buffer_state,
+                experience = BaseExperience(
+                    observation_nn=self.state_to_nn_input_fn(state.env_state),
+                    policy_mask=state.metadata.action_mask,
+                    policy_weights=eval_output.policy_weights,
+                    reward=jnp.empty_like(state.metadata.rewards),
+                    cur_player_id=state.metadata.cur_player_id
+                )
         )
         # apply transforms 
         for transform_fn in self.transform_fns:
@@ -314,16 +315,17 @@ class Trainer:
                 eval_output.policy_weights,
                 state.env_state
             )
-            buffer_state = self.memory_buffer.add_experience(
-                state = buffer_state,
-                experience = BaseExperience(
-                    observation_nn=self.state_to_nn_input_fn(t_env_state),
-                    policy_mask=t_policy_mask,
-                    policy_weights=t_policy_weights,
-                    reward=jnp.empty_like(state.metadata.rewards),
-                    cur_player_id=state.metadata.cur_player_id
+            if state.metadata.cur_player_id > -1: 
+                buffer_state = self.memory_buffer.add_experience(
+                    state = buffer_state,
+                    experience = BaseExperience(
+                        observation_nn=self.state_to_nn_input_fn(t_env_state),
+                        policy_mask=t_policy_mask,
+                        policy_weights=t_policy_weights,
+                        reward=jnp.empty_like(state.metadata.rewards),
+                        cur_player_id=state.metadata.cur_player_id
+                    )
                 )
-            )
         # assign rewards to buffer if episode is terminated
         buffer_state = jax.lax.cond(
             terminated,
