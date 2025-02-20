@@ -1,0 +1,195 @@
+
+
+Walk through only the changes necessary to add chance nodes into this MCTS evaluator code.   We are using an LLM to help with this work. 
+
+Step1: Lets summarize the code down to what is needed so we are working with less code in each call to the LLM. 
+
+Here is the mcts 
+
+
+# state.py
+import chex
+from chex import dataclass
+import jax.numpy as jnp
+from core.evaluators.evaluator import EvalOutput
+from core.trees.tree import Tree
+
+@dataclass(frozen=True)
+class MCTSNode:
+    # Visit count, policy probabilities, cumulative value estimate, terminal flag, and state embedding.
+    n: jnp.number
+    p: chex.Array
+    q: jnp.number
+    terminated: jnp.number
+    embedding: chex.ArrayTree
+
+    @property
+    def w(self) -> jnp.number:
+        return self.q * self.n
+
+# The search tree is a Tree of MCTSNodes.
+MCTSTree = Tree[MCTSNode] 
+
+@dataclass(frozen=True)
+class TraversalState:
+    # Used during traversal: tracks parent node index and the action taken.
+    parent: int
+    action: int
+
+@dataclass(frozen=True)
+class BackpropState:
+    # Used during backpropagation: tracks node index, value to propagate, and the tree.
+    node_idx: int
+    value: float
+    tree: MCTSTree
+
+@dataclass(frozen=True)
+class MCTSOutput(EvalOutput):
+    # Final output: updated search tree and policy weights per action.
+    eval_state: MCTSTree
+    policy_weights: chex.Array
+
+
+# mcts.py File
+
+
+class MCTS:
+    def __init__(self, eval_fn, action_selector, branching_factor, max_nodes, num_iterations, discount, **kwargs):
+        self.eval_fn = eval_fn
+        self.action_selector = action_selector
+        self.branching_factor = branching_factor
+        self.max_nodes = max_nodes
+        self.num_iterations = num_iterations
+        self.discount = discount
+
+    def evaluate(self, key, tree, env_state, params, env_step_fn, root_metadata, **kwargs):
+        # Update the root node using the evaluation function.
+        key, root_key = jax.random.split(key)
+        tree = self.update_root(root_key, tree, env_state, params, root_metadata)
+        # Run multiple MCTS iterations.
+        for _ in range(self.num_iterations):
+            key, iter_key = jax.random.split(key)
+            tree = self.iterate(iter_key, tree, params, env_step_fn)
+        # Sample an action from the root based on visit counts.
+        action, policy_weights = self.sample_root_action(key, tree)
+        return tree, action, policy_weights
+
+    def update_root(self, key, tree, root_embedding, params, metadata):
+        # Evaluate the root state.
+        policy_logits, root_value = self.eval_fn(root_embedding, params, key)
+        root_policy = jax.nn.softmax(policy_logits)
+        # Update the root node with new policy, value, and embedding.
+        tree.root = self.update_root_node(tree.root, root_policy, root_value, root_embedding)
+        return tree
+
+    def iterate(self, key, tree, params, env_step_fn):
+        # Traverse from root to a leaf (or chance) node.
+        traversal_state = self.traverse(tree)
+        parent, action = traversal_state.parent, traversal_state.action
+
+        # Retrieve current state and step the environment.
+        embedding = tree.data_at(parent).embedding
+        new_embedding, metadata = env_step_fn(embedding, action)
+
+        # Evaluate the new state.
+        eval_key, key = jax.random.split(key)
+        policy_logits, value = self.eval_fn(new_embedding, params, eval_key)
+        policy = jax.nn.softmax(policy_logits)
+        # Adjust value if terminal.
+        value = jnp.where(metadata.terminated, metadata.rewards[metadata.cur_player_id], value)
+
+        # Expand or update the node.
+        if tree.is_edge(parent, action):
+            node_idx = tree.edge_map[parent, action]
+            node_data = self.visit_node(tree.data_at(node_idx), value, policy, metadata.terminated, new_embedding)
+            tree = tree.update_node(node_idx, node_data)
+        else:
+            node_data = self.new_node(policy, value, new_embedding, metadata.terminated)
+            tree = tree.add_node(parent, action, node_data)
+
+        # Backpropagate the value.
+        return self.backpropagate(key, tree, parent, value)
+
+    def traverse(self, tree):
+        """
+        Traverses the tree starting from the root.
+        NEW for chance nodes: if the current node is a chance node,
+        sample the outcome using its chance distribution.
+        """
+        # Start at the root.
+        node_idx = tree.ROOT_INDEX
+        # Choose an initial action.
+        action = self.action_selector(tree, node_idx, self.discount)
+        # Loop until reaching a node with no child or terminal.
+        while tree.is_edge(node_idx, action):
+            child_idx = tree.edge_map[node_idx, action]
+            node = tree.data_at(child_idx)
+            # --- CHANCE NODE HOOK ---
+            if hasattr(node, "is_chance_node") and node.is_chance_node:
+                # Instead of using the regular action_selector, sample using chance probabilities.
+                action = sample_chance_action(node.chance_probs)
+            else:
+                action = self.action_selector(tree, node_idx, self.discount)
+            # Terminate if the child node is terminal.
+            if node.terminated:
+                break
+            node_idx = child_idx
+        return TraversalState(parent=node_idx, action=action)
+
+    def backpropagate(self, key, tree, parent, value):
+        # Propagate the value back from the leaf to the root.
+        while parent != tree.NULL_INDEX:
+            node = tree.data_at(parent)
+            node = self.visit_node(node, value)
+            tree = tree.update_node(parent, node)
+            parent = tree.parents[parent]
+            # Apply discount at each step.
+            value *= self.discount
+        return tree
+
+    @staticmethod
+    def visit_node(node, value, policy=None, terminated=None, embedding=None):
+        # Update visit count and Q-value.
+        new_n = node.n + 1
+        new_q = ((node.q * node.n) + value) / new_n
+        return node.replace(
+            n=new_n,
+            q=new_q,
+            p=policy if policy is not None else node.p,
+            terminated=terminated if terminated is not None else node.terminated,
+            embedding=embedding if embedding is not None else node.embedding
+        )
+
+    @staticmethod
+    def new_node(policy, value, embedding, terminated):
+        # Create a new node.
+        return MCTSNode(
+            n=jnp.array(1, dtype=jnp.int32),
+            p=policy,
+            q=jnp.array(value, dtype=jnp.float32),
+            terminated=jnp.array(terminated, dtype=jnp.bool_),
+            embedding=embedding
+        )
+
+    @staticmethod
+    def update_root_node(root_node, root_policy, root_value, root_embedding):
+        # Update the root node with the evaluated results.
+        visited = root_node.n > 0
+        return root_node.replace(
+            p=root_policy,
+            q=jnp.where(visited, root_node.q, root_value),
+            n=jnp.where(visited, root_node.n, 1),
+            embedding=root_embedding
+        )
+
+    def sample_root_action(self, key, tree):
+        # Compute policy weights based on the root's visit counts.
+        action_visits = tree.get_child_data('n', tree.ROOT_INDEX)
+        total = action_visits.sum()
+        policy_weights = action_visits / jnp.maximum(total, 1)
+        # Temperature handling omitted for brevity.
+        action = jnp.argmax(policy_weights)
+        return action, policy_weights
+
+
+# Action Selection

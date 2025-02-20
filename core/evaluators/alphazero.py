@@ -96,3 +96,6 @@ class AlphaZero(MCTS):
         cls_type = type("AlphaZero", (_AlphaZero, base_type), {})
         cls_type.__name__ = f'AlphaZero({base_type.__name__})'
         return cls_type
+
+
+##### Move to stochastic AlphaZero.py file later

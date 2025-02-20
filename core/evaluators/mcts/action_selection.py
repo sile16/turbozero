@@ -3,6 +3,7 @@ from typing import Dict
 
 import chex
 import jax.numpy as jnp
+import jax
 
 from core.evaluators.mcts.state import MCTSTree
 
@@ -175,3 +176,55 @@ class MuZeroPUCTSelector(MCTSActionSelector):
         puct_values = q_values + u_values
         # select action with highest PUCT value
         return puct_values.argmax()
+
+
+class BackgammonDiceSelector(MCTSActionSelector):
+    """Specialized chance node selector for backgammon dice rolls.
+    
+    Uses the MCTS temperature parameter to control exploration vs exploitation:
+    - Higher temperature (→1) increases exploration of less-visited paths
+    - Lower temperature (→0) focuses on maintaining probabilistic sampling
+    
+    Args:
+        temperature: Reuses the MCTS temperature parameter (0-1)
+    """
+
+    def __init__(self, tiebreak_noise: float = 1e-8):
+        super().__init__()
+        self.tiebreak_noise = tiebreak_noise
+    
+    def __call__(self, tree: MCTSTree, index: int, probabilities: chex.Array, key: chex.PRNGKey, temperature: float) -> int:
+        # Get visit counts for outcomes
+        visit_counts = tree.get_child_data('n', index)
+        parent_visits = tree.data_at(index).n
+        
+        # Calculate target visits based on probability
+        target_visits = probabilities * parent_visits
+        
+        # Calculate visit deficit (how far below expected visits)
+        visit_deficit = jnp.maximum(target_visits - visit_counts, 0)
+        
+        # Scale exploration bonus by temperature
+        # Higher temperature = more emphasis on exploration
+        # Lower temperature = more emphasis on probability
+        unvisited_bonus = (visit_counts == 0) * temperature * 2.0
+        
+        # For very low temperatures (near 0), just sample by probability
+        temperature_threshold = 0.05
+        use_pure_probability = temperature < temperature_threshold
+        
+        def probability_sampling():
+            # Add tiny noise to break ties while respecting probabilities
+            return jax.random.choice(key, len(probabilities), p=probabilities)
+            
+        def deficit_based_sampling():
+            # Add small noise to break ties
+            noise = jax.random.uniform(key, shape=visit_deficit.shape, maxval=1e-6)
+            selection_score = visit_deficit + unvisited_bonus + noise
+            return jnp.argmax(selection_score)
+        
+        return jax.lax.cond(
+            use_pure_probability,
+            probability_sampling,
+            deficit_based_sampling
+        )

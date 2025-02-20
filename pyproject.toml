@@ -29,9 +29,10 @@ flax = "^0.8.4"
 optax = "^0.1.8"
 orbax-checkpoint = "^0.10.1"
 chex = "^0.1.85"
-pgx = "^2.0.1"
+#pgx = "^2.0.1"
 dm-haiku = "^0.0.12"
 cairosvg = "^2.7.1"
+pgx = {path = "/home/sile/github/pgx"}
 
 [tool.poetry.group.dev.dependencies]
 ipykernel = "^6.25.1"

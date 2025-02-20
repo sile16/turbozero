@@ -1432,15 +1432,17 @@ version = "2.5.0"
 description = ""
 optional = false
 python-versions = "*"
-files = [
-    {file = "pgx-2.5.0-py3-none-any.whl", hash = "sha256:34935ad8194c6092075a5ec8ec57c3068eaade9142e10d860a145d1f662a0d27"},
-    {file = "pgx-2.5.0.tar.gz", hash = "sha256:f8785b9bc112a4d53c37de17f426a9b5a25091b0bb48bb600a103fe504a0bc34"},
-]
+files = []
+develop = false
 
 [package.dependencies]
 jax = ">=0.4.6"
 svgwrite = "*"
 typing_extensions = ">=4.2.0"
+
+[package.source]
+type = "directory"
+url = "../pgx"
 
 [[package]]
 name = "pillow"
@@ -2550,4 +2552,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.0"
 python-versions = "^3.10"
-content-hash = "30c76c9a47c8f4746c97a4439c6972eb4ca888662b7de96eba2c5d64d2ba631c"
+content-hash = "f4558a5d704af136efc43ac2bfe771c6ec67e32eaaa42e9f8ab8a9789fe43919"
