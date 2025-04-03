@@ -20,7 +20,7 @@ url = "https://storage.googleapis.com/jax-releases/jax_cuda_releases.html"
 priority = "primary"
 
 [tool.poetry.dependencies]
-python = "^3.10"
+python = "^3.12"
 graphviz = "^0.20.1"
 wandb = "^0.18.6"
 jax = "0.4.35"
@@ -29,7 +29,7 @@ flax = "^0.8.4"
 optax = "^0.1.8"
 orbax-checkpoint = "^0.10.1"
 chex = "^0.1.85"
-pgx = "^2.0.1"
+pgx = { path = "../pgx", develop = true }
 dm-haiku = "^0.0.12"
 cairosvg = "^2.7.1"
 
