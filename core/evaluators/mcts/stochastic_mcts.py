@@ -1218,9 +1218,9 @@ class StochasticMCTS(Evaluator):
         params: chex.ArrayTree,
         env_step_fn: EnvStepFn,
         root_metadata: StepMetadata
-    ) -> Tuple[StochasticMCTSTree, chex.Array, chex.Array]:
+    ) -> Tuple[StochasticMCTSTree, int, chex.Array]:
         """Handles the case where the root node is stochastic.
-
+        
         UPDATED DESIGN: Samples a stochastic action and returns it immediately.
         Does NOT perform MCTS search or step the environment.
 
@@ -1234,27 +1234,27 @@ class StochasticMCTS(Evaluator):
             root_metadata: Metadata for the stochastic root (unused in this path).
 
         Returns:
-            Tuple[StochasticMCTSTree, chex.Array, chex.Array]:
+            Tuple[StochasticMCTSTree, int, chex.Array]:
                 - Unchanged eval_state.
                 - Sampled stochastic action index (as JAX array).
-                - Stochastic action probabilities as policy weights (as JAX array).
+                - Dummy policy weights (e.g., uniform). 
         """
-        debug_print("_select_from_stochastic_root entered (UPDATED DESIGN)", level=1)
-
-        # 1. Sample a stochastic action
-        stochastic_action = jax.random.choice(
-            key=root_key, # Use the main key passed to the function
-            a=jnp.arange(len(self.stochastic_action_probs)),
+        debug_print("Selecting stochastic action from root without search", level=1)
+        num_stochastic_outcomes = len(self.stochastic_action_probs)
+        
+        # --- Sample a stochastic outcome --- 
+        sampled_stochastic_action_idx = jax.random.choice(
+            key=root_key, 
+            a=jnp.arange(num_stochastic_outcomes), 
             p=self.stochastic_action_probs
         )
-        debug_print(f"_select_from_stochastic_root: Sampled stochastic action {stochastic_action}", level=1)
+        debug_print(f"_select_from_stochastic_root: Sampled stochastic action index: {sampled_stochastic_action_idx}", level=1)
 
-        # 2. For stochastic roots, policy weights don't have meaning
-        # Just return a zero array with the same shape as the deterministic case
-        policy_weights = jnp.zeros(self.branching_factor, dtype=jnp.float32)
+        # Create dummy policy weights (not used for selection here)
+        dummy_policy = jnp.zeros(self.branching_factor)
 
-        # 3. Return the unchanged eval_state, the sampled action, and the zero policy weights
-        return eval_state, stochastic_action, policy_weights
+        # Return the original tree state, the sampled stochastic action, and dummy policy
+        return eval_state, sampled_stochastic_action_idx, dummy_policy
 
     def _evaluate_deterministic_root(self,
         root_key: chex.PRNGKey,
