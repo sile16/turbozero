@@ -1,4 +1,3 @@
-
 from typing import Dict
 
 import chex
@@ -112,8 +111,16 @@ class PUCTSelector(MCTSActionSelector):
         u_values = self.c * node.p * jnp.sqrt(node.n) / (n_values + 1)
         # PUCT = Q-value + U-value
         puct_values = q_values + u_values
-        # select action with highest PUCT value
-        return puct_values.argmax()
+        
+        # === FIX: Apply legal action mask ===
+        # Get the legal action mask from the node's embedding
+        legal_action_mask = node.embedding.legal_action_mask
+        # Mask out illegal actions by setting their PUCT value to negative infinity
+        masked_puct_values = jnp.where(legal_action_mask, puct_values, jnp.finfo(puct_values.dtype).min)
+        # === END FIX ===
+        
+        # select action with highest PUCT value (from legal actions)
+        return masked_puct_values.argmax()
     
 
 class MuZeroPUCTSelector(MCTSActionSelector):
@@ -173,5 +180,13 @@ class MuZeroPUCTSelector(MCTSActionSelector):
         u_values = base_term * log_term
         # PUCT = Q-value + U-value
         puct_values = q_values + u_values
-        # select action with highest PUCT value
-        return puct_values.argmax()
+        
+        # === FIX: Apply legal action mask ===
+        # Get the legal action mask from the node's embedding
+        legal_action_mask = node.embedding.legal_action_mask
+        # Mask out illegal actions by setting their PUCT value to negative infinity
+        masked_puct_values = jnp.where(legal_action_mask, puct_values, jnp.finfo(puct_values.dtype).min)
+        # === END FIX ===
+        
+        # select action with highest PUCT value (from legal actions)
+        return masked_puct_values.argmax()

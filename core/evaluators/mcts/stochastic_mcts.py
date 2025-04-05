@@ -387,6 +387,20 @@ class StochasticMCTS(Evaluator):
         policy_logits = jnp.where(new_metadata.action_mask, policy_logits, jnp.finfo(policy_logits).min)
         policy = jax.nn.softmax(policy_logits)
         
+        # === FIX: If the new node represents a stochastic state, don't use its NaN policy ===
+        # Store zeros instead. The selection should rely on Q-values once visits happen.
+        policy = jnp.where(is_new_node_stochastic, 
+                           jnp.zeros_like(policy), 
+                           policy)
+        # === END FIX ===
+
+        # === ADDED DEBUG: Log mask and policy before node creation/update ===
+        debug_print(f"  _expand_deterministic_node: For parent={parent_idx}, action={action}", level=1)
+        debug_print(f"    New node mask (first 10): {new_metadata.action_mask[:10]}", level=1)
+        debug_print(f"    New node policy (first 10): {policy[:10]}", level=1)
+        debug_print(f"    Is Action 0 legal in new mask? {new_metadata.action_mask[0]}", level=1)
+        # === END DEBUG ===
+
         # Check if we've already seen this node
         existing_node_idx = tree.edge_map[parent_idx, action]
         node_exists = tree.is_edge(parent_idx, action)
@@ -727,6 +741,18 @@ class StochasticMCTS(Evaluator):
             debug_print(f"In body_fn with parent={state.parent}, action={state.action}")
             # We know from cond_fn that the edge exists and the child is deterministic & not terminal
             node_idx = tree.edge_map[state.parent, state.action]
+            
+            # === ADDED DEBUG: Log policy and mask for the current node ===
+            current_node_data = tree.data_at(node_idx)
+            current_policy = current_node_data.p
+            current_embedding = current_node_data.embedding
+            current_mask = current_embedding.legal_action_mask
+            debug_print(f"  Node {node_idx} data for selection:", level=1)
+            debug_print(f"    Policy (first 10): {current_policy[:10]}", level=1) # Show subset
+            debug_print(f"    Legal Mask (first 10): {current_mask[:10]}", level=1) # Show subset
+            debug_print(f"    Is No-Op (Action 0) legal? {current_mask[0]}", level=1)
+            # === END DEBUG ===
+            
             # Select the action from this deterministic child node
             try:
                 action = self.action_selector(tree, node_idx, self.discount)

@@ -85,7 +85,34 @@ def tree_to_graph(eval_state):
                 print(f"DEBUG - Node {node_idx} has no children")
         
         # Create node label
-        label = f"Node {node_idx}\nVisits: {visit_count}\nQ: {q_value:.4f}"
+        label = f"Node {node_idx}\\nVisits: {visit_count}\\nQ: {q_value:.4f}"
+        # Add policy visualization (top 3 actions for brevity)
+        if hasattr(node_data, 'p') and node_data.p is not None and visit_count > 0: # Only show for visited nodes with policy
+            try:
+                # Ensure policy is numpy array for sorting
+                policy_array = np.array(node_data.p) 
+                # Get indices of top k probabilities
+                top_k = 3
+                top_indices = np.argsort(policy_array)[-top_k:][::-1]
+                policy_str_parts = []
+                for idx in top_indices:
+                    prob = policy_array[idx]
+                    if prob > 0.001: # Threshold to avoid tiny noise
+                         # Attempt to get action string, fallback to index
+                         try:
+                             # Determine if the node itself is stochastic to hint at action type
+                             is_stochastic_node = tree.node_is_stochastic[node_idx] if hasattr(tree, 'node_is_stochastic') else False
+                             if is_stochastic_node:
+                                 action_label = bg.stochastic_action_to_str(idx)
+                             else:
+                                 action_label = bg.action_to_str(idx)
+                         except:
+                             action_label = f"A:{idx}" # Fallback label
+                         policy_str_parts.append(f"{action_label}={prob:.2f}")
+                if policy_str_parts:
+                    label += "\\nPolicy: " + ", ".join(policy_str_parts)
+            except Exception as e:
+                 label += "\\nPolicy: (Error)" # Indicate if policy parsing failed
         
         # Set node style - simplified to just deterministic vs stochastic
         is_stochastic = tree.node_is_stochastic[node_idx] if hasattr(tree, 'node_is_stochastic') else False
@@ -245,8 +272,8 @@ def create_real_mcts_visualization(output_dir):
 
     visualization_frames = []
     frame_idx = 0
-    total_turns = 2 # Reduced to 2 turns for faster testing
-    iterations_per_deterministic_turn = 5 # Reduced to 5 iterations for faster visualization
+    total_turns = 3 # Reduced to 2 turns for faster testing
+    iterations_per_deterministic_turn = 15 # Reduced to 5 iterations for faster visualization
 
     # Keep track of the latest board SVG paths relative to output_dir
     last_saved_curr_board_path = None
@@ -383,6 +410,21 @@ def create_real_mcts_visualization(output_dir):
                     print(f"      DEBUG: State causing no-op consideration:\n{state}") 
                     # --- END ADDED DEBUG ---
                 # --- END DEBUG ---
+                
+                # === ADDED DEBUG: Inspect Node 1 after iteration ===
+                if eval_state.next_free_idx > 1: # Check if node 1 exists
+                    try:
+                        node1_data = eval_state.data_at(1)
+                        node1_policy = np.array(node1_data.p) # Convert to numpy for printing
+                        node1_mask = np.array(node1_data.embedding.legal_action_mask)
+                        print(f"    DEBUG: Inspecting Node 1 (after iter {iteration+1}):")
+                        print(f"      Node 1 Policy (Top 5): {np.argsort(node1_policy)[-5:][::-1]}") # Indices of top 5
+                        print(f"      Node 1 Policy Probs (Top 5): {np.sort(node1_policy)[-5:][::-1]}")
+                        print(f"      Node 1 Mask (first 10): {node1_mask[:10]}")
+                        print(f"      Node 1 Mask[0] (No-Op Legal?): {node1_mask[0]}")
+                    except Exception as e:
+                        print(f"    DEBUG: Error inspecting Node 1: {e}")
+                # === END DEBUG ===
 
                 # Simple tree size check without JAX callbacks
                 print(f"    DEBUG: After iteration {iteration+1}, tree size: {eval_state.next_free_idx}")
