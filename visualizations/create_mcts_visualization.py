@@ -104,14 +104,28 @@ def tree_to_graph(eval_state):
             if child_node_idx != -1:  # Valid edge
                 child_id = str(child_node_idx)
                 
-                # Format edge label
+                # Format edge label - MODIFIED LOGIC
                 try:
-                    if tree.node_is_stochastic[node_idx]:
+                    # Default to parent's type
+                    use_stochastic_str = tree.node_is_stochastic[node_idx] if hasattr(tree, 'node_is_stochastic') else False
+                    # If child exists and tree has stochastic info, check child's type
+                    if hasattr(tree, 'node_is_stochastic'):
+                         # Ensure child_node_idx is valid before accessing
+                         # We know child_node_idx != -1, but check against next_free_idx as well for safety
+                         if child_node_idx < tree.next_free_idx:
+                             use_stochastic_str = tree.node_is_stochastic[child_node_idx]
+
+                    if use_stochastic_str:
                         action_str = bg.stochastic_action_to_str(action)
                     else:
                         action_str = bg.action_to_str(action)
+                except IndexError:
+                     # Handle cases where action index might be out of bounds for the specific to_str function
+                     action_str = f"Action: {action} (Invalid?)"
                 except Exception as e:
-                    action_str = f"Action: {action}"
+                    # Catch other potential errors during string conversion
+                    print(f"WARN: Error converting action {action} to string for edge from node {node_idx} to {child_node_idx}: {e}")
+                    action_str = f"Action: {action} (Error)"
                 
                 edge_label = action_str
                 graph.edge(node_id, child_id, label=edge_label)
