@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 from typing import Tuple, TypeVar, Generic, ClassVar
 import chex
@@ -126,7 +125,7 @@ class Tree(Generic[NodeType]):
             next_free_idx=jnp.where(in_bounds, self.next_free_idx + 1, self.next_free_idx),
             parents=self.parents.at[self.next_free_idx].set(parent_index),
             edge_map=self.edge_map.at[parent_index, edge_index].set(edge_map_index),
-            data=jax.tree_map(
+            data=jax.tree_util.tree_map(
                 lambda x, y: x.at[self.next_free_idx].set(y),
                 self.data, data)
         )
@@ -145,7 +144,7 @@ class Tree(Generic[NodeType]):
 
         return self.replace( #pylint: disable=no-member
             next_free_idx=jnp.maximum(self.next_free_idx, 1),
-            data=jax.tree_map(
+            data=jax.tree_util.tree_map(
                 lambda x, y: x.at[self.ROOT_INDEX].set(y),
                 self.data, data))
     
@@ -257,7 +256,7 @@ class Tree(Generic[NodeType]):
                     translation[x])))
 
         def translate_pytree(x, null_value=self.NULL_VALUE):
-            return jax.tree_map(
+            return jax.tree_util.tree_map(
                 lambda t: translate(t, null_value=null_value), x)
         
         # extract subtree using translation functions
@@ -275,7 +274,7 @@ class Tree(Generic[NodeType]):
             next_free_idx=0,
             parents=jnp.full_like(self.parents, self.NULL_INDEX),
             edge_map=jnp.full_like(self.edge_map, self.NULL_INDEX),
-            data=jax.tree_map(jnp.zeros_like, self.data))
+            data=jax.tree_util.tree_map(jnp.zeros_like, self.data))
     
 
 def init_tree(max_nodes: int, branching_factor: int, template_data: NodeType) -> Tree:

@@ -1,4 +1,3 @@
-
 from functools import partial
 import os
 import shutil
@@ -457,12 +456,46 @@ class Trainer:
         - `epoch`: current epoch
         - `step`: current step
         """
+        # Flatten metrics dict if it contains nested dictionaries
+        flat_metrics = {}
+        for k, v in metrics.items():
+            if isinstance(v, dict):
+                for sub_k, sub_v in v.items():
+                    flat_metrics[f"{k}/{sub_k}"] = sub_v
+            else:
+                flat_metrics[k] = v
+                
+        # Extract key metrics for console display
+        console_metrics = {}
+        for k, v in flat_metrics.items():
+            # Only show scalar values in console output
+            if hasattr(v, 'item') and callable(getattr(v, 'item')):
+                console_metrics[k] = f"{v.item():.4f}"
+            elif isinstance(v, (int, float)):
+                console_metrics[k] = f"{v:.4f}"
+        
         # log to console
-        metrics_str = {k: f"{v.item():.4f}" for k, v in metrics.items()}
-        print(f"Epoch {epoch}: {metrics_str}")
+        print(f"Epoch {epoch}: {console_metrics}")
+        
         # log to wandb
         if self.use_wandb:
-            wandb.log(metrics, step)
+            # Add epoch as a metric
+            wandb_metrics = {k: v for k, v in flat_metrics.items()}
+            wandb_metrics['epoch'] = epoch
+            
+            # Add training metrics with better organization
+            if 'loss' in wandb_metrics:
+                wandb_metrics['training/loss'] = wandb_metrics.pop('loss')
+            if 'policy_loss' in wandb_metrics:
+                wandb_metrics['training/policy_loss'] = wandb_metrics.pop('policy_loss')
+            if 'value_loss' in wandb_metrics:
+                wandb_metrics['training/value_loss'] = wandb_metrics.pop('value_loss')
+                
+            # Add evaluation metrics with better organization
+            if 'greedy_avg_outcome' in wandb_metrics:
+                wandb_metrics['evaluation/greedy_avg_outcome'] = wandb_metrics.pop('greedy_avg_outcome')
+                
+            wandb.log(wandb_metrics, step)
 
 
     def save_checkpoint(self, train_state: TrainState, epoch: int) -> None:
