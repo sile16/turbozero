@@ -194,8 +194,10 @@ def test_step_stochastic(stochastic_mcts, backgammon_env, mock_params, key):
     # Get the next game state to check if it's stochastic using the step_fn closure
     next_state, _ = step_fn(initial_state, action, step_key)
 
-    # Assertions
-    if expected_child_idx != -1:
+    # Assertions - use jnp.equal for JAX array comparison rather than Python's != operator
+    child_exists = tree.is_edge(initial_root_idx, action)
+    
+    if child_exists:
         # The MCTS tree moved to the child node
         assert new_tree.ROOT_INDEX == expected_child_idx
         assert new_tree.parents[new_tree.ROOT_INDEX] == -1
@@ -251,7 +253,9 @@ def test_tree_persistence(stochastic_mcts, non_persistent_mcts, backgammon_env, 
     
     new_tree_p = stochastic_mcts.step(tree_p, action_p)
     
-    if expected_child_idx_p != -1:
+    # Use tree's is_edge method for proper JAX array comparison
+    child_exists_p = tree_p.is_edge(tree_p.ROOT_INDEX, action_p)
+    if child_exists_p:
         assert new_tree_p.ROOT_INDEX == expected_child_idx_p
         assert new_tree_p.parents[new_tree_p.ROOT_INDEX] == -1
         print("Persistent step: Root moved as expected.")
