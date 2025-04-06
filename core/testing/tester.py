@@ -1,4 +1,3 @@
-
 from functools import partial
 from typing import Callable, Dict, Optional, Tuple
 
@@ -103,18 +102,22 @@ class BaseTester:
             state, metrics, frames, p_ids = self.test(max_steps, env_step_fn, \
                                                       env_init_fn, evaluator, keys, state, params)
             
-            if self.render_fn is not None:
-                # render first episode to .gif
-                # get frames from first episode
-                frames = jax.tree_map(lambda x: x[0], frames)
-                # get player ids from first episode
-                p_ids = p_ids[0]
-                # get list of frames
-                frame_list = [jax.device_get(jax.tree_map(lambda x: x[i], frames)) for i in range(max_steps)]
-                # render frames to .gif
-                path_to_rendering = self.render_fn(frame_list, p_ids, f"{self.name}_{epoch_num}", self.render_dir)
-            else:
-                path_to_rendering = None
+            # Render frames if render function provided
+            path_to_rendering = None
+            if self.render_dir is not None and self.render_fn is not None:
+                # Process frames: Extract frame data for each step
+                # Remove jax.device_get to keep frames as JAX arrays for pgx rendering
+                frame_list = [jax.tree.map(lambda x: x[i], frames) for i in range(max_steps)] 
+                # Convert player IDs to NumPy for the render function if needed (p_ids usually small)
+                p_ids_np = jax.device_get(p_ids)
+                try:
+                    path_to_rendering = self.render_fn(frame_list, p_ids_np, f"{self.name}_{epoch_num}", self.render_dir)
+                except Exception as e:
+                    print(f"Rendering failed for tester {self.name}: {e}")
+                    # Optionally log traceback
+                    # import traceback
+                    # traceback.print_exc()
+                    path_to_rendering = None # Ensure path is None if rendering fails
             return state, metrics, path_to_rendering
         
     
