@@ -890,6 +890,28 @@ def test_backgammon_ennv(stochastic_mcts, backgammon_env, mock_params, key):
     # make sure no-op is not legal
     for x in range(6):
         assert not state.legal_action_mask[x]
+
+    # try new one
+
+    state = backgammon_env.init(key)
+    state = backgammon_env.stochastic_step(state, 2)
+    #legal_actions = state.legal_actions_mask
+    #for i in range(len(state.legal_action_mask)):
+    #    if state.legal_action_mask[i]:
+    #        print(f"Legal action {i} : {action_to_str(i)}" )
+    key, step_key = jax.random.split(key, 2)
+    state = backgammon_env.step(state, 80, step_key) # 12/15
+    state = backgammon_env.step(state, 110, step_key) # 17/20
+    state = backgammon_env.step(state, 14, step_key) # 1/4
+    state = backgammon_env.step(state, 14, step_key) # 1/4
+
+    # is node stochastic? 
+    
+
+    # make sure no-op is not legal
+    for x in range(6):
+        assert not state.legal_action_mask[x]
+    
     
 
     print("test_backgammon_ennv PASSED")

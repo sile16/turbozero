@@ -34,7 +34,7 @@ from core.types import StepMetadata
 backgammon_env = bg.Backgammon(simple_doubles=True)
 print("Backgammon environment initialized.")
 
-def tree_to_graph(eval_state):
+def tree_to_graph(eval_state, output_dir, boards_dir):
     """Convert a tree to a Graphviz graph."""
     tree = eval_state  # The eval_state is the tree itself
     
@@ -52,7 +52,7 @@ def tree_to_graph(eval_state):
                 print(f"  Edge {i}--{j}-->{target}")
     
     graph = graphviz.Digraph('MCTS Tree', format='svg')
-    graph.attr(rankdir='LR')
+    graph.attr(rankdir='TD')
     graph.attr('node', shape='box', style='filled', fillcolor='lightblue')
     
     # Add root node
@@ -84,8 +84,13 @@ def tree_to_graph(eval_state):
             else:
                 print(f"DEBUG - Node {node_idx} has no children")
         
+        # === ADDED DEBUG for Visit Count ===
+        print(f"  GRAPH_TRACE - Node {node_idx}: Visit count for label = {visit_count}")
+        # === END DEBUG ===
+        
         # Create node label
-        label = f"Node {node_idx}\\nVisits: {visit_count}\\nQ: {q_value:.4f}"
+        player_id = node_data.embedding.current_player if hasattr(node_data.embedding, 'current_player') else 'N/A'
+        label = f"Node {node_idx}\\nPlayer: {player_id} (0=W, 1=B)\\nVisits: {visit_count}\\nQ: {q_value:.4f}"
         # Add policy visualization (top 3 actions for brevity)
         if hasattr(node_data, 'p') and node_data.p is not None and visit_count > 0: # Only show for visited nodes with policy
             try:
@@ -123,6 +128,30 @@ def tree_to_graph(eval_state):
         else:
             fillcolor = 'lightblue'   # Deterministic nodes
         
+        # === Add Board SVG Tooltip ===
+        try:
+            if hasattr(node_data, 'embedding') and node_data.embedding is not None:
+                board_state = node_data.embedding
+                # Check if it looks like a valid state object (simple check)
+                if hasattr(board_state, 'to_svg'): 
+                    board_svg_str = board_state.to_svg()
+                    board_filename_rel = os.path.join("boards", f"board_node_{node_idx}.svg")
+                    board_filename_abs = os.path.join(output_dir, board_filename_rel)
+                    save_svg_string(board_svg_str, board_filename_abs)
+                    # Update the node with the tooltip
+                    graph.node(node_id, label=label, fillcolor=fillcolor, tooltip=board_filename_rel) 
+                else:
+                     # Add node without tooltip if embedding is not a state
+                     graph.node(node_id, label=label, fillcolor=fillcolor)
+            else:
+                 # Add node without tooltip if no embedding
+                 graph.node(node_id, label=label, fillcolor=fillcolor)
+        except Exception as e:
+             print(f"WARN: Failed to generate/save board SVG for node {node_idx}: {e}")
+             # Add node without tooltip on error
+             graph.node(node_id, label=label, fillcolor=fillcolor)
+        # === END Add Board SVG Tooltip ===
+        
         graph.node(node_id, label=label, fillcolor=fillcolor)
         
         # Add edges to children
@@ -131,30 +160,33 @@ def tree_to_graph(eval_state):
             if child_node_idx != -1:  # Valid edge
                 child_id = str(child_node_idx)
                 
-                # Format edge label - MODIFIED LOGIC
+                # Format edge label - REFINED LOGIC
                 try:
-                    # Default to parent's type
-                    use_stochastic_str = tree.node_is_stochastic[node_idx] if hasattr(tree, 'node_is_stochastic') else False
-                    # If child exists and tree has stochastic info, check child's type
-                    if hasattr(tree, 'node_is_stochastic'):
-                         # Ensure child_node_idx is valid before accessing
-                         # We know child_node_idx != -1, but check against next_free_idx as well for safety
-                         if child_node_idx < tree.next_free_idx:
-                             use_stochastic_str = tree.node_is_stochastic[child_node_idx]
-
-                    if use_stochastic_str:
-                        action_str = bg.stochastic_action_to_str(action)
+                    is_parent_stochastic = tree.node_is_stochastic[node_idx] if hasattr(tree, 'node_is_stochastic') else False
+                    if is_parent_stochastic:
+                        # Parent is stochastic, action selects a stochastic outcome
+                        try:
+                            action_str = bg.stochastic_action_to_str(action)
+                        except IndexError:
+                             action_str = f"StochAction: {action} (Invalid Idx)" # Stochastic index out of range?
+                        except Exception as inner_e:
+                             action_str = f"StochAction: {action} (Err: {inner_e})"
                     else:
-                        action_str = bg.action_to_str(action)
-                except IndexError:
-                     # Handle cases where action index might be out of bounds for the specific to_str function
-                     action_str = f"Action: {action} (Invalid?)"
+                        # Parent is deterministic, action is a game move
+                        try:
+                            action_str = bg.action_to_str(action)
+                        except IndexError:
+                             action_str = f"Action: {action} (Invalid Idx)" # Deterministic index out of range?
+                        except Exception as inner_e:
+                             action_str = f"Action: {action} (Err: {inner_e})"
+
                 except Exception as e:
-                    # Catch other potential errors during string conversion
-                    print(f"WARN: Error converting action {action} to string for edge from node {node_idx} to {child_node_idx}: {e}")
-                    action_str = f"Action: {action} (Error)"
+                    # Fallback for unexpected errors accessing node_is_stochastic or other issues
+                    print(f"WARN: Error determining edge label type for edge from node {node_idx} (action {action}) to {child_node_idx}: {e}")
+                    action_str = f"Action: {action} (Type Err)"
                 
-                edge_label = action_str
+                # Prepend action number to the string
+                edge_label = f"{action}: {action_str}"
                 graph.edge(node_id, child_id, label=edge_label)
     
     return graph
@@ -317,7 +349,7 @@ def create_real_mcts_visualization(output_dir):
             print(f"DEBUG - Stochastic action selected: {action}")
             
             # Add selected stochastic action to visualization
-            graph = tree_to_graph(eval_state)
+            graph = tree_to_graph(eval_state, output_dir, boards_dir)
             
             # Visualize MCTS tree for the stochastic root
             graph_filename = f'real_tree_turn_{turn}_stochastic_eval.svg'
@@ -357,7 +389,7 @@ def create_real_mcts_visualization(output_dir):
             last_saved_curr_board_path = os.path.join("boards", curr_board_filename) # Update last saved current board
 
             # Visualize MCTS tree *after* the stochastic step
-            graph_after_step = tree_to_graph(eval_state)
+            graph_after_step = tree_to_graph(eval_state, output_dir, boards_dir)
             graph_after_step_filename = f'real_tree_turn_{turn}_stochastic_after.svg'
             graph_after_step_path_abs = os.path.join(output_dir, graph_after_step_filename)
             graph_after_step_path_rel = graph_after_step_filename
@@ -441,7 +473,7 @@ def create_real_mcts_visualization(output_dir):
                 #     print(f"============================================\n")
 
                 # Visualize tree after this iteration
-                graph = tree_to_graph(eval_state)
+                graph = tree_to_graph(eval_state, output_dir, boards_dir)
                 graph_filename = f'real_tree_turn_{turn}_iter_{iteration:02d}.svg'
                 graph_path_abs = os.path.join(output_dir, graph_filename)
                 graph_path_rel = graph_filename
@@ -496,7 +528,7 @@ def create_real_mcts_visualization(output_dir):
             last_saved_curr_board_path = os.path.join("boards", curr_board_filename) # Update last saved current board
 
             # Visualize MCTS tree *after* the step
-            graph_after_step = tree_to_graph(eval_state)
+            graph_after_step = tree_to_graph(eval_state, output_dir, boards_dir)
             graph_after_step_filename = f'real_tree_turn_{turn}_deterministic_after.svg'
             graph_after_step_path_abs = os.path.join(output_dir, graph_after_step_filename)
             graph_after_step_path_rel = graph_after_step_filename

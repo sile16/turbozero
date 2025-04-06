@@ -1151,30 +1151,63 @@ class StochasticMCTS(Evaluator):
             
             def extract_subtree_fn(args):
                 s, a = args
-                # <<< FIX: Get flag *before* subtree extraction >>>
-                original_child_index = s.edge_map[s.ROOT_INDEX, a]
-                child_is_stochastic = s.node_is_stochastic[original_child_index]
-                # <<< END FIX >>>
-                # === DEBUG ADDED ===
-                debug_print(f"extract_subtree_fn: original_child_index={original_child_index}, child_is_stochastic={child_is_stochastic}", level=1)
-                # === END DEBUG ===
+                # <<< FIX: Get node_is_stochastic flags *before* subtree extraction >>>
+                # Get mapping from old indices to new indices
+                old_subtree_idxs, translation, erase_idxs = s._get_translation(a)
+                new_size = translation.max() + 1
+                
+                # Create the new stochastic flags array
+                # Initialize with False (or a default value)
+                new_stochastic_flags = jnp.zeros(s.capacity, dtype=jnp.bool_)
+                
+                # Use the translation map to copy flags from old tree to new tree
+                # Only copy flags for nodes that are retained (translation != -1)
+                # Source indices are the indices in the original tree (old_subtree_idxs)
+                # Target indices are the new indices in the pruned tree (translation[old_subtree_idxs])
+                
+                # Helper function to update flags using scatter (avoids loops)
+                def update_flags(old_indices, trans, old_flags):
+                    # Get the new indices corresponding to the old indices 
+                    target_indices = trans[old_indices]
+                    # Get the flags from the old array at the old indices
+                    values_to_copy = old_flags[old_indices]
+                    
+                    # Initialize the new flags array
+                    scattered_flags = jnp.zeros(s.capacity, dtype=jnp.bool_)
+                    
+                    # Iterate through the indices and copy if the target is valid
+                    # Note: Using fori_loop for compatibility with JIT
+                    def loop_body(i, current_flags):
+                        target_idx = target_indices[i]
+                        value_to_set = values_to_copy[i]
+                        # Only update if the target index is valid (not NULL_INDEX)
+                        return jnp.where(target_idx != s.NULL_INDEX, 
+                                         current_flags.at[target_idx].set(value_to_set), 
+                                         current_flags)
 
-                # Use get_subtree which extracts the subtree with the specified edge (action) as the new root
+                    # Run the loop over all potential old indices
+                    scattered_flags = jax.lax.fori_loop(0, old_indices.shape[0], loop_body, scattered_flags)
+                    return scattered_flags
+
+                # Populate the new stochastic flags array
+                new_stochastic_flags = update_flags(old_subtree_idxs, translation, s.node_is_stochastic)
+                # === DEBUG: Check new flags ===
+                debug_print(f"extract_subtree_fn: New stochastic flags (first 10): {new_stochastic_flags[:10]}", level=1)
+                # === END DEBUG ===
+                # <<< END FIX >>>
+
+                # Now get the base tree using the standard get_subtree
                 new_base_tree = s.get_subtree(a)
                 debug_print(f"Extracted subtree with new size={new_base_tree.next_free_idx}", level=2)
                 
-                # Create a new stochastic array with the root flag set appropriately
-                new_stochastic_flags = jnp.zeros_like(s.node_is_stochastic) # Use shape from original tree for safety
-                new_stochastic_flags = new_stochastic_flags.at[0].set(child_is_stochastic)
-                
                 # Construct the new StochasticMCTSTree using the base tree's structure
-                # and the new stochastic flags array
+                # and the *correctly mapped* stochastic flags array
                 final_tree = StochasticMCTSTree(
                     next_free_idx=new_base_tree.next_free_idx,
                     parents=new_base_tree.parents,
                     edge_map=new_base_tree.edge_map,
                     data=new_base_tree.data,
-                    node_is_stochastic=new_stochastic_flags
+                    node_is_stochastic=new_stochastic_flags # Use the newly created flags
                 )
                 debug_print(f"Created new StochasticMCTSTree with size: {final_tree.next_free_idx}", level=2)
                 return final_tree
