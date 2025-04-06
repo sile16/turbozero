@@ -278,10 +278,10 @@ class Tree(Generic[NodeType]):
     
 
 def init_tree(max_nodes: int, branching_factor: int, template_data: NodeType) -> Tree:
-    """ Initializes a new Tree.
+    """Initialize a new tree.
     
     Args:
-    - `max_nodes`: the maximum number of nodes the tree can store.
+    - `max_nodes`: the maximum number of nodes the tree can hold.
     - `branching_factor`: the maximum number of children a node can have.
     - `template_data`: template of node data
     
@@ -293,5 +293,10 @@ def init_tree(max_nodes: int, branching_factor: int, template_data: NodeType) ->
         parents=jnp.full((max_nodes,), fill_value=Tree.NULL_INDEX, dtype=jnp.int32),
         edge_map=jnp.full((max_nodes, branching_factor), fill_value=Tree.NULL_INDEX, dtype=jnp.int32),
         data=jax.tree_util.tree_map(
-            lambda x: jnp.zeros((max_nodes, *x.shape), dtype=x.dtype),
-            template_data))
+            lambda x: jnp.zeros(
+                (max_nodes, *x.shape) if hasattr(x, 'shape') else (max_nodes,),
+                dtype=getattr(x, 'dtype', jnp.result_type(x))
+            ),
+            template_data
+        )
+    )
