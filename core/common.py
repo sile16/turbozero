@@ -23,7 +23,7 @@ def partition(
     Returns:
     - (chex.ArrayTree): partitioned ArrayTree
     """
-    return jax.tree_map(
+    return jax.tree.map(
         lambda x: x.reshape(num_partitions, x.shape[0] // num_partitions, *x.shape[1:]),
         data
     )

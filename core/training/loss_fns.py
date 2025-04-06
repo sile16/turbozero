@@ -63,7 +63,7 @@ def az_default_loss_fn(params: chex.ArrayTree, train_state: TrainState, experien
     # compute L2 regularization
     l2_reg = l2_reg_lambda * jax.tree_util.tree_reduce(
         lambda x, y: x + y,
-        jax.tree_map(
+        jax.tree.map(
             lambda x: (x ** 2).sum(),
             params
         )

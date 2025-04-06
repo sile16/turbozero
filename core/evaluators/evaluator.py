@@ -42,7 +42,7 @@ class Evaluator:
     def init_batched(self, batch_size: int, *args, **kwargs) -> chex.ArrayTree:
         """Initializes the internal state of the Evaluator across a batch dimension."""
         tree = self.init(*args, **kwargs)
-        return jax.tree_map(lambda x: jnp.broadcast_to(x, (batch_size,) + x.shape), tree)
+        return jax.tree.map(lambda x: jnp.broadcast_to(x, (batch_size,) + x.shape), tree)
 
 
     def reset(self, state: chex.ArrayTree) -> chex.ArrayTree:

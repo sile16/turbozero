@@ -433,7 +433,7 @@ class Trainer:
             # sample from replay memory
             batch = self.memory_buffer.sample(buffer_state, step_key, self.train_batch_size)
             # reshape into minibatch
-            batch = jax.tree_map(lambda x: x.reshape((self.num_devices, -1, *x.shape[1:])), batch)
+            batch = jax.tree.map(lambda x: x.reshape((self.num_devices, -1, *x.shape[1:])), batch)
             # make training step
             train_state, metrics = self.one_train_step(train_state, batch)
             # append metrics from step
@@ -506,7 +506,7 @@ class Trainer:
         - `epoch`: current epoch
         """
         # convert pmap-sharded train_state to a single-device one
-        ckpt = jax.tree_map(lambda x: jax.device_get(x), train_state)
+        ckpt = jax.tree.map(lambda x: jax.device_get(x), train_state)
         # save checkpoint (async)
         self.checkpoint_manager.save(epoch, args=ocp.args.StandardSave(ckpt))
 
