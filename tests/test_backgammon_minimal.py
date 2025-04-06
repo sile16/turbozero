@@ -1,0 +1,150 @@
+import jax
+import jax.numpy as jnp
+import pgx.backgammon as bg
+import chex
+import optax
+from functools import partial
+import flax.linen as nn
+from typing import Tuple
+import pytest
+
+from core.types import StepMetadata
+from core.evaluators.evaluation_fns import make_nn_eval_fn
+from core.evaluators.mcts.action_selection import PUCTSelector
+from core.evaluators.mcts.mcts import MCTS
+
+def test_backgammon_basics():
+    """Test basic functionality of Backgammon environment."""
+    print("Testing backgammon environment basic functionality...")
+    
+    # --- Environment Setup ---
+    env = bg.Backgammon(simple_doubles=True)
+    num_actions = env.num_actions
+    print(f"NUM_ACTIONS: {num_actions}")
+    assert num_actions == 156
+    
+    # --- Get test observation ---
+    key = jax.random.PRNGKey(0)
+    init_state = env.init(key)
+    observation_shape = init_state.observation.shape
+    print(f"Detected Observation Shape: {observation_shape}")
+    assert observation_shape == (34,)
+    
+    stochastic_probs = env.stochastic_action_probs
+    print(f"STOCHASTIC_PROBS: {stochastic_probs}")
+    assert len(stochastic_probs) == 6  # should be 6 for simple_doubles=True
+    
+    # --- Test basic environment operations ---
+    # 1. Initial state should be stochastic (need to roll dice)
+    assert init_state.is_stochastic
+    assert not init_state.terminated
+    
+    # 2. Test stochastic step (dice roll)
+    stochastic_action = 0  # choose first dice roll
+    after_roll_state = env.stochastic_step(init_state, stochastic_action)
+    
+    # After rolling dice, state should be deterministic
+    assert not after_roll_state.is_stochastic
+    assert not after_roll_state.terminated
+    
+    # 3. Test a regular move
+    # Find a legal action
+    legal_actions = jnp.where(after_roll_state.legal_action_mask)[0]
+    assert len(legal_actions) > 0, "No legal actions available after dice roll"
+    
+    move_key = jax.random.PRNGKey(1)
+    action = int(legal_actions[0])
+    after_move_state = env.step(after_roll_state, action, move_key)
+    
+    # After a move, we should be back to stochastic for the next dice roll
+    # or game might be terminated
+    # Assertion removed since it depends on the specific action taken
+    
+    print("Basic environment operations tested successfully!")
+
+def test_backgammon_evaluator():
+    """Test basic functionality of evaluator with Backgammon environment."""
+    print("\nTesting backgammon evaluator basic functionality...")
+    
+    # --- Environment Setup ---
+    env = bg.Backgammon(simple_doubles=True)
+    num_actions = env.num_actions
+    
+    # --- Get test observation ---
+    key = jax.random.PRNGKey(0)
+    init_state = env.init(key)
+    
+    # --- Basic eval function ---
+    def simple_eval_fn(state, params, key):
+        """Simple evaluation function for testing. Returns uniform policy and zero value."""
+        policy_logits = jnp.zeros(num_actions)
+        value = jnp.array(0.0)
+        return policy_logits, value
+    
+    # --- Basic MCTS setup ---
+    mcts = MCTS(
+        eval_fn=simple_eval_fn,
+        num_iterations=2,  # Just 2 iterations for testing
+        max_nodes=10,
+        branching_factor=num_actions,
+        action_selector=PUCTSelector(),
+        temperature=0.0,
+    )
+    
+    # --- Initialize evaluator ---
+    eval_state = mcts.init(template_embedding=init_state)
+    assert eval_state is not None
+    
+    # --- Roll dice ---
+    stochastic_action = 0
+    after_roll_state = env.stochastic_step(init_state, stochastic_action)
+    assert not after_roll_state.is_stochastic
+    
+    # --- Create metadata ---
+    metadata = StepMetadata(
+        rewards=after_roll_state.rewards,
+        action_mask=after_roll_state.legal_action_mask,
+        terminated=after_roll_state.terminated,
+        cur_player_id=after_roll_state.current_player,
+        step=after_roll_state._step_count
+    )
+    
+    # --- Test evaluator on deterministic state ---
+    eval_key = jax.random.PRNGKey(1)
+    
+    def simple_step_fn(state, action):
+        """Simple step function for testing."""
+        # MCTS step_fn doesn't take a key parameter
+        step_key = jax.random.PRNGKey(0)  # Use a fixed key for determinism
+        new_state = env.step(state, action, step_key)
+        return new_state, StepMetadata(
+            rewards=new_state.rewards,
+            action_mask=new_state.legal_action_mask,
+            terminated=new_state.terminated,
+            cur_player_id=new_state.current_player,
+            step=new_state._step_count
+        )
+    
+    # Use empty params dict
+    params = {}
+    
+    # Call evaluate method
+    output = mcts.evaluate(
+        key=eval_key,
+        eval_state=eval_state,
+        env_state=after_roll_state,
+        root_metadata=metadata,
+        params=params,
+        env_step_fn=simple_step_fn
+    )
+    
+    # Verify we get valid outputs
+    assert output is not None
+    assert output.action is not None
+    assert output.policy_weights is not None
+    assert output.eval_state is not None
+    
+    # Ensure the selected action is legal
+    assert after_roll_state.legal_action_mask[output.action]
+    
+    print("Evaluator test completed successfully!") 

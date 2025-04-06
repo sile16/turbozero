@@ -1,5 +1,10 @@
 checkpoints/
 .vscode/
+wandb/*
+
+visualizations/mcts_trees/*
+.DS_Store
+ckpts/*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

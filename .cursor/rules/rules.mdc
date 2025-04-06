@@ -1,0 +1,46 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+# Your rule content
+
+- Files only modify test_backgammon_training.py & stochastic_mcts.py,
+- Do Not modify any other file, if changes are needed output the changes and ask the user to make them
+- This is a large project codebase, so we need to make concise updates and edit as few lines as possible. Only modify code that directly affects functionality or correctness.
+- Preserve existing code, comments, formatting, and white space unless a change is strictly necessary.
+- Do not move code blocks or change white space in ways that generate unnecessary diffs.
+- Keep related changes together in one area whenever possible.
+- For new functions, add them at the end of files while ensuring proper dependency ordering.
+- Unless specifically asked to refactor for performance, our preference is to add new code without altering existing logic.
+- Use performant JAX style coding:
+  - Avoid using standard Python if-then-else constructs within JAX compiled functions; instead, use `jax.lax.cond`, `jax.lax.switch`, or vectorized operations.
+  - When using loops, consider using `jax.lax.fori_loop`.
+  - Manage random keys according to JAX best practices by updating and propagating them to ensure reproducibility.
+- Do not refactor existing code unless it is necessary to achieve correct outputs.
+- Place all new code in the file `core/evaluators/mcts/stochastic_mcts.py` and notebooks/hello_world-bg.ipynb and test_backgammon_training.py
+- Always adhere to JAX programming rules in JIT-compiled functions, ensuring functional purity and avoiding side effects.
+
+# PGX Stochastic ENV properties
+
+- The environment state includes a property `is_stochastic`.
+- step is overloaded to handled both actions and stochastic actions
+- The stochastic action probabilities are provided in `env.stochastic_action_probs` (ensure these probabilities are valid and sum to 1, or handle errors appropriately).
+
+# Project Goal
+
+- Create a new class based on the current MCTS implementation to support stochastic nodes.
+  - The new class should integrate with the existing implementation without disrupting current functionality (consider subclassing or composition).
+- When encountering a stochastic node:
+  - Immediately expand the node using all stochastic actions irrespective of the current iteration count,
+  - Compute the node’s value as a weighted sum of its leaves’ values, with weights determined by the probabilities in `env.stochastic_action_probs`.
+- when updating the root node, if it's a stochastic node, we need to immediately pick one of it's actions using random to pick and then update the root node again as we only want to return deterministic nodes back.
+- Make sure the back propagate function properly handles the new node type, these values are using for machine learning so much be logically correct for it to work.
+-- Ensure the tree is persisted according to the `persist_tree` variable, following established serialization practices.
+
+# Additional Considerations
+
+- **Error Handling:** Validate that the environment meets the expected contract (e.g., valid `stochastic_action_probs`, properly defined `stochastic_expansion_mask`) and include error handling as needed.
+- **Testing and Documentation:** Add unit tests for the new stochastic behavior and update documentation and UML diagrams to reflect any interface changes.
+- **Consistency:** Use clear and consistent terminology throughout the codebase. Correct any typos, such as "stocahstic" → "stochastic", "acheve" → "achieve", "immediatlely" → "immediately", and "it's leafs" → "its leaves".
+- **Diff Minimization:** Maintain existing formatting, comments, and white space to avoid extraneous diffs during code reviews.

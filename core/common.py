@@ -352,7 +352,7 @@ def two_player_game(
             outcomes = state.outcomes
         )
         # return game state and render frames
-        return state, jax.tree_map(lambda x, y: jnp.stack([x, y]), frame1, frame2)
+        return state, jax.tree.map(lambda x, y: jnp.stack([x, y]), frame1, frame2)
     
     # play the game
     state, frames = jax.lax.scan(
@@ -361,8 +361,8 @@ def two_player_game(
         xs=jnp.arange(max_steps//2)
     )
     # reshape frames
-    frames = jax.tree_map(lambda x: x.reshape(max_steps, *x.shape[2:]), frames)
+    frames = jax.tree.map(lambda x: x.reshape(max_steps, *x.shape[2:]), frames)
     # append initial state to front of frames
-    frames = jax.tree_map(lambda i, x: jnp.concatenate([jnp.expand_dims(i, 0), x]), initial_game_frame, frames)
+    frames = jax.tree.map(lambda i, x: jnp.concatenate([jnp.expand_dims(i, 0), x]), initial_game_frame, frames)
     # return outcome, frames, player ids
     return jnp.array([state.outcomes[p1_id], state.outcomes[p2_id]]), frames, jnp.array([p1_id, p2_id])
