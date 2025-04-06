@@ -6,20 +6,17 @@ without relying on the actual MCTS implementation.
 """
 
 import os
-import sys
+from functools import partial
+import json
 import graphviz
 import numpy as np
 import glob
-import io
-import argparse
-from PIL import Image
-import imageio.v2 as imageio
+
 # cairosvg might not be needed if we save SVGs directly
 # import cairosvg 
 import jax
 import jax.numpy as jnp
-from functools import partial
-import json
+
 # Use display and HTML from IPython if needed for direct SVG rendering in notebooks
 # from IPython.display import display, HTML
 

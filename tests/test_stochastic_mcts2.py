@@ -10,15 +10,7 @@ import os # Added for directory creation
 import pgx.backgammon as bg # Added for Backgammon env
 from core.evaluators.mcts.state import tree_to_graph # Added for visualization
 
-# Imports for GIF generation
-import glob
-import imageio.v2 as imageio # Use v2 API
-import io
-from PIL import Image # For converting rendered output
-import numpy as np # For image array conversion
-import cairosvg  # Use cairosvg instead of svglib
-import shutil
-import subprocess
+
 
 # Imports from your project (adjust paths as necessary)
 from core.evaluators.mcts.stochastic_mcts import StochasticMCTS, StochasticMCTSTree, MCTSNode, MCTSOutput

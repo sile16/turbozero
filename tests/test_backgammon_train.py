@@ -375,8 +375,8 @@ trainer = StochasticTrainer(
         BackgammonTwoPlayerBaseline(
             num_episodes=2,
             baseline_evaluator=pip_count_mcts_evaluator_test,
-            render_fn=render_fn,
-            render_dir='training_eval/pip_count_baseline',
+            #render_fn=render_fn,
+            #render_dir='training_eval/pip_count_baseline',
             name='pip_count_baseline'
         ),
         # Add another tester using the RandomEvaluator
@@ -384,8 +384,8 @@ trainer = StochasticTrainer(
             num_episodes=2, 
             baseline_evaluator=random_evaluator, # Use the random evaluator here
             # Optionally add rendering for this baseline too
-            render_fn=render_fn, 
-            render_dir='training_eval/random_baseline',
+            #render_fn=render_fn, 
+            #render_dir='training_eval/random_baseline',
             name='random_baseline'
         )
     ],
