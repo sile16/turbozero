@@ -477,7 +477,11 @@ class StochasticMCTS(Evaluator):
                     stochastic_node_idx: int, params: chex.ArrayTree, 
                     env_step_fn: EnvStepFn) -> Tuple[StochasticMCTSTree, int, chex.Array]:
         """Expands a stochastic node by considering all possible outcomes.
-        Returns the updated tree, and the final weighted state value."""
+        Ensures all stochastic actions have corresponding child nodes.
+        Returns the updated tree, and the final weighted state value.
+        
+        In subsequent iterations, traversal can continue through this node.
+        """
         
         debug_print(f"Expanding stochastic node {stochastic_node_idx}", level=2)
         #dprint("_expand_stochastic_node ENTRY: node_idx={idx}", idx=stochastic_node_idx)
@@ -497,105 +501,165 @@ class StochasticMCTS(Evaluator):
         
         debug_print(f"Preparing to expand {num_stochastic_outcomes} stochastic outcomes", level=2)
         
-        # Process each stochastic action
-        def expand_one_stochastic_outcome(i, scan_val):
-            action_idx = i
-            debug_print(f"Processing stochastic action {action_idx}", level=2)
+        # Check if the stochastic node is already fully expanded
+        def is_fully_expanded(node_idx):
+            # Check if each stochastic action has a corresponding child node
+            def check_all_edges(i, all_exist):
+                edge_exists = tree.is_edge(node_idx, i)
+                return jnp.logical_and(all_exist, edge_exists)
             
-            scan_tree, accumulated_value = scan_val
-            prob = self.stochastic_action_probs[action_idx]
-            
-            # Take the action in the environment
-            step_key, eval_key = jax.random.split(jax.random.fold_in(key, action_idx))
-            
-            debug_print(f"Calling env_step_fn for stochastic action {action_idx}", level=2)
-            # Original step function call with key passing
-            child_embedding, child_metadata = env_step_fn(stochastic_embedding, action_idx, step_key)
-            debug_print(f"env_step_fn for stochastic action returned state with is_stochastic={child_embedding.is_stochastic}", level=2)
-            
-            # Evaluate the child state 
-            debug_print(f"Evaluating child state for stochastic action {action_idx}", level=2)
-            policy_logits, value = self.eval_fn(child_embedding, params, eval_key)
-            
-            # Apply action masking and softmax
-            policy_logits = jnp.where(child_metadata.action_mask, policy_logits, jnp.finfo(policy_logits).min)
-            policy = jax.nn.softmax(policy_logits)
-            
-            # Get the child node index
-            # child_exists, child_node_idx = scan_tree.node_exists(stochastic_node_idx, action_idx)
-            child_node_idx = scan_tree.edge_map[stochastic_node_idx, action_idx]
-            child_exists = scan_tree.is_edge(stochastic_node_idx, action_idx)
-            
-            # Determine the node index (existing or new)
-            new_child_node_idx = jax.lax.cond(
-                child_exists,
-                lambda: child_node_idx,
-                lambda: scan_tree.next_free_idx
+            # Start with True and check all edges
+            all_edges_exist = jax.lax.fori_loop(
+                0, num_stochastic_outcomes, check_all_edges, jnp.array(True)
             )
             
-            # Create the child node using ONLY defined fields
-            child_node = MCTSNode(
-                n=jnp.array(0, dtype=jnp.int32), # Start visits at 0
-                p=policy,
-                q=value, # Initial q is evaluated value
-                terminated=child_metadata.terminated,
-                embedding=child_embedding
+            return all_edges_exist
+        
+        # If already fully expanded, just recalculate the weighted value and return
+        def handle_already_expanded(operand):
+            input_tree, input_node_idx = operand
+            debug_print(f"Stochastic node {input_node_idx} already fully expanded, recalculating value", level=2)
+            
+            # Recalculate the weighted value from all child nodes
+            def sum_child_values(i, acc_value):
+                child_exists = input_tree.is_edge(input_node_idx, i)
+                child_idx = input_tree.edge_map[input_node_idx, i]
+                child_q = jnp.where(child_exists, input_tree.data_at(child_idx).q, 0.0)
+                prob = self.stochastic_action_probs[i]
+                return acc_value + prob * child_q
+            
+            weighted_value = jax.lax.fori_loop(
+                0, num_stochastic_outcomes, sum_child_values, 0.0
             )
             
-            # Add the child node to the tree
-            # Correct arguments: parent_index, edge_index (action), data
-            add_new_branch = lambda: scan_tree.add_node(stochastic_node_idx, action_idx, child_node)
-            updated_tree = jax.lax.cond(
-                child_exists,
-                lambda: scan_tree.update_node(index=child_node_idx, data=child_node),
-                add_new_branch
+            # Update the stochastic node's Q-value with the recalculated weighted sum
+            node_data = input_tree.data_at(input_node_idx)
+            updated_node = node_data.replace(
+                q=weighted_value,
+                n=node_data.n + 1  # Still increment visit count
             )
             
-            # Update stochastic flags for this node
-            is_child_stochastic = child_embedding.is_stochastic
-            # updated_tree = updated_tree.data_replace(
-            #     'node_is_stochastic', new_child_node_idx, is_child_stochastic
-            # )
-            # <<< FIX: Use standard JAX array update >>>
-            updated_tree = updated_tree.replace(node_is_stochastic=updated_tree.node_is_stochastic.at[new_child_node_idx].set(is_child_stochastic))
+            updated_tree = input_tree.update_node(input_node_idx, updated_node)
+            
+            debug_print(f"Recalculated weighted value: {weighted_value}", level=2)
+            
+            return updated_tree, input_node_idx, weighted_value
+        
+        # Process each stochastic action - expand any unexpanded outcomes
+        def expand_all_outcomes(operand):
+            input_tree, input_node_idx = operand
+            debug_print(f"Expanding all outcomes for stochastic node {input_node_idx}", level=2)
+            
+            # Process each stochastic action
+            def expand_one_stochastic_outcome(i, scan_val):
+                action_idx = i
+                debug_print(f"Processing stochastic action {action_idx}", level=2)
+                
+                scan_tree, accumulated_value = scan_val
+                prob = self.stochastic_action_probs[action_idx]
+                
+                # Take the action in the environment
+                step_key, eval_key = jax.random.split(jax.random.fold_in(key, action_idx))
+                
+                debug_print(f"Calling env_step_fn for stochastic action {action_idx}", level=2)
+                # Original step function call with key passing
+                child_embedding, child_metadata = env_step_fn(stochastic_embedding, action_idx, step_key)
+                debug_print(f"env_step_fn for stochastic action returned state with is_stochastic={child_embedding.is_stochastic}", level=2)
+                
+                # Evaluate the child state 
+                debug_print(f"Evaluating child state for stochastic action {action_idx}", level=2)
+                policy_logits, value = self.eval_fn(child_embedding, params, eval_key)
+                
+                # Apply action masking and softmax
+                policy_logits = jnp.where(child_metadata.action_mask, policy_logits, jnp.finfo(policy_logits).min)
+                policy = jax.nn.softmax(policy_logits)
+                
+                # Get the child node index
+                # child_exists, child_node_idx = scan_tree.node_exists(stochastic_node_idx, action_idx)
+                child_node_idx = scan_tree.edge_map[input_node_idx, action_idx]
+                child_exists = scan_tree.is_edge(input_node_idx, action_idx)
+                
+                # Determine the node index (existing or new)
+                new_child_node_idx = jax.lax.cond(
+                    child_exists,
+                    lambda: child_node_idx,
+                    lambda: scan_tree.next_free_idx
+                )
+                
+                # Create the child node using ONLY defined fields
+                child_node = MCTSNode(
+                    n=jnp.array(0, dtype=jnp.int32), # Start visits at 0
+                    p=policy,
+                    q=value, # Initial q is evaluated value
+                    terminated=child_metadata.terminated,
+                    embedding=child_embedding
+                )
+                
+                # Add the child node to the tree
+                # Correct arguments: parent_index, edge_index (action), data
+                add_new_branch = lambda: scan_tree.add_node(input_node_idx, action_idx, child_node)
+                updated_tree = jax.lax.cond(
+                    child_exists,
+                    lambda: scan_tree.update_node(index=child_node_idx, data=child_node),
+                    add_new_branch
+                )
+                
+                # Update stochastic flags for this node
+                is_child_stochastic = child_embedding.is_stochastic
+                # <<< FIX: Use standard JAX array update >>>
+                updated_tree = updated_tree.replace(node_is_stochastic=updated_tree.node_is_stochastic.at[new_child_node_idx].set(is_child_stochastic))
 
-            debug_print(f"Adding child node for stochastic action {action_idx} at index {new_child_node_idx}", level=2)
-            
-            # Accumulate weighted value
-            new_accumulated_value = accumulated_value + prob * value
-            
-            debug_print(f"Accumulated value: {new_accumulated_value} after adding weighted value {prob * value}", level=2)
-            
-            # return updated_tree, new_accumulated_value
-            # <<< FIX: Return structure must match scan carry: ((tree, acc), y) >>>
-            return (updated_tree, new_accumulated_value), None
+                debug_print(f"Adding child node for stochastic action {action_idx} at index {new_child_node_idx}", level=2)
+                
+                # Accumulate weighted value
+                new_accumulated_value = accumulated_value + prob * value
+                
+                debug_print(f"Accumulated value: {new_accumulated_value} after adding weighted value {prob * value}", level=2)
+                
+                # return updated_tree, new_accumulated_value
+                # <<< FIX: Return structure must match scan carry: ((tree, acc), y) >>>
+                return (updated_tree, new_accumulated_value), None
 
-        # Initialize accumulator with zero value and the original tree
-        initial_accumulated_value = jnp.array(0.0, dtype=jnp.float32)
+            # Initialize accumulator with zero value and the original tree
+            initial_accumulated_value = jnp.array(0.0, dtype=jnp.float32)
+            
+            debug_print(f"Starting fori_loop for {num_stochastic_outcomes} stochastic outcomes", level=2)
+            # Use scan to accumulate values
+            updated_tree, total_weighted_value = jax.lax.scan(
+                lambda val, i: expand_one_stochastic_outcome(i, val),
+                (input_tree, initial_accumulated_value),
+                jnp.arange(num_stochastic_outcomes)
+            )[0]
+            
+            debug_print(f"Completed stochastic expansion with total_weighted_value={total_weighted_value}", level=2)
+            
+            # Update the stochastic node's Q-value with the weighted sum
+            stochastic_node_data = updated_tree.data_at(input_node_idx)
+            updated_node = stochastic_node_data.replace(
+                q=total_weighted_value,
+                n=stochastic_node_data.n + 1  # Increment the visit count
+            )
+            
+            updated_tree = updated_tree.update_node(input_node_idx, updated_node)
+            
+            debug_print(f"Updated stochastic node with weighted value={total_weighted_value}", level=2)
+            return updated_tree, input_node_idx, total_weighted_value
         
-        debug_print(f"Starting fori_loop for {num_stochastic_outcomes} stochastic outcomes", level=2)
-        # Use scan to accumulate values
-        updated_tree, total_weighted_value = jax.lax.scan(
-            lambda val, i: expand_one_stochastic_outcome(i, val),
-            (tree, initial_accumulated_value),
-            jnp.arange(num_stochastic_outcomes)
-        )[0]
+        # Check if the node is already fully expanded
+        fully_expanded = is_fully_expanded(stochastic_node_idx)
+        debug_print(f"Stochastic node {stochastic_node_idx} fully expanded? {fully_expanded}", level=2)
         
-        debug_print(f"Completed stochastic expansion with total_weighted_value={total_weighted_value}", level=2)
-        
-        # Update the stochastic node's Q-value with the weighted sum
-        stochastic_node_data = updated_tree.data_at(stochastic_node_idx)
-        updated_node = stochastic_node_data.replace(
-            q=total_weighted_value,
-            n=stochastic_node_data.n + 1  # Increment the visit count
+        # Either recalculate value of fully expanded node or expand all outcomes
+        result_tree, result_idx, result_value = jax.lax.cond(
+            fully_expanded,
+            handle_already_expanded,
+            expand_all_outcomes,
+            (tree, stochastic_node_idx)
         )
         
-        updated_tree = updated_tree.update_node(stochastic_node_idx, updated_node)
-        
-        debug_print(f"Updated stochastic node with weighted value={total_weighted_value}", level=2)
         #dprint("_expand_stochastic_node EXIT: node_idx={idx}, value={v}", idx=stochastic_node_idx, v=total_weighted_value)
         # Return the updated tree, the stochastic node's index, and the weighted value
-        return updated_tree, stochastic_node_idx, total_weighted_value
+        return result_tree, result_idx, result_value
 
     def iterate(self, key: chex.PRNGKey, tree: StochasticMCTSTree, params: chex.ArrayTree, env_step_fn: EnvStepFn) -> StochasticMCTSTree:
         """ Performs one iteration of MCTS.
@@ -696,7 +760,8 @@ class StochasticMCTS(Evaluator):
 
 
     def traverse(self, tree: StochasticMCTSTree) -> TraversalState:
-        """ Traverse from the root node until an unvisited leaf node or a stochastic node is reached.
+        """ Traverse from the root node until an unvisited leaf node or an unexpanded stochastic node is reached.
+        Now supports traversing through already-expanded stochastic nodes.
         
         Args:
         - `tree`: StochasticMCTSTree to evaluate
@@ -705,7 +770,7 @@ class StochasticMCTS(Evaluator):
         - (TraversalState): state of the traversal
             - `parent`: index of the node where traversal stopped.
             - `action`: action selected from the `parent` node.
-                      The edge (`parent`, `action`) might be unvisited, or it might lead to a stochastic node.
+                      The edge (`parent`, `action`) might be unvisited, or it might lead to an unexpanded stochastic node.
         """
         debug_print(f"Starting traversal from root (node {tree.ROOT_INDEX})")
         # Choose the action to take from the root initially
@@ -719,7 +784,13 @@ class StochasticMCTS(Evaluator):
             return TraversalState(parent=tree.ROOT_INDEX, action=0)
 
         def cond_fn(state: TraversalState) -> bool:
-            """Continue traversal if the selected edge exists AND the child node it leads to is deterministic and not terminal."""
+            """Continue traversal if:
+            1. The selected edge exists AND 
+            2. The child node it leads to is not terminal AND
+            3. Either:
+               a. The child is deterministic, OR
+               b. The child is a stochastic node that has been fully expanded
+            """
             debug_print(f"Checking cond_fn with parent={state.parent}, action={state.action}")
             edge_exists = tree.is_edge(state.parent, state.action)
             
@@ -729,17 +800,60 @@ class StochasticMCTS(Evaluator):
             # Check child properties only if the index is valid
             is_child_stochastic = jnp.where(child_idx >= 0, tree.node_is_stochastic[child_idx], False)
             is_child_terminal = jnp.where(child_idx >= 0, tree.data_at(child_idx).terminated, False)
-
-            # Continue if: edge exists AND child is not stochastic AND child is not terminal
-            result = jnp.logical_and(edge_exists, 
-                   jnp.logical_and(~is_child_stochastic, ~is_child_terminal))
-            debug_print(f"cond_fn result: {result} (edge_exists={edge_exists}, is_child_stochastic={is_child_stochastic}, is_child_terminal={is_child_terminal})")
+            
+            # NEW: Check if stochastic node is fully expanded
+            # A stochastic node is fully expanded if all its stochastic action outcomes 
+            # have corresponding child nodes in the tree
+            def is_stochastic_node_fully_expanded(idx):
+                # Check if each stochastic action has a corresponding child node
+                num_stochastic_outcomes = len(self.stochastic_action_probs)
+                
+                # Use for loop to check if all stochastic actions have edges
+                def check_all_edges(i, all_exist):
+                    edge_exists = tree.is_edge(idx, i)
+                    return jnp.logical_and(all_exist, edge_exists)
+                
+                # Start with True and check all edges
+                all_edges_exist = jax.lax.fori_loop(
+                    0, num_stochastic_outcomes, check_all_edges, jnp.array(True)
+                )
+                
+                return all_edges_exist
+            
+            # Check if stochastic child is fully expanded (only matters if the child exists and is stochastic)
+            stochastic_fully_expanded = jnp.where(
+                jnp.logical_and(child_idx >= 0, is_child_stochastic),
+                is_stochastic_node_fully_expanded(child_idx),
+                jnp.array(False)  # Doesn't matter if child isn't stochastic
+            )
+            
+            # Continue if: 
+            # 1. Edge exists AND
+            # 2. Child is not terminal AND
+            # 3. Either:
+            #    a. Child is not stochastic OR
+            #    b. Child is stochastic but fully expanded
+            continue_deterministic = jnp.logical_and(edge_exists, ~is_child_terminal)
+            continue_through_stochastic = jnp.logical_and(
+                is_child_stochastic,
+                stochastic_fully_expanded
+            )
+            
+            result = jnp.logical_and(
+                continue_deterministic,
+                jnp.logical_or(~is_child_stochastic, continue_through_stochastic)
+            )
+            
+            debug_print(f"cond_fn result: {result} (edge_exists={edge_exists}, is_child_stochastic={is_child_stochastic}, " +
+                       f"is_child_terminal={is_child_terminal}, stochastic_fully_expanded={stochastic_fully_expanded})")
             return result
         
         def body_fn(state: TraversalState) -> TraversalState:
             """Move to the child node and select the next action."""
             debug_print(f"In body_fn with parent={state.parent}, action={state.action}")
-            # We know from cond_fn that the edge exists and the child is deterministic & not terminal
+            # We know from cond_fn that the edge exists and the child is either:
+            # 1. deterministic & not terminal OR
+            # 2. stochastic & fully expanded & not terminal
             node_idx = tree.edge_map[state.parent, state.action]
             
             # === ADDED DEBUG: Log policy and mask for the current node ===
@@ -753,10 +867,49 @@ class StochasticMCTS(Evaluator):
             debug_print(f"    Is No-Op (Action 0) legal? {current_mask[0]}", level=1)
             # === END DEBUG ===
             
-            # Select the action from this deterministic child node
+            # Check if the node is stochastic
+            is_node_stochastic = tree.node_is_stochastic[node_idx]
+            
+            # Define how to select the next action
+            def select_from_deterministic():
+                # Use the action selector for deterministic nodes
+                return self.action_selector(tree, node_idx, self.discount)
+            
+            def select_from_stochastic():
+                # For stochastic nodes, select among stochastic actions
+                # We weight selection by the stochastic action probabilities
+                # and also take into account visit counts if available
+                
+                # Get visit counts for each stochastic action's child
+                def get_child_visit(action_idx):
+                    child_exists = tree.is_edge(node_idx, action_idx)
+                    child_idx = tree.edge_map[node_idx, action_idx]
+                    return jnp.where(child_exists, tree.data_at(child_idx).n, 0)
+                
+                # Get visit counts for each stochastic action
+                visit_counts = jnp.array([get_child_visit(i) for i in range(len(self.stochastic_action_probs))])
+                
+                # Combine probabilities and visit counts for selection
+                # Formula: prob * (1 + visit_count)^(-0.5) (similar to PUCT)
+                selection_weights = self.stochastic_action_probs * jnp.power(1.0 + visit_counts, -0.5)
+                
+                # Normalize weights
+                normalized_weights = selection_weights / jnp.sum(selection_weights)
+                
+                # Select action based on weights
+                # Use a deterministic approach to avoid random key management
+                # Select the action with the highest weight
+                return jnp.argmax(normalized_weights)
+            
+            # Use jax.lax.cond to select the appropriate action based on node type
             try:
-                action = self.action_selector(tree, node_idx, self.discount)
-                debug_print(f"Selected action {action} from node {node_idx}")
+                action = jax.lax.cond(
+                    is_node_stochastic,
+                    lambda _: select_from_stochastic(),
+                    lambda _: select_from_deterministic(),
+                    operand=None
+                )
+                debug_print(f"Selected action {action} from node {node_idx} (stochastic: {is_node_stochastic})")
                 return TraversalState(parent=node_idx, action=action)
             except Exception as e:
                 debug_print(f"Exception in action selection in body_fn: {e}")
@@ -822,6 +975,8 @@ class StochasticMCTS(Evaluator):
                 debug_print(f"Updating stochastic node {node_idx}")
                 # Value is the weighted average of children's current Q-values
                 # Iterate through all possible actions/edges
+                num_stochastic_outcomes = len(self.stochastic_action_probs)
+                
                 def sum_child_values(action_idx, running_value_sum):
                     child_exists = current_tree.is_edge(node_idx, action_idx)
                     child_node_idx = current_tree.edge_map[node_idx, action_idx]
@@ -834,8 +989,8 @@ class StochasticMCTS(Evaluator):
                     debug_print(f"  Child {action_idx}: exists={child_exists}, child_idx={child_node_idx if child_exists else 'N/A'}, q={child_q if child_exists else 0}, prob={prob}, running_sum={new_sum}")
                     return new_sum
                 
-                # Calculate sum using fori_loop over branching factor
-                weighted_q_sum = jax.lax.fori_loop(0, self.branching_factor, sum_child_values, 0.0)
+                # Calculate sum using fori_loop over all stochastic outcomes
+                weighted_q_sum = jax.lax.fori_loop(0, num_stochastic_outcomes, sum_child_values, 0.0)
                 # The stochastic node's value IS this weighted sum.
                 debug_print(f"Stochastic update final weighted_q_sum={weighted_q_sum}")
                 return weighted_q_sum
@@ -860,8 +1015,15 @@ class StochasticMCTS(Evaluator):
             # Prepare state for next iteration
             # Correct attribute name is 'parents'
             parent_idx = new_tree.parents[node_idx] # Use parent from the *updated* tree
-            # The value propagated to the parent is always the initially passed 'value', discounted.
-            next_value = current_value * self.discount
+            
+            # The value propagated to the parent depends on the node type
+            # For stochastic nodes, we always use the recalculated weighted sum value
+            next_value = jax.lax.cond(
+                is_stochastic,
+                lambda: updated_q * self.discount, # Propagate the recalculated value
+                lambda: current_value * self.discount # Propagate the original value discounted
+            )
+            
             debug_print(f"Node {node_idx} updated: n={updated_node_data.n}, q={updated_node_data.q}, next node will be {parent_idx}")
             # Return the *new_tree* in the state
             return BackpropState(node_idx=parent_idx, value=next_value, tree=new_tree) 

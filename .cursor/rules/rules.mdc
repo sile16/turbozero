@@ -21,11 +21,12 @@ alwaysApply: true
 - Place all new code in the file `core/evaluators/mcts/stochastic_mcts.py` and notebooks/hello_world-bg.ipynb and test_backgammon_training.py
 - Always adhere to JAX programming rules in JIT-compiled functions, ensuring functional purity and avoiding side effects.
 
-# PGX Stochastic ENV properties
+# Project properties
 
 - The environment state includes a property `is_stochastic`.
 - step is overloaded to handled both actions and stochastic actions
 - The stochastic action probabilities are provided in `env.stochastic_action_probs` (ensure these probabilities are valid and sum to 1, or handle errors appropriately).
+- This project uses poetry for package management
 
 # Project Goal
 

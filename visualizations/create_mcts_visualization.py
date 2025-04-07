@@ -23,7 +23,7 @@ import jax.numpy as jnp
 import pgx.backgammon as bg
 # Assuming render_pgx_2p is not needed anymore
 # from core.testing.utils import render_pgx_2p
-from core.evaluators.mcts.stochastic_mcts import StochasticMCTSTree, StochasticMCTS
+from core.evaluators.mcts.stochastic_mcts import StochasticMCTS
 from core.evaluators.mcts.action_selection import PUCTSelector
 from core.types import StepMetadata
 
@@ -302,7 +302,7 @@ def create_real_mcts_visualization(output_dir):
     visualization_frames = []
     frame_idx = 0
     total_turns = 3 # Reduced to 2 turns for faster testing
-    iterations_per_deterministic_turn = 15 # Reduced to 5 iterations for faster visualization
+    iterations_per_deterministic_turn = 20 # Reduced to 5 iterations for faster visualization
 
     # Keep track of the latest board SVG paths relative to output_dir
     last_saved_curr_board_path = None
