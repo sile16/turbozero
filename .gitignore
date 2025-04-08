@@ -3,6 +3,8 @@ checkpoints/
 wandb/*
 
 visualizations/mcts_trees/*
+visualizations/
+training_eval/
 .DS_Store
 ckpts/*
 
