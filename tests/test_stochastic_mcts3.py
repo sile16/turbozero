@@ -1,7 +1,5 @@
-import pytest
 import jax
 import jax.numpy as jnp
-import numpy as np
 from functools import partial
 
 import pgx.backgammon as bg
@@ -212,15 +210,21 @@ def test_stochastic_mcts_backgammon_simple_doubles_valid_actions():
 
 def test_traverse_through_stochastic_nodes():
     """
-    Test that MCTS can traverse through stochastic nodes and expand at least 2 levels 
-    of deterministic nodes after a stochastic node.
+    Test that MCTS can traverse through all node types during the evaluate
     
     This verifies the fix for allowing MCTS to continue exploration through stochastic
-    nodes in subsequent iterations.
+    nodes in subsequent iterations during evaluate.
     """
     # Initialize environment and MCTS
     key = jax.random.PRNGKey(42)
+
+    # Initialize the game state
+    key, init_key, eval_key, step_key = jax.random.split(key, 4)  # Add step_key
     env = bg.Backgammon(simple_doubles=True)
+
+    state = env.init(init_key)
+    
+    state, metadata = backgammon_step_fn(env, state, 3, step_key) # dice roll of 4-4
     
     # Set up MCTS with high iteration count for deep exploration
     mcts = StochasticMCTS(
@@ -228,7 +232,7 @@ def test_traverse_through_stochastic_nodes():
         action_selector=PUCTSelector(),
         branching_factor=env.num_actions,
         max_nodes=500,  # Large enough to store many nodes
-        num_iterations=60,  # Enough iterations to explore deeply
+        num_iterations=100,  # Enough iterations to explore deeply
         stochastic_action_probs=env.stochastic_action_probs,
         discount=-1.0,
         temperature=1.0,  # Some exploration temperature
@@ -236,12 +240,9 @@ def test_traverse_through_stochastic_nodes():
         debug_level=1  # Enable some debugging output
     )
     
-    # Initialize the game state
-    key, init_key = jax.random.split(key)
-    state = env.init(init_key)
-    
     # Initialize evaluation state and metadata
     eval_state = mcts.init(template_embedding=state)
+
     metadata = StepMetadata(
         rewards=state.rewards,
         action_mask=state.legal_action_mask,
@@ -249,10 +250,8 @@ def test_traverse_through_stochastic_nodes():
         cur_player_id=state.current_player,
         step=state._step_count
     )
-    
-    # First, get through the initial stochastic state (dice roll)
-    key, eval_key = jax.random.split(key)
-    print("Starting with initial stochastic state (dice roll)")
+
+    # do an initial eval.
     mcts_output = mcts.evaluate(
         key=eval_key,
         eval_state=eval_state,
@@ -261,176 +260,74 @@ def test_traverse_through_stochastic_nodes():
         params={},
         env_step_fn=partial(backgammon_step_fn, env)
     )
-    
-    # Apply stochastic action (dice roll)
-    action = mcts_output.action
-    eval_state = mcts_output.eval_state
-    
-    key, step_key = jax.random.split(key)
-    state, metadata = backgammon_step_fn(env, state, action, step_key)
-    eval_state = mcts.step(eval_state, action)
-    
-    print(f"Applied stochastic action (dice roll): {action}, {bg.stochastic_action_to_str(action)}")
-    print(f"New state is_stochastic: {state.is_stochastic}")
-    
-    # Now we should be in a deterministic state. Make a move.
-    key, eval_key = jax.random.split(key)
-    print("Making first deterministic move")
-    mcts_output = mcts.evaluate(
-        key=eval_key,
-        eval_state=eval_state,
-        env_state=state,
-        root_metadata=metadata,
-        params={},
-        env_step_fn=partial(backgammon_step_fn, env)
-    )
-    
-    # Apply deterministic action
-    action = mcts_output.action
-    eval_state = mcts_output.eval_state
-    
-    key, step_key = jax.random.split(key)
-    state, metadata = backgammon_step_fn(env, state, action, step_key)
-    eval_state = mcts.step(eval_state, action)
-    
-    print(f"Applied deterministic action: {action}, {bg.action_to_str(action)}")
-    print(f"New state is_stochastic: {state.is_stochastic}")
-    
-    # Force a stochastic state by manipulating the env if necessary
-    # For Backgammon, a stochastic state will appear after a turn completes
-    # Continue making moves until we get to a stochastic state
-    
-    # If not already in a stochastic state, continue until we reach one
-    while not state.is_stochastic and not state.terminated:
-        key, eval_key = jax.random.split(key)
-        mcts_output = mcts.evaluate(
-            key=eval_key,
-            eval_state=eval_state,
-            env_state=state,
-            root_metadata=metadata,
-            params={},
-            env_step_fn=partial(backgammon_step_fn, env)
-        )
-        
-        action = mcts_output.action
-        eval_state = mcts_output.eval_state
-        
-        key, step_key = jax.random.split(key)
-        state, metadata = backgammon_step_fn(env, state, action, step_key)
-        eval_state = mcts.step(eval_state, action)
-        
-        print(f"Applied action to reach stochastic state: {action}")
-        print(f"New state is_stochastic: {state.is_stochastic}")
-    
-    # Check that we now have a stochastic state
-    assert state.is_stochastic, "Failed to reach a stochastic state for testing"
-    print("Successfully reached a stochastic state")
-    
-    # Now run MCTS on this stochastic state with high iteration count
-    # We expect it to expand all stochastic outcomes and continue exploration
-    key, eval_key = jax.random.split(key)
-    
-    # Create a fresh MCTS instance with high iterations to ensure deep exploration
-    explore_mcts = StochasticMCTS(
-        eval_fn=backgammon_eval_fn,
-        action_selector=PUCTSelector(),
-        branching_factor=env.num_actions,
-        max_nodes=1000,  # Very large to accommodate deep exploration
-        num_iterations=60,  # Enough iterations to explore deeply
-        stochastic_action_probs=env.stochastic_action_probs,
-        discount=-1.0,
-        temperature=1.0,
-        persist_tree=True,
-        debug_level=1
-    )
-    
-    # Initialize a fresh tree
-    explore_eval_state = explore_mcts.init(template_embedding=state)
-    
-    # Run MCTS with high iteration count
-    print(f"Running MCTS with {explore_mcts.num_iterations} iterations on stochastic state")
-    mcts_output = explore_mcts.evaluate(
-        key=eval_key,
-        eval_state=explore_eval_state,
-        env_state=state,
-        root_metadata=metadata,
-        params={},
-        env_step_fn=partial(backgammon_step_fn, env)
-    )
-    
-    # Now examine the tree to verify it explored through stochastic nodes
-    print(f"MCTS tree size after evaluation: {mcts_output.eval_state.next_free_idx} nodes")
     
     # Helper function to analyze the tree structure
-    def find_deepest_path_through_stochastic(tree):
-        """Find the deepest path that goes through at least one stochastic node."""
-        # First, identify stochastic nodes
-        stochastic_nodes = []
-        for i in range(tree.next_free_idx):
-            if tree.node_is_stochastic[i]:
-                stochastic_nodes.append(i)
+    def find_deepest_path(tree):
+        """Find the path to the deepest node in the tree.
+        Returns only valid continuous parent-child paths from root to a leaf."""
+        max_depth = 0
+        deepest_node_idx = tree.ROOT_INDEX
         
-        print(f"Found {len(stochastic_nodes)} stochastic nodes in the tree")
-        
-        # For each stochastic node, find the maximum depth of deterministic nodes after it
-        max_det_depth_after_stoch = 0
-        max_depth_stoch_node = -1
-        max_depth_path = []
-        
-        for stoch_node_idx in stochastic_nodes:
-            # Get all children of the stochastic node
-            stoch_children = []
+        # Use DFS to find the deepest node
+        def dfs(node_idx, current_depth, current_path):
+            nonlocal max_depth, deepest_node_idx
+            
+            # Check if this node has any children
+            has_children = False
             for a in range(tree.branching_factor):
-                child_idx = tree.edge_map[stoch_node_idx, a]
+                child_idx = tree.edge_map[node_idx, a]
                 if child_idx != -1:  # Valid edge
-                    stoch_children.append(child_idx)
-            
-            print(f"Stochastic node {stoch_node_idx} has {len(stoch_children)} children")
-            
-            # For each child of the stochastic node, find the maximum depth of deterministic nodes
-            for child_idx in stoch_children:
-                # Skip if child is itself stochastic
-                if tree.node_is_stochastic[child_idx]:
-                    continue
-                
-                # DFS to find maximum depth of deterministic nodes
-                def dfs(node_idx, depth, path):
-                    # Check if this is a leaf
-                    has_children = False
-                    max_depth = depth
-                    best_path = path
+                    has_children = True
+                    # Verify this is a valid parent-child relationship
+                    is_valid_edge = tree.parents[child_idx] == node_idx
+                    if not is_valid_edge:
+                        print(f"Warning: Invalid edge from {node_idx} to {child_idx}. Parent of {child_idx} is {tree.parents[child_idx]}")
+                        continue
                     
-                    # Explore all children
-                    for a in range(tree.branching_factor):
-                        next_idx = tree.edge_map[node_idx, a]
-                        if next_idx != -1:  # Valid edge
-                            has_children = True
-                            # Only continue through deterministic nodes
-                            if not tree.node_is_stochastic[next_idx]:
-                                child_depth, child_path = dfs(next_idx, depth + 1, path + [next_idx])
-                                if child_depth > max_depth:
-                                    max_depth = child_depth
-                                    best_path = child_path
-                    
-                    return max_depth, best_path
+                    # Continue DFS with the child added to path
+                    dfs(child_idx, current_depth + 1, current_path + [child_idx])
+            
+            # If it's a leaf node and deeper than what we've seen before
+            if not has_children and current_depth > max_depth:
+                max_depth = current_depth
+                deepest_node_idx = node_idx
+                print(f"Found new deepest path with depth {current_depth}: {current_path}")
                 
-                det_depth, det_path = dfs(child_idx, 1, [stoch_node_idx, child_idx])  # Start depth at 1 for this deterministic node
-                
-                if det_depth > max_det_depth_after_stoch:
-                    max_det_depth_after_stoch = det_depth
-                    max_depth_stoch_node = stoch_node_idx
-                    max_depth_path = det_path
+                # Validate the entire path to make sure it's proper parent-c
         
-        return max_det_depth_after_stoch, max_depth_stoch_node, max_depth_path
+        # Start DFS from root node (depth 0)
+        dfs(tree.ROOT_INDEX, 0, [tree.ROOT_INDEX])
+        
+        return max_depth, deepest_node_idx
     
     # Analyze the tree
-    max_depth, stoch_node, path = find_deepest_path_through_stochastic(mcts_output.eval_state)
+    tree = mcts_output.eval_state
+    max_depth, deepest_node_idx = find_deepest_path(tree)
     
-    print(f"Maximum depth of deterministic nodes after a stochastic node: {max_depth}")
-    print(f"Stochastic node with deepest deterministic path: {stoch_node}")
-    print(f"Path with maximum depth: {path}")
+    # Verify the path is actually valid
+    current_node_idx = deepest_node_idx
+    num_transitions = 0
+    total_depth = 0
+  
+    while tree.parents[current_node_idx] != tree.ROOT_INDEX:
+        if tree.node_is_stochastic[current_node_idx] != tree.node_is_stochastic[tree.parents[current_node_idx]]:
+            num_transitions += 1
+        current_node_idx = tree.parents[current_node_idx]
+        total_depth += 1
+        #print the node visit count
+        print(f"Node {current_node_idx} visit count: {tree.data_at(current_node_idx).n}")
+        assert tree.data_at(tree.parents[current_node_idx]).n >= tree.data_at(current_node_idx).n, \
+            f"Parent node {tree.parents[current_node_idx]} visit count ({tree.data_at(tree.parents[current_node_idx]).n}) should be >= child node {current_node_idx} visit count ({tree.data_at(current_node_idx).n})"
+        assert total_depth < 1000, "Infinite loop detected"  
+
+
+
     
-    # Verify that there are at least 2 levels of deterministic nodes after a stochastic node
-    assert max_depth >= 2, f"Expected at least 2 levels of deterministic nodes after a stochastic node, got {max_depth}"
+    assert max_depth >= 6, f"Expected path length of at least 3, got {max_depth}"
+    assert max_depth <= 105, f"Path length ({max_depth}) should not exceed iteration count"
+    
+ 
+    print(f"Number of transitions between stochastic and deterministic nodes: {num_transitions}")
+    assert num_transitions >= 5, "Expected at least one transition between stochastic and deterministic nodes"
     
     print("Successfully verified that MCTS can traverse through stochastic nodes") 

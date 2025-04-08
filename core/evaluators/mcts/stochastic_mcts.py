@@ -20,10 +20,9 @@ from flax import struct
 DEBUG_LEVEL = 0  # 0 = minimal debug output, 1 = important messages, 2 = verbose
 # Add a debug print function
 def debug_print(msg, *args, level=1, **kwargs):
-    pass
-    # if level <= DEBUG_LEVEL:
-    #     time_stamp = time.time()
-    #     print(f"[DEBUG-STOCHASTIC_MCTS-{time_stamp}] {msg}", *args, **kwargs)
+    if level <= DEBUG_LEVEL:
+        time_stamp = time.time()
+        print(f"[DEBUG-STOCHASTIC_MCTS-{time_stamp}] {msg}", *args, **kwargs)
 
 @struct.dataclass
 class StochasticMCTSTree(MCTSTree):
@@ -85,6 +84,8 @@ class StochasticMCTS(Evaluator):
         # Set global debug level
         global DEBUG_LEVEL
         DEBUG_LEVEL = debug_level
+
+        assert self.branching_factor >= len(self.stochastic_action_probs), f"Branching factor must be >= number of stochastic actions: {len(self.stochastic_action_probs)}"
         
         debug_print(f"StochasticMCTS initialized with num_iterations={num_iterations}, max_nodes={max_nodes}", level=1)
 
@@ -441,7 +442,7 @@ class StochasticMCTS(Evaluator):
             tree, next_idx, _existing_idx, is_stochastic, _node_data = operand
             new_node_idx = next_idx
             new_node = MCTSNode(
-                n=jnp.array(0, dtype=jnp.int32), 
+                n=jnp.array(1, dtype=jnp.int32), # Start visits at 1 to be consistent with new_node 
                 p=policy, 
                 q=value, 
                 terminated=new_metadata.terminated,
@@ -588,7 +589,7 @@ class StochasticMCTS(Evaluator):
                 
                 # Create the child node using ONLY defined fields
                 child_node = MCTSNode(
-                    n=jnp.array(0, dtype=jnp.int32), # Start visits at 0
+                    n=jnp.array(1, dtype=jnp.int32), # Start visits at 1 to be consistent with new_node
                     p=policy,
                     q=value, # Initial q is evaluated value
                     terminated=child_metadata.terminated,
@@ -941,13 +942,13 @@ class StochasticMCTS(Evaluator):
         Returns:
         - (StochasticMCTSTree): updated search tree
         """
-        debug_print(f"Starting backpropagation from node {start_node_idx} with value {value}")
+        debug_print(f"Starting backpropagation from node {start_node_idx} with value {value}", level=2)
 
         def body_fn(state: BackpropState) -> BackpropState:
             """Updates one node in the backpropagation path."""
             # Note: loop_idx is not directly used, state carries the current node index
             node_idx, current_value, current_tree = state.node_idx, state.value, state.tree
-            debug_print(f"Backpropagating through node {node_idx} with value {current_value}")
+            debug_print(f"Backpropagating through node {node_idx} with value {current_value}", level=2)
             
             # Stop if we reached the root's parent (-1)
             # Should not happen if start_node_idx is valid, but good safeguard.
@@ -959,7 +960,7 @@ class StochasticMCTS(Evaluator):
             # Get node data
             node_data = current_tree.data_at(node_idx)
             is_stochastic = current_tree.node_is_stochastic[node_idx]
-            debug_print(f"Node {node_idx}: is_stochastic={is_stochastic}, n={node_data.n}, q={node_data.q}, parent={parent_idx}")
+            debug_print(f"Node {node_idx}: is_stochastic={is_stochastic}, n={node_data.n}, q={node_data.q}, parent={parent_idx}", level=2)
 
             # --- Calculate updated Q-value conditionally ---
             def update_deterministic_q():
@@ -968,11 +969,11 @@ class StochasticMCTS(Evaluator):
                 # We assume n represents visits *before* this backprop step.
                 n_plus_1 = node_data.n + 1.0 # Use float for division
                 new_q = (node_data.q * node_data.n + current_value) / n_plus_1
-                debug_print(f"Deterministic update: old_q={node_data.q}, n={node_data.n}, value={current_value}, new_q={new_q}")
+                debug_print(f"Deterministic update: old_q={node_data.q}, n={node_data.n}, value={current_value}, new_q={new_q}", level=2)
                 return new_q
 
             def update_stochastic_q():
-                debug_print(f"Updating stochastic node {node_idx}")
+                debug_print(f"Updating stochastic node {node_idx}", level=2)
                 # Value is the weighted average of children's current Q-values
                 # Iterate through all possible actions/edges
                 num_stochastic_outcomes = len(self.stochastic_action_probs)
@@ -986,13 +987,13 @@ class StochasticMCTS(Evaluator):
                     prob = self.stochastic_action_probs[action_idx]
                     # Add weighted value
                     new_sum = running_value_sum + prob * child_q
-                    debug_print(f"  Child {action_idx}: exists={child_exists}, child_idx={child_node_idx if child_exists else 'N/A'}, q={child_q if child_exists else 0}, prob={prob}, running_sum={new_sum}")
+                    debug_print(f"  Child {action_idx}: exists={child_exists}, child_idx={child_node_idx if child_exists else 'N/A'}, q={child_q if child_exists else 0}, prob={prob}, running_sum={new_sum}", level=2)
                     return new_sum
                 
                 # Calculate sum using fori_loop over all stochastic outcomes
                 weighted_q_sum = jax.lax.fori_loop(0, num_stochastic_outcomes, sum_child_values, 0.0)
                 # The stochastic node's value IS this weighted sum.
-                debug_print(f"Stochastic update final weighted_q_sum={weighted_q_sum}")
+                debug_print(f"Stochastic update final weighted_q_sum={weighted_q_sum}", level=2)
                 return weighted_q_sum
             
             updated_q = jax.lax.cond(
@@ -1024,7 +1025,7 @@ class StochasticMCTS(Evaluator):
                 lambda: current_value * self.discount # Propagate the original value discounted
             )
             
-            debug_print(f"Node {node_idx} updated: n={updated_node_data.n}, q={updated_node_data.q}, next node will be {parent_idx}")
+            debug_print(f"Node {node_idx} updated: n={updated_node_data.n}, q={updated_node_data.q}, next node will be {parent_idx}", level=2)
             # Return the *new_tree* in the state
             return BackpropState(node_idx=parent_idx, value=next_value, tree=new_tree) 
 
@@ -1033,26 +1034,23 @@ class StochasticMCTS(Evaluator):
             # We process the root node, then stop. The loop runs N times where N is path length.
             # state.node_idx becomes -1 after processing the root.
             result = state.node_idx != -1
-            debug_print(f"backprop cond_fn with node_idx={state.node_idx}, result={result}")
+            debug_print(f"backprop cond_fn with node_idx={state.node_idx}, result={result}", level=2)
             return result
 
         # Initial state for the loop
-        # Start backprop from the node *parent* of the newly added/evaluated leaf 
-        # OR from the stochastic node itself if that's what was expanded.
-        # Correct attribute name is 'parents'
-        initial_parent_idx = tree.parents[start_node_idx]
+        # Start backprop from the node *itself* (not just parent) to ensure leaf nodes get updated
         initial_state = BackpropState(node_idx=start_node_idx, value=value, tree=tree)
-        debug_print(f"Backprop initial state: node_idx={start_node_idx}, value={value}, parent={initial_parent_idx}")
+        debug_print(f"Backprop initial state: node_idx={start_node_idx}, value={value}, parent={tree.parents[start_node_idx]}", level=2)
         
         # Run the loop
         try:
             # Note: Using while_loop as path length isn't fixed
-            debug_print("Entering backprop while_loop")
+            debug_print("Entering backprop while_loop", level=2)
             final_state = jax.lax.while_loop(cond_fn, body_fn, initial_state)
-            debug_print(f"Backprop while_loop completed, final tree size: {final_state.tree.next_free_idx}")
+            debug_print(f"Backprop while_loop completed, final tree size: {final_state.tree.next_free_idx}", level=2)
             return final_state.tree
         except Exception as e:
-            debug_print(f"Exception in backprop while_loop: {e}")
+            debug_print(f"Exception in backprop while_loop: {e}", level=1)
             # Return the original tree if while_loop fails
             return tree
 
