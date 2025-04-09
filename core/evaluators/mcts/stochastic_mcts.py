@@ -73,27 +73,61 @@ class StochasticMCTS(MCTS):
         return self.action_selector(tree, node_idx, discount)
     
     def explore_stochastic_action_selector(self, key: chex.PRNGKey, tree, node_idx, discount):
-        """Called when traversing the tree and exploring possibilities..
+        """Called when traversing the tree and exploring possibilities.
+        
+        Selects the action with the largest discrepancy between the child's observed
+        visit frequency and its theoretical stochastic probability.
         
         Args:
         - `key`: rng
         - `tree`: MCTSTree to evaluate
         - `node_idx`: index of the node to select an action from
+        - `discount`: discount factor (not used in this selector)
+        
+        Returns:
+        - The action with the largest delta between observed visit frequency and stochastic probability
         """
-        # we want a function that will return the biggest delta between the visits counts vs the stochastic action probs
-
-        # get normalized visit count percetnages of all children
-        visit_counts = tree.data_at(node_idx).n
-        visit_counts = visit_counts / jnp.sum(visit_counts)
-
-        # get the delta between the visit counts and the stochastic action probs
-        delta = jnp.abs(visit_counts - self.stochastic_action_probs)
-
-        # add some noise to the delta
+        # Get the number of stochastic actions
+        num_stochastic_actions = len(self.stochastic_action_probs)
+        
+        # Get the mapping from edge indices to child node indices, but only for stochastic actions
+        child_indices = tree.edge_map[node_idx, :num_stochastic_actions]
+        
+        # Create a mask for edges that exist (not NULL_INDEX)
+        child_exists_mask = child_indices != tree.NULL_INDEX
+        
+        # For vectorized child visit count retrieval, we need to handle NULL_INDEX
+        # We'll replace NULL_INDEX with 0 for array access, then mask the result
+        safe_indices = jnp.maximum(child_indices, 0)  # Replace -1 with 0 for safe access
+        
+        # Vectorized access to visit counts - get n for all safe_indices
+        # Shape: (num_stochastic_actions,)
+        all_n = tree.data.n[safe_indices]
+        
+        # Apply mask to zero out non-existent children
+        # Shape: (num_stochastic_actions,)
+        child_visits = jnp.where(child_exists_mask, all_n, 0)
+        
+        # Calculate total visits
+        total_visits = jnp.sum(child_visits)
+        
+        # Normalize visit counts; handle the case where total_visits=0
+        normalized_visits = jnp.where(
+            total_visits > 0,
+            child_visits / total_visits,
+            # If total_visits=0, use a uniform distribution
+            jnp.ones_like(child_visits, dtype=jnp.float32) / num_stochastic_actions
+        )
+        
+        # Calculate deltas between actual visit frequencies and theoretical probabilities
+        # Now both arrays have shape (num_stochastic_actions,)
+        delta = self.stochastic_action_probs - normalized_visits 
+        
+        # Add some noise to break ties
         key, noise_key = jax.random.split(key)
         delta = delta + jax.random.normal(noise_key, delta.shape) * self.noise_scale
-
-        # return the action with the biggest delta
+        
+        # Return the action with the biggest delta
         return jnp.argmax(delta)
     
     
@@ -114,7 +148,36 @@ class StochasticMCTS(MCTS):
             key, tree, node_idx, discount
         )
         
+    
+    def det_value_policy(self, embedding, params, eval_key, metadata, player_reward) -> Tuple[float, chex.Array]:
+        """Get value and policy for deterministic nodes."""
+        policy_logits, value = self.eval_fn(embedding, params, eval_key)
+        policy_logits = jnp.where(metadata.action_mask, policy_logits, jnp.finfo(policy_logits).min)
+        policy = jax.nn.softmax(policy_logits)
+        value = jnp.where(metadata.terminated, player_reward, value)
+        return value, policy
+
+    def stochastic_value_policy(self, tree, parent_idx, embedding, params, eval_key, metadata, player_reward) -> Tuple[float, chex.Array]:
+        """Get value and policy for stochastic nodes.
         
+        For stochastic nodes:
+        - If parent exists (not root), set value to the parent's Q-value
+        - Otherwise use 0.0 as a neutral value
+        - Set policy to all zeros as stochastic nodes don't have meaningful policies
+        """
+        # Get parent's Q-value if parent exists (not ROOT_INDEX)
+        parent_is_root = parent_idx == tree.NULL_INDEX  # No parent (this is root)
+        
+        # For root stochastic nodes, use a neutral value (0.0)
+        # For non-root stochastic nodes, inherit parent's Q-value
+        parent_q = jnp.where(parent_is_root, 
+                             0.0,  # Default value if root
+                             tree.data_at(parent_idx).q)  # Parent's Q-value
+        
+        # Just use zeros for policy since stochastic nodes don't have meaningful policies
+        policy = jnp.zeros((self.branching_factor,), dtype=jnp.float32)
+        
+        return parent_q, policy
 
     def iterate(self, key: chex.PRNGKey, tree: MCTSTree, params: chex.ArrayTree, env_step_fn: EnvStepFn) -> MCTSTree:
         """ Performs one iteration of MCTS.
@@ -144,11 +207,17 @@ class StochasticMCTS(MCTS):
         new_embedding, metadata = env_step_fn(embedding, action, step_key)
         
         player_reward = metadata.rewards[metadata.cur_player_id]
-        # evaluate leaf node
-        policy_logits, value = self.eval_fn(new_embedding, params, eval_key)
-        policy_logits = jnp.where(metadata.action_mask, policy_logits, jnp.finfo(policy_logits).min)
-        policy = jax.nn.softmax(policy_logits)
-        value = jnp.where(metadata.terminated, player_reward, value)
+        
+        # Check if the new state is stochastic
+        is_stochastic = new_embedding.is_stochastic
+        
+        # Evaluate leaf node - use different evaluation based on stochastic vs deterministic
+        value, policy = jax.lax.cond(
+            is_stochastic,
+            lambda: self.stochastic_value_policy(tree, parent, new_embedding, params, eval_key, metadata, player_reward),
+            lambda: self.det_value_policy(new_embedding, params, eval_key, metadata, player_reward)
+        )
+        
         # add leaf node to tree
         node_exists = tree.is_edge(parent, action)
         node_idx = tree.edge_map[parent, action]

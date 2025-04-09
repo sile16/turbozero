@@ -307,7 +307,8 @@ def test_traverse_through_stochastic_nodes():
     total_depth = 0
   
     while tree.parents[current_node_idx] != tree.ROOT_INDEX:
-        if tree.node_is_stochastic[current_node_idx] != tree.node_is_stochastic[tree.parents[current_node_idx]]:
+        if StochasticMCTS.is_node_idx_stochastic_stochastic(tree, current_node_idx) != \
+              StochasticMCTS.is_node_stochastic(tree, tree.parents[current_node_idx]):
             num_transitions += 1
         current_node_idx = tree.parents[current_node_idx]
         total_depth += 1

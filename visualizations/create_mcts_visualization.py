@@ -275,7 +275,6 @@ def create_real_mcts_visualization(output_dir):
         discount=-1.0,
         temperature=1.0,
         persist_tree=True,  # Critical to preserve tree between steps
-        debug_level=2
     )
     
     # Debug - Confirm the MCTS configuration
