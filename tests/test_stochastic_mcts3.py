@@ -3,7 +3,7 @@ import jax.numpy as jnp
 from functools import partial
 
 import pgx.backgammon as bg
-from core.evaluators.mcts.stochastic_mcts import StochasticMCTS, StochasticMCTSTree
+from core.evaluators.mcts.stochastic_mcts import StochasticMCTS
 from core.evaluators.mcts.action_selection import PUCTSelector
 from core.types import StepMetadata
 
@@ -89,7 +89,6 @@ def test_stochastic_mcts_backgammon_simple_doubles_valid_actions():
         discount=-1.0,
         temperature=0.0, # Greedy action selection
         persist_tree=True, # Player 0 persists tree
-        debug_level=0
     )
 
     mcts_p1 = StochasticMCTS(
@@ -102,7 +101,6 @@ def test_stochastic_mcts_backgammon_simple_doubles_valid_actions():
         discount=-1.0,
         temperature=0.0, # Greedy action selection
         persist_tree=False, # Player 1 does NOT persist tree
-        debug_level=0
     )
 
     # --- Initialization ---
@@ -236,8 +234,7 @@ def test_traverse_through_stochastic_nodes():
         stochastic_action_probs=env.stochastic_action_probs,
         discount=-1.0,
         temperature=1.0,  # Some exploration temperature
-        persist_tree=True,
-        debug_level=1  # Enable some debugging output
+        persist_tree=True # Enable some debugging output
     )
     
     # Initialize evaluation state and metadata

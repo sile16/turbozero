@@ -103,7 +103,7 @@ def tree_to_graph(eval_state, output_dir, boards_dir):
                          # Attempt to get action string, fallback to index
                          try:
                              # Determine if the node itself is stochastic to hint at action type
-                             is_stochastic_node = tree.node_is_stochastic[node_idx] if hasattr(tree, 'node_is_stochastic') else False
+                             is_stochastic_node = StochasticMCTS.is_node_idx_stochastic(tree, node_idx)
                              if is_stochastic_node:
                                  action_label = bg.stochastic_action_to_str(idx)
                              else:
@@ -117,7 +117,7 @@ def tree_to_graph(eval_state, output_dir, boards_dir):
                  label += "\\nPolicy: (Error)" # Indicate if policy parsing failed
         
         # Set node style - simplified to just deterministic vs stochastic
-        is_stochastic = tree.node_is_stochastic[node_idx] if hasattr(tree, 'node_is_stochastic') else False
+        is_stochastic = StochasticMCTS.is_node_idx_stochastic(tree, node_idx)
         if is_stochastic:
             fillcolor = 'lightcoral'  # Stochastic nodes
         elif node_data.terminated:
@@ -159,7 +159,7 @@ def tree_to_graph(eval_state, output_dir, boards_dir):
                 
                 # Format edge label - REFINED LOGIC
                 try:
-                    is_parent_stochastic = tree.node_is_stochastic[node_idx] if hasattr(tree, 'node_is_stochastic') else False
+                    is_parent_stochastic = StochasticMCTS.is_node_idx_stochastic(tree, node_idx)
                     if is_parent_stochastic:
                         # Parent is stochastic, action selects a stochastic outcome
                         try:

@@ -1,14 +1,12 @@
-
-from functools import partial
-from typing import Dict, Optional, Tuple
+from typing import Optional, Tuple
 import jax
-import chex
 import jax.numpy as jnp
-from core.evaluators.evaluator import Evaluator
+import chex
 from core.evaluators.mcts.action_selection import MCTSActionSelector
 from core.evaluators.mcts.state import BackpropState, MCTSNode, MCTSTree, TraversalState, MCTSOutput
-from core.trees.tree import init_tree
+from core.evaluators.mcts.mcts import MCTS
 from core.types import EnvStepFn, EvalFn, StepMetadata
+
 
 class StochasticMCTS(MCTS):
     """Batched implementation of Monte Carlo Tree Search (MCTS).
@@ -19,14 +17,15 @@ class StochasticMCTS(MCTS):
     def __init__(self,
         eval_fn: EvalFn,
         action_selector: MCTSActionSelector,
-        stochastic_action_probs: List[float],
+        stochastic_action_probs: chex.Array,
         branching_factor: int,
         max_nodes: int,
         num_iterations: int,
         discount: float = -1.0,
         temperature: float = 1.0,
         tiebreak_noise: float = 1e-8,
-        persist_tree: bool = True
+        persist_tree: bool = True,
+        noise_scale: float = 0.05
     ):
         """
         Args:
@@ -42,22 +41,45 @@ class StochasticMCTS(MCTS):
         - `temperature`: temperature for root action selection (default: 1.0)
         - `tiebreak_noise`: magnitude of noise to add to policy weights for breaking ties (default: 1e-8)
         - `persist_tree`: whether to persist search tree state between calls to `evaluate` (default: True)
+        - `noise_scale`: scale of noise to add to delta values in stochastic action selection (default: 0.05)
         """
         super().__init__(eval_fn, action_selector, branching_factor, max_nodes, num_iterations, discount, temperature, tiebreak_noise, persist_tree)
 
         self.stochastic_action_probs = stochastic_action_probs
+        self.noise_scale = noise_scale
 
-    def existing_stochastic_action_selector(self, key: chex.PRNGKey, tree, node_idx, discount):
-        """Select an action from the node.
+    def stochastic_action_selector(self, key: chex.PRNGKey, tree, node_idx, discount):
+        """Select an action from the node, no use in exploring at this point so we just use the stochastic action probs.
+        i.e. we are rolling the dice to get the next deterministic state.
         
         Args:
         - `tree`: MCTSTree to evaluate
         - `node_idx`: index of the node to select an action from
         """
-        choice_key, key = jax.random.split(key)
-        return jax.random.choice(self.stochastic_action_probs)
+        # Properly handle the key for jax.random.choice which expects a single key
+        choice_key, _ = jax.random.split(key)
+        action = jax.random.choice(choice_key, len(self.stochastic_action_probs), p=self.stochastic_action_probs)
+            
+        return jnp.array(action, dtype=jnp.int32)
+    
+    
+    def deterministic_action_selector(self, key: chex.PRNGKey, tree: MCTSTree, node_idx: int, discount: float) -> int:
+        """Just a wrapper function to call the action selector removing the key argument.
+        
+        Args:
+        - `tree`: MCTSTree to evaluate
+        - `node_idx`: index of the node to select an action from
+        """
+        return self.action_selector(tree, node_idx, discount)
     
     def explore_stochastic_action_selector(self, key: chex.PRNGKey, tree, node_idx, discount):
+        """Called when traversing the tree and exploring possibilities..
+        
+        Args:
+        - `key`: rng
+        - `tree`: MCTSTree to evaluate
+        - `node_idx`: index of the node to select an action from
+        """
         # we want a function that will return the biggest delta between the visits counts vs the stochastic action probs
 
         # get normalized visit count percetnages of all children
@@ -68,16 +90,13 @@ class StochasticMCTS(MCTS):
         delta = jnp.abs(visit_counts - self.stochastic_action_probs)
 
         # add some noise to the delta
-        delta = delta + jax.random.normal(key, delta.shape) * self.noise_scale
+        key, noise_key = jax.random.split(key)
+        delta = delta + jax.random.normal(noise_key, delta.shape) * self.noise_scale
 
         # return the action with the biggest delta
         return jnp.argmax(delta)
     
     
-    def deterministic_action_selector(self, key: chex.PRNGKey tree, node_idx, discount):
-        # wrapper function to call the action selector removing the key argument
-        return self.action_selector(tree, node_idx, discount)
-
 
     def cond_action_selector(self, key: chex.PRNGKey, tree: MCTSTree, node_idx: int, discount: float) -> int:
         """Select an action from the node, picks the right action selector based on the node type.
@@ -87,10 +106,13 @@ class StochasticMCTS(MCTS):
         - `node_idx`: index of the node to select an action from
         """
 
-        jax.lax.cond(tree.data_at(node_idx).embedding.is_stochastic, 
-                     self.stochastic_action_selector, 
-                     self.deterministic_action_selector, 
-                     tree, node_idx, discount)
+        # Create lambda functions that capture all required parameters
+        return jax.lax.cond(
+            StochasticMCTS.is_node_idx_stochastic(tree, node_idx), 
+            lambda k, t, n, d: self.explore_stochastic_action_selector(k, t, n, d),
+            lambda k, t, n, d: self.deterministic_action_selector(k, t, n, d),
+            key, tree, node_idx, discount
+        )
         
         
 
@@ -114,10 +136,15 @@ class StochasticMCTS(MCTS):
         parent, action = traversal_state.parent, traversal_state.action
         # get env state (embedding) for leaf node
         embedding = tree.data_at(parent).embedding
-        new_embedding, metadata = env_step_fn(embedding, action)
+        
+        # Split key for step function and evaluation
+        step_key, eval_key, key = jax.random.split(key, 3)
+        
+        # Call step function with the required key parameter
+        new_embedding, metadata = env_step_fn(embedding, action, step_key)
+        
         player_reward = metadata.rewards[metadata.cur_player_id]
         # evaluate leaf node
-        eval_key, key = jax.random.split(key)
         policy_logits, value = self.eval_fn(new_embedding, params, eval_key)
         policy_logits = jnp.where(metadata.action_mask, policy_logits, jnp.finfo(policy_logits).min)
         policy = jax.nn.softmax(policy_logits)
@@ -180,33 +207,6 @@ class StochasticMCTS(MCTS):
         )
 
 
-    def stochastic_evaluate(self, #pylint: disable=arguments-differ
-        key: chex.PRNGKey,
-        eval_state: MCTSTree, 
-        env_state: chex.ArrayTree,
-        root_metadata: StepMetadata,
-        params: chex.ArrayTree,
-        env_step_fn: EnvStepFn,
-        **kwargs
-    ) -> MCTSOutput:
-        """Performs `self.num_iterations` MCTS iterations on an `MCTSTree`.
-        Samples an action to take from the root node after search is completed.
-        
-        Args:
-        - `eval_state`: `MCTSTree` to evaluate, could be empty or partially complete
-
-        """
-
-        action = self.stochastic_action_selector(key,eval_state, eval_state.ROOT_INDEX, self.discount)
-
-        return MCTSOutput(
-            eval_state=eval_state,
-            action=action,
-            policy_weights=jnp.zeros((self.branching_factor,))
-        )
-
-
-
     def evaluate(self, #pylint: disable=arguments-differ
         key: chex.PRNGKey,
         eval_state: MCTSTree, 
@@ -229,11 +229,51 @@ class StochasticMCTS(MCTS):
         Returns:
         - (MCTSOutput): contains new tree state, selected action, root value, and policy weights
         """
+        tree = eval_state
+        
+        # Define lambda functions that capture all required parameters
+        def true_fn():
+            return self.stochastic_evaluate(key, eval_state, env_state, root_metadata, params, env_step_fn)
+        
+        def false_fn():
+            return MCTS.evaluate(self, key, eval_state, env_state, root_metadata, params, env_step_fn)
+        
+        return jax.lax.cond(
+            StochasticMCTS.is_node_idx_stochastic(tree, tree.ROOT_INDEX),
+            true_fn,
+            false_fn
+        )
 
-       jax.lax.cond(tree.data_at(tree.ROOT_INDEX).is_stochastic, 
-                    self.stochastic_evaluate, 
-                    super().evaluate, 
-                    key, eval_state, env_state, root_metadata, params, env_step_fn)
+    def stochastic_evaluate(self, #pylint: disable=arguments-differ
+        key: chex.PRNGKey,
+        eval_state: MCTSTree, 
+        env_state: chex.ArrayTree,
+        root_metadata: StepMetadata,
+        params: chex.ArrayTree,
+        env_step_fn: EnvStepFn,
+        **kwargs
+    ) -> MCTSOutput:
+        """Performs `self.num_iterations` MCTS iterations on an `MCTSTree`.
+        Samples an action to take from the root node after search is completed.
+        
+        Args:
+        - `eval_state`: `MCTSTree` to evaluate, could be empty or partially complete
+
+        """
+        # Get the action using stochastic_action_selector
+        action = self.stochastic_action_selector(key, eval_state, eval_state.ROOT_INDEX, self.discount)
+        
+        # Convert to integer32 to match MCTS.evaluate output type 
+        
+        
+        # Create zero policy weights of the right shape
+        policy_weights = jnp.zeros((self.branching_factor,), dtype=jnp.float32)
+
+        return MCTSOutput(
+            eval_state=eval_state,
+            action=action,
+            policy_weights=policy_weights
+        )
 
     def backpropagate(self, key: chex.PRNGKey, tree: MCTSTree, parent: int, value: float) -> MCTSTree: #pylint: disable=unused-argument
         """Backpropagate the value estimate from the leaf node to the root node and update visit counts.
@@ -268,7 +308,8 @@ class StochasticMCTS(MCTS):
         )
         return state.tree
 
-    def stochastic_new_q_value(self, node: MCTSNode, value: float) -> float:
+    @staticmethod
+    def stochastic_new_q_value(node: MCTSNode, value: float) -> float:
         """Calculate the new Q value for a node.
         
         Args:
@@ -285,7 +326,8 @@ class StochasticMCTS(MCTS):
         # do a weighted sum of the q values
         return jnp.sum(q_values * visit_counts)
 
-    def deterministic_new_q_value(self, node: MCTSNode, value: float) -> float:
+    @staticmethod
+    def deterministic_new_q_value(node: MCTSNode, value: float) -> float:
         """Calculate the new Q value for a node.
 
         Args:
@@ -294,7 +336,25 @@ class StochasticMCTS(MCTS):
         """
         return((node.q * node.n) + value) / (node.n + 1)
 
-
+    @staticmethod
+    def is_node_stochastic(node: MCTSNode) -> jnp.bool_:
+        """Check if the node is stochastic.
+        
+        Returns a JAX boolean that can be used with jax.lax.cond.
+        """
+        # Access the is_stochastic flag directly without conversion to Python bool
+        # which would cause tracing errors
+        return node.embedding.is_stochastic
+    
+    @staticmethod
+    def is_node_idx_stochastic(tree: MCTSTree, node_idx: int) -> jnp.bool_:
+        """Check if the node is stochastic.
+        
+        Returns a JAX boolean that can be used with jax.lax.cond.
+        """
+        # Access the is_stochastic flag directly from the embedded state
+        # Don't convert to Python bool as that would break JAX tracing
+        return tree.data_at(node_idx).embedding.is_stochastic
 
     @staticmethod
     def visit_node(
@@ -319,10 +379,12 @@ class StochasticMCTS(MCTS):
         - (MCTSNode): updated MCTSNode
         """
         # update running value estimate
-        q_value = jax.lax.cond(node.is_stochastic, 
-                               stochastic_new_q_value, 
-                               deterministic_new_q_value, 
-                               node, value)
+        q_value = jax.lax.cond(
+            StochasticMCTS.is_node_stochastic(node), 
+            StochasticMCTS.stochastic_new_q_value, 
+            StochasticMCTS.deterministic_new_q_value, 
+            node, value
+        )
         # update other node attributes
         if p is None:
             p = node.p

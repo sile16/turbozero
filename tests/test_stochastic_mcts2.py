@@ -13,7 +13,7 @@ from core.evaluators.mcts.state import tree_to_graph # Added for visualization
 
 
 # Imports from your project (adjust paths as necessary)
-from core.evaluators.mcts.stochastic_mcts import StochasticMCTS, StochasticMCTSTree, MCTSNode, MCTSOutput
+from core.evaluators.mcts.stochastic_mcts import StochasticMCTS, MCTSNode, MCTSOutput
 from core.evaluators.mcts.action_selection import MCTSActionSelector, PUCTSelector
 from core.types import StepMetadata, EvalFn, EnvStepFn
 from core.evaluators.evaluator import EvalOutput
@@ -129,97 +129,6 @@ def mcts_config(branching_factor, stochastic_action_probs):
         "stochastic_action_probs": stochastic_action_probs
     }
 
-@pytest.fixture
-def stochastic_mcts(monkeypatch, mcts_config):
-    mcts = StochasticMCTS(**mcts_config)
-    
-    # # Mock the init method specifically for testing to avoid JAX tree incompatibility issues
-    # def mock_init(self, template_embedding, *args, **kwargs):
-    #     """Create a minimal version of the tree for testing purposes.""""
-    #     from core.trees.tree import init_tree
-    #     
-    #     # Initialize a basic MCTSNode for the template
-    #     template_node = MCTSNode(
-    #         p=jnp.zeros(self.branching_factor),
-    #         q=jnp.array(0.0, dtype=jnp.float32), # Use JAX array for float
-    #         n=jnp.array(0, dtype=jnp.int32), # Use JAX array for int
-    #         embedding=template_embedding,
-    #         terminated=jnp.array(False) # Use JAX array for bool
-    #     )
-    #     
-    #     # Use the existing init_tree function from the codebase
-    #     base_tree = init_tree(self.max_nodes, self.branching_factor, template_node)
-    #     
-    #     # Add the stochastic flag array to create a StochasticMCTSTree
-    #     node_is_stochastic = jnp.zeros(self.max_nodes, dtype=jnp.bool_)
-    #     
-    #     # Return the proper StochasticMCTSTree using the fields from the base tree
-    #     # Plus our additional stochastic flag array
-    #     tree = StochasticMCTSTree(
-    #         next_free_idx=base_tree.next_free_idx,
-    #         parents=base_tree.parents,
-    #         edge_map=base_tree.edge_map,
-    #         data=base_tree.data,
-    #         node_is_stochastic=node_is_stochastic
-    #     )
-    #     
-    #     # Set root node with uniform policy
-    #     root_policy = jnp.ones(self.branching_factor) / self.branching_factor
-    #     root_node = MCTSNode(
-    #         p=root_policy,
-    #         q=0.0,
-    #         n=0,
-    #         embedding=template_embedding,
-    #         terminated=False
-    #     )
-    #     
-    #     # Update root node data using set_root to potentially increment next_free_idx
-    #     return tree.set_root(root_node)
-    
-    # # Patch the init method for testing
-    # monkeypatch.setattr(StochasticMCTS, "init", mock_init)
-    
-    return mcts
-
-@pytest.fixture
-def non_persistent_mcts(monkeypatch, mcts_config):
-    """Fixture for StochasticMCTS with persist_tree=False."""
-    config = mcts_config.copy()
-    config["persist_tree"] = False
-    mcts = StochasticMCTS(**config)
-    
-    # # Mock the init method same as the persistent one
-    # def mock_init(self, template_embedding, *args, **kwargs):
-    #     """Create a minimal version of the tree for testing purposes."""
-    #     from core.trees.tree import init_tree
-    #     template_node = MCTSNode(
-    #         p=jnp.zeros(self.branching_factor),
-    #         q=jnp.array(0.0, dtype=jnp.float32), # Use JAX array for float
-    #         n=jnp.array(0, dtype=jnp.int32), # Use JAX array for int
-    #         embedding=template_embedding,
-    #         terminated=jnp.array(False) # Use JAX array for bool
-    #     )
-    #     base_tree = init_tree(self.max_nodes, self.branching_factor, template_node)
-    #     node_is_stochastic = jnp.zeros(self.max_nodes, dtype=jnp.bool_)
-    #     tree = StochasticMCTSTree(
-    #         next_free_idx=base_tree.next_free_idx,
-    #         parents=base_tree.parents,
-    #         edge_map=base_tree.edge_map,
-    #         data=base_tree.data,
-    #         node_is_stochastic=node_is_stochastic
-    #     )
-    #     root_policy = jnp.ones(self.branching_factor) / self.branching_factor
-    #     root_node = MCTSNode(
-    #         p=root_policy,
-    #         q=0.0,
-    #         n=0,
-    #         embedding=template_embedding,
-    #         terminated=False
-    #     )
-    #     return tree.set_root(root_node)
-    
-    # monkeypatch.setattr(StochasticMCTS, "init", mock_init)
-    return mcts
 
 # --- Test Cases ---
 
