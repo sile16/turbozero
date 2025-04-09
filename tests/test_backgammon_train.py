@@ -99,7 +99,7 @@ def state_to_nn_input(state):
 # --- Define a Simple MLP Network ---
 class SimpleMLP(nn.Module):
     num_actions: int
-    hidden_dim: int = 64
+    hidden_dim: int = 128
 
     @nn.compact
     def __call__(self, x, train: bool):
@@ -192,8 +192,8 @@ random_evaluator = RandomEvaluator()
 evaluator = StochasticMCTS(   #Explores new moves
     eval_fn=make_nn_eval_fn(mlp_policy_value_net, state_to_nn_input),
     stochastic_action_probs=STOCHASTIC_PROBS,
-    num_iterations=4,  # Very few iterations
-    max_nodes=10,      # Very small tree
+    num_iterations=200,  
+    max_nodes=300,      
     branching_factor=NUM_ACTIONS,
     action_selector=PUCTSelector(),
     temperature=1.0,
@@ -202,8 +202,8 @@ evaluator = StochasticMCTS(   #Explores new moves
 evaluator_test = StochasticMCTS(   #Use optimized moves, temperature=0.0
     eval_fn=make_nn_eval_fn(mlp_policy_value_net, state_to_nn_input),
     stochastic_action_probs=STOCHASTIC_PROBS,
-    num_iterations=4,  # Very few iterations
-    max_nodes=20,      # Very small tree
+    num_iterations=200,  # Very few iterations
+    max_nodes=300,      # Very small tree
     branching_factor=NUM_ACTIONS,
     action_selector=PUCTSelector(),
     temperature=0.0,
@@ -213,8 +213,8 @@ evaluator_test = StochasticMCTS(   #Use optimized moves, temperature=0.0
 pip_count_mcts_evaluator_test = StochasticMCTS(  # optimizes for moves
     eval_fn=backgammon_pip_count_eval, # Use pip count eval fn
     stochastic_action_probs=STOCHASTIC_PROBS,
-    num_iterations=10, # Give it slightly more iterations maybe
-    max_nodes=20,
+    num_iterations=30, # Give it slightly more iterations maybe
+    max_nodes=100,
     branching_factor=NUM_ACTIONS,
     action_selector=PUCTSelector(),
     temperature=0.0 # Deterministic action selection for testing
@@ -355,11 +355,11 @@ class BackgammonTwoPlayerBaseline(TwoPlayerBaseline):
 
 # --- Trainer ---
 trainer = StochasticTrainer(
-    batch_size=4,      # Minimal batch size
-    train_batch_size=4,
+    batch_size=128,      # Minimal batch size
+    train_batch_size=50,
     warmup_steps=0,
-    collection_steps_per_epoch=2,  # Just 2 collection step
-    train_steps_per_epoch=2,       # Just 2 training step
+    collection_steps_per_epoch=50,  # Just 2 collection step
+    train_steps_per_epoch=50,       # Just 2 training step
     nn=mlp_policy_value_net,
     loss_fn=partial(az_default_loss_fn, l2_reg_lambda=0.0),
     optimizer=optax.adam(1e-4),
