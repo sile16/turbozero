@@ -20,6 +20,7 @@ from core.evaluators.mcts.mcts import MCTS
 from core.memory.replay_memory import EpisodeReplayBuffer
 from core.training.loss_fns import az_default_loss_fn
 from core.training.stochastic_train import StochasticTrainer
+from core.training.train import Trainer
 from core.testing.two_player_baseline import TwoPlayerBaseline
 from core.common import two_player_game_step # Need this for the game loop
 from core.common import TwoPlayerGameState, GameFrame # Import the dataclasses
@@ -164,8 +165,7 @@ class RandomEvaluator(Evaluator):
         return EvalOutput(
             eval_state=eval_state, 
             action=action,
-            policy_weights=policy_weights,
-            value=jnp.array(0.0) 
+            policy_weights=policy_weights
         )
 
     def get_value(self, state: chex.ArrayTree) -> chex.Array:
@@ -192,7 +192,7 @@ random_evaluator = RandomEvaluator()
 evaluator = StochasticMCTS(   #Explores new moves
     eval_fn=make_nn_eval_fn(mlp_policy_value_net, state_to_nn_input),
     stochastic_action_probs=STOCHASTIC_PROBS,
-    num_iterations=200,  
+    num_iterations=20,  
     max_nodes=300,      
     branching_factor=NUM_ACTIONS,
     action_selector=PUCTSelector(),
@@ -202,7 +202,7 @@ evaluator = StochasticMCTS(   #Explores new moves
 evaluator_test = StochasticMCTS(   #Use optimized moves, temperature=0.0
     eval_fn=make_nn_eval_fn(mlp_policy_value_net, state_to_nn_input),
     stochastic_action_probs=STOCHASTIC_PROBS,
-    num_iterations=200,  # Very few iterations
+    num_iterations=20,  # Very few iterations
     max_nodes=300,      # Very small tree
     branching_factor=NUM_ACTIONS,
     action_selector=PUCTSelector(),
@@ -213,7 +213,7 @@ evaluator_test = StochasticMCTS(   #Use optimized moves, temperature=0.0
 pip_count_mcts_evaluator_test = StochasticMCTS(  # optimizes for moves
     eval_fn=backgammon_pip_count_eval, # Use pip count eval fn
     stochastic_action_probs=STOCHASTIC_PROBS,
-    num_iterations=30, # Give it slightly more iterations maybe
+    num_iterations=20, # Give it slightly more iterations maybe
     max_nodes=100,
     branching_factor=NUM_ACTIONS,
     action_selector=PUCTSelector(),
@@ -223,156 +223,27 @@ pip_count_mcts_evaluator_test = StochasticMCTS(  # optimizes for moves
 # --- Replay Memory ---
 replay_memory = EpisodeReplayBuffer(capacity=100)
 
-# --- Custom BackgammonTwoPlayerBaseline ---
-class BackgammonTwoPlayerBaseline(TwoPlayerBaseline):
-    """TwoPlayerBaseline overridden to handle backgammon's 1D observation shape and rendering."""
-
-    @partial(jax.pmap, axis_name='d', static_broadcasted_argnums=(0, 1, 2, 3, 4))
-    def test(self, max_steps: int, env_step_fn: EnvStepFn, env_init_fn: EnvInitFn, evaluator: Evaluator,
-             keys: chex.PRNGKey, state: chex.ArrayTree, params: chex.ArrayTree) -> Tuple[chex.ArrayTree, Dict, chex.ArrayTree, chex.Array]:
-        """Test the agent against the baseline, handling 1D observations and collecting frames."""
-
-        def game_fn(key):
-            """Plays a single two-player game and collects frames."""
-            # init envs
-            key1, key2 = jax.random.split(key)
-            env1_state, metadata1 = env_init_fn(key1)
-            env2_state, metadata2 = env_init_fn(key2)
-
-            # init evaluator states
-            key1, key2 = jax.random.split(jax.random.fold_in(key, 1))
-            eval_state1 = evaluator.init(template_embedding=env1_state)
-            eval_state2 = self.baseline_evaluator.init(template_embedding=env2_state)
-
-            # Initial game state using the dataclass
-            init_val = TwoPlayerGameState(
-                key=key,
-                env_state=env1_state, 
-                env_state_metadata=metadata1, 
-                p1_eval_state=eval_state1,
-                p2_eval_state=eval_state2,
-                p1_value_estimate=jnp.array(0.0),
-                p2_value_estimate=jnp.array(0.0),
-                outcomes=jnp.zeros(2),
-                completed=False 
-            )
-            
-            # Capture initial frame
-            initial_game_frame = GameFrame(
-                env_state = init_val.env_state,
-                p1_value_estimate = init_val.p1_value_estimate,
-                p2_value_estimate = init_val.p2_value_estimate,
-                completed = init_val.completed,
-                outcomes = init_val.outcomes
-            )
-
-            # Modified step_step to return GameFrame using state *before* step for rendering
-            def step_step(carry: TwoPlayerGameState, _) -> Tuple[TwoPlayerGameState, GameFrame]:
-                needs_step = jnp.logical_and(~carry.completed, carry.env_state_metadata.step < max_steps)
-                
-                # Store state before step for frame capture
-                state_before_step = carry 
-
-                # Call the common game step logic
-                next_state_if_step = two_player_game_step(
-                    state=carry, 
-                    p1_evaluator=evaluator, 
-                    p2_evaluator=self.baseline_evaluator,
-                    params=params, 
-                    env_step_fn=env_step_fn,
-                    env_init_fn=env_init_fn,
-                    use_p1=True, # Simplified assumption for step call structure
-                    max_steps=max_steps
-                )
-                
-                next_carry = jax.tree.map(
-                    lambda x, y: jnp.where(needs_step, x, y), 
-                    next_state_if_step, 
-                    carry
-                )
-                
-                truncated = jnp.logical_and(needs_step, next_carry.env_state_metadata.step >= max_steps)
-                next_carry = next_carry.replace(completed=jnp.logical_or(next_carry.completed, truncated))
-                
-                # Create frame using the state *before* the step was taken (state_before_step.env_state)
-                # but use values/outcomes from *after* the step (next_carry)
-                frame = GameFrame(
-                    env_state=state_before_step.env_state, # Use state before step for rendering compatibility
-                    p1_value_estimate=next_carry.p1_value_estimate,
-                    p2_value_estimate=next_carry.p2_value_estimate,
-                    completed=next_carry.completed,
-                    outcomes=next_carry.outcomes
-                )
-                
-                return next_carry, frame
-
-            # Run scan, collecting frames
-            final_state, collected_frames = jax.lax.scan(step_step, init_val, None, length=max_steps)
-
-            # Combine initial frame with collected frames
-            all_frames = jax.tree.map(
-                lambda init, rest: jnp.concatenate([jnp.expand_dims(init, 0), rest]),
-                initial_game_frame, collected_frames
-            )
-
-            p1_won = final_state.outcomes[0] > 0
-            p2_won = final_state.outcomes[1] > 0
-            draw = jnp.logical_and(final_state.outcomes[0] == 0, final_state.outcomes[1] == 0)
-
-            results = {
-                'p1_won': p1_won,
-                'p2_won': p2_won,
-                'draw': draw,
-                'steps': final_state.env_state_metadata.step, 
-                'outcome': jnp.select([p1_won, p2_won, draw], [1.0, -1.0, 0.0], default=0.0)
-            }
-            
-            p_ids = jnp.array([0, 1]) # Assuming player 0 = agent, player 1 = baseline
-
-            # Return results and the actual frames
-            return results, all_frames, p_ids
-
-        # Run vmap over game_fn
-        results, frames, p_ids = jax.vmap(game_fn)(keys)
-
-        # Calculate metrics
-        avg = results['outcome'].mean()
-        metrics = {
-            f"{self.name}_avg_outcome": avg,
-            f"{self.name}_win_rate": jnp.mean(results['p1_won']),
-            f"{self.name}_loss_rate": jnp.mean(results['p2_won']),
-            f"{self.name}_draw_rate": jnp.mean(results['draw']),
-            f"{self.name}_avg_steps": jnp.mean(results['steps'])
-        }
-        
-        # Select frames and p_ids from the first episode for rendering
-        first_ep_frames = jax.tree.map(lambda x: x[0], frames)
-        first_ep_p_ids = p_ids[0]
-
-        # Return state, metrics, and *actual* frames
-        return state, metrics, first_ep_frames, first_ep_p_ids
-
 
 # --- Trainer ---
-trainer = StochasticTrainer(
-    batch_size=128,      # Minimal batch size
-    train_batch_size=50,
+trainer = Trainer(
+    batch_size=8,      # Minimal batch size
+    train_batch_size=8,
     warmup_steps=0,
-    collection_steps_per_epoch=50,  # Just 2 collection step
-    train_steps_per_epoch=50,       # Just 2 training step
+    collection_steps_per_epoch=10,  # Just 2 collection step
+    train_steps_per_epoch=10,       # Just 2 training step
     nn=mlp_policy_value_net,
     loss_fn=partial(az_default_loss_fn, l2_reg_lambda=0.0),
     optimizer=optax.adam(1e-4),
     # Use the stochastic evaluator for training
     evaluator=evaluator, 
     memory_buffer=replay_memory,
-    max_episode_steps=60,  # Super short episodes
+    max_episode_steps=200,  # Super short episodes
     env_step_fn=step_fn,
     env_init_fn=init_fn,
     state_to_nn_input_fn=state_to_nn_input,
     testers=[
         # Use our custom BackgammonTwoPlayerBaseline
-        BackgammonTwoPlayerBaseline(
+        TwoPlayerBaseline(
             num_episodes=2,
             baseline_evaluator=pip_count_mcts_evaluator_test,
             #render_fn=render_fn,
@@ -380,7 +251,7 @@ trainer = StochasticTrainer(
             name='pip_count_baseline'
         ),
         # Add another tester using the RandomEvaluator
-        BackgammonTwoPlayerBaseline(
+        TwoPlayerBaseline(
             num_episodes=2, 
             baseline_evaluator=random_evaluator, # Use the random evaluator here
             # Optionally add rendering for this baseline too

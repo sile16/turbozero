@@ -6,6 +6,7 @@ from core.evaluators.mcts.action_selection import MCTSActionSelector
 from core.evaluators.mcts.state import BackpropState, MCTSNode, MCTSTree, TraversalState, MCTSOutput
 from core.evaluators.mcts.mcts import MCTS
 from core.types import EnvStepFn, EvalFn, StepMetadata
+from core.trees.tree import init_tree
 
 
 class StochasticMCTS(MCTS):
@@ -163,7 +164,7 @@ class StochasticMCTS(MCTS):
         For stochastic nodes:
         - If parent exists (not root), set value to the parent's Q-value
         - Otherwise use 0.0 as a neutral value
-        - Set policy to all zeros as stochastic nodes don't have meaningful policies
+        - Set policy to parent's policy, unless the root node
         """
         # Get parent's Q-value if parent exists (not ROOT_INDEX)
         parent_is_root = parent_idx == tree.NULL_INDEX  # No parent (this is root)
@@ -174,8 +175,14 @@ class StochasticMCTS(MCTS):
                              0.0,  # Default value if root
                              tree.data_at(parent_idx).q)  # Parent's Q-value
         
-        # Just use zeros for policy since stochastic nodes don't have meaningful policies
-        policy = jnp.zeros((self.branching_factor,), dtype=jnp.float32)
+        # Use a uniform policy over legal actions instead of all zeros to avoid numerical issues
+        legal_actions = metadata.action_mask
+        num_legal_actions = jnp.sum(legal_actions)
+        uniform_prob = jnp.where(num_legal_actions > 0, 
+                                 1.0 / num_legal_actions, 
+                                 0.0)  # Handle the case where there are no legal actions
+        
+        policy = jnp.where(parent_is_root, uniform_prob, tree.data_at(parent_idx).p)
         
         return parent_q, policy
 
@@ -332,11 +339,26 @@ class StochasticMCTS(MCTS):
         # Get the action using stochastic_action_selector
         action = self.stochastic_action_selector(key, eval_state, eval_state.ROOT_INDEX, self.discount)
         
-        # Convert to integer32 to match MCTS.evaluate output type 
+        # return root node policy weights
+        ## sum the policy weights of the node
+        policy_weights = eval_state.data_at(eval_state.ROOT_INDEX).p
+        policy_weights_sum = jnp.sum(policy_weights)
+
+        # if policy_weights_sum is 0 lets call the eval function to get the policy weights
+        # using lax.cond to avoid conditional branches in the graph
+        eval_key, key = jax.random.split(key)
         
+        # Create a function to generate policy from eval_fn
+        def generate_policy(_):
+            policy_logits, _ = self.eval_fn(env_state, params, eval_key)
+            return jax.nn.softmax(policy_logits)
         
-        # Create zero policy weights of the right shape
-        policy_weights = jnp.zeros((self.branching_factor,), dtype=jnp.float32)
+        policy_weights = jax.lax.cond(
+            policy_weights_sum == 0,
+            generate_policy,
+            lambda _: policy_weights,
+            None  # Dummy operand, not used directly by either branch
+        )
 
         return MCTSOutput(
             eval_state=eval_state,
@@ -468,4 +490,3 @@ class StochasticMCTS(MCTS):
             terminated=terminated,
             embedding=embedding
         )
-

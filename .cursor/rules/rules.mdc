@@ -37,6 +37,7 @@ alwaysApply: true
 -- Ensure the tree is persisted according to the `persist_tree` variable, following established serialization practices.
 
 # Additional Considerations
+- Always run pytest tests with -sv to see the detailed output
 
 - **Error Handling:** Validate that the environment meets the expected contract (e.g., valid `stochastic_action_probs`, properly defined `stochastic_expansion_mask`) and include error handling as needed.
 - **Testing and Documentation:** Add unit tests for the new stochastic behavior and update documentation and UML diagrams to reflect any interface changes.
