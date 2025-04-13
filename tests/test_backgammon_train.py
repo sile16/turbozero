@@ -225,7 +225,7 @@ replay_memory = EpisodeReplayBuffer(capacity=100)
 
 
 # --- Trainer ---
-trainer = Trainer(
+trainer = StochasticTrainer(
     batch_size=8,      # Minimal batch size
     train_batch_size=8,
     warmup_steps=0,

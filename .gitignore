@@ -1,6 +1,7 @@
 checkpoints/
 .vscode/
 wandb/*
+venv*
 
 visualizations/mcts_trees/*
 visualizations/
