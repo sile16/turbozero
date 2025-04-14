@@ -7,9 +7,9 @@ description = "Abseil Python Common Libraries, see https://github.com/abseil/abs
 optional = false
 python-versions = ">=3.8"
 <<<<<<< HEAD
-=======
 groups = ["main"]
->>>>>>> 27a4a7f (poetry.lock update for ubuntu)
+=======
+>>>>>>> 0d0190e48a6ffba5144f25a66dd7c0af9dc37d8b
 files = [
     {file = "absl_py-2.2.2-py3-none-any.whl", hash = "sha256:e5797bc6abe45f64fd95dc06394ca3f2bedf3b5d895e9da691c9ee3397d70092"},
     {file = "absl_py-2.2.2.tar.gz", hash = "sha256:bf25b2c2eed013ca456918c453d687eab4e8309fba81ee2f4c1a6aa2494175eb"},
@@ -187,9 +187,9 @@ description = "The Real First Universal Charset Detector. Open, modern and activ
 optional = false
 python-versions = ">=3.7"
 <<<<<<< HEAD
-=======
 groups = ["main"]
->>>>>>> 27a4a7f (poetry.lock update for ubuntu)
+=======
+>>>>>>> 0d0190e48a6ffba5144f25a66dd7c0af9dc37d8b
 files = [
     {file = "charset_normalizer-3.4.1-cp310-cp310-macosx_10_9_universal2.whl", hash = "sha256:91b36a978b5ae0ee86c394f5a54d6ef44db1de0815eb43de826d41d21e4af3de"},
     {file = "charset_normalizer-3.4.1-cp310-cp310-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:7461baadb4dc00fd9e0acbe254e3d7d2112e7f92ced2adc96e54ef6501c5f176"},
@@ -359,9 +359,9 @@ description = "CSS selectors for Python ElementTree"
 optional = false
 python-versions = ">=3.9"
 <<<<<<< HEAD
-=======
 groups = ["main"]
->>>>>>> 27a4a7f (poetry.lock update for ubuntu)
+=======
+>>>>>>> 0d0190e48a6ffba5144f25a66dd7c0af9dc37d8b
 files = [
     {file = "cssselect2-0.8.0-py3-none-any.whl", hash = "sha256:46fc70ebc41ced7a32cd42d58b1884d72ade23d21e5a4eaaf022401c13f0e76e"},
     {file = "cssselect2-0.8.0.tar.gz", hash = "sha256:7674ffb954a3b46162392aee2a3a0aedb2e14ecf99fcc28644900f4e6e3e9d3a"},
@@ -418,9 +418,9 @@ description = "Decorators for Humans"
 optional = false
 python-versions = ">=3.8"
 <<<<<<< HEAD
-=======
 groups = ["dev"]
->>>>>>> 27a4a7f (poetry.lock update for ubuntu)
+=======
+>>>>>>> 0d0190e48a6ffba5144f25a66dd7c0af9dc37d8b
 files = [
     {file = "decorator-5.2.1-py3-none-any.whl", hash = "sha256:d316bb415a2d9e2d2b3abcc4084c6502fc09240e292cd76a76afc106a1c8e04a"},
     {file = "decorator-5.2.1.tar.gz", hash = "sha256:65f266143752f734b0a7cc83c46f4618af75b8c5911b00ccb61d0ac9b6da0360"},
@@ -565,9 +565,9 @@ description = "File-system specification"
 optional = false
 python-versions = ">=3.9"
 <<<<<<< HEAD
-=======
 groups = ["main"]
->>>>>>> 27a4a7f (poetry.lock update for ubuntu)
+=======
+>>>>>>> 0d0190e48a6ffba5144f25a66dd7c0af9dc37d8b
 files = [
     {file = "fsspec-2025.3.2-py3-none-any.whl", hash = "sha256:2daf8dc3d1dfa65b6aa37748d112773a7a08416f6c70d96b264c96476ecaf711"},
     {file = "fsspec-2025.3.2.tar.gz", hash = "sha256:e52c77ef398680bbd6a98c0e628fbc469491282981209907bbc8aea76a04fdc6"},
@@ -634,10 +634,10 @@ gitdb = ">=4.0.1,<5"
 [package.extras]
 doc = ["sphinx (>=7.1.2,<7.2)", "sphinx-autodoc-typehints", "sphinx_rtd_theme"]
 <<<<<<< HEAD
-test = ["coverage[toml]", "ddt (>=1.1.1,!=1.4.3)", "mock", "mypy", "pre-commit", "pytest (>=7.3.1)", "pytest-cov", "pytest-instafail", "pytest-mock", "pytest-sugar", "typing-extensions"]
-=======
 test = ["coverage[toml]", "ddt (>=1.1.1,!=1.4.3)", "mock ; python_version < \"3.8\"", "mypy", "pre-commit", "pytest (>=7.3.1)", "pytest-cov", "pytest-instafail", "pytest-mock", "pytest-sugar", "typing-extensions ; python_version < \"3.11\""]
->>>>>>> 27a4a7f (poetry.lock update for ubuntu)
+=======
+test = ["coverage[toml]", "ddt (>=1.1.1,!=1.4.3)", "mock", "mypy", "pre-commit", "pytest (>=7.3.1)", "pytest-cov", "pytest-instafail", "pytest-mock", "pytest-sugar", "typing-extensions"]
+>>>>>>> 0d0190e48a6ffba5144f25a66dd7c0af9dc37d8b
 
 [[package]]
 name = "graphviz"
@@ -693,9 +693,9 @@ description = "Read resources from Python packages"
 optional = false
 python-versions = ">=3.9"
 <<<<<<< HEAD
-=======
 groups = ["main"]
->>>>>>> 27a4a7f (poetry.lock update for ubuntu)
+=======
+>>>>>>> 0d0190e48a6ffba5144f25a66dd7c0af9dc37d8b
 files = [
     {file = "importlib_resources-6.5.2-py3-none-any.whl", hash = "sha256:789cfdc3ed28c78b67a06acb8126751ced69a3d5f79c095a98298cd8a760ccec"},
     {file = "importlib_resources-6.5.2.tar.gz", hash = "sha256:185f87adef5bcc288449d98fb4fba07cea78bc036455dd44c5fc4a2fe78fed2c"},
@@ -762,9 +762,9 @@ description = "IPython: Productive Interactive Computing"
 optional = false
 python-versions = ">=3.11"
 <<<<<<< HEAD
-=======
 groups = ["dev"]
->>>>>>> 27a4a7f (poetry.lock update for ubuntu)
+=======
+>>>>>>> 0d0190e48a6ffba5144f25a66dd7c0af9dc37d8b
 files = [
     {file = "ipython-9.1.0-py3-none-any.whl", hash = "sha256:2df07257ec2f84a6b346b8d83100bcf8fa501c6e01ab75cd3799b0bb253b3d2a"},
     {file = "ipython-9.1.0.tar.gz", hash = "sha256:a47e13a5e05e02f3b8e1e7a0f9db372199fe8c3763532fe7a1e0379e4e135f16"},
@@ -797,9 +797,9 @@ description = "Defines a variety of Pygments lexers for highlighting IPython cod
 optional = false
 python-versions = ">=3.8"
 <<<<<<< HEAD
-=======
 groups = ["dev"]
->>>>>>> 27a4a7f (poetry.lock update for ubuntu)
+=======
+>>>>>>> 0d0190e48a6ffba5144f25a66dd7c0af9dc37d8b
 files = [
     {file = "ipython_pygments_lexers-1.1.1-py3-none-any.whl", hash = "sha256:a9462224a505ade19a605f71f8fa63c2048833ce50abc86768a0d81d876dc81c"},
     {file = "ipython_pygments_lexers-1.1.1.tar.gz", hash = "sha256:09c0138009e56b6854f9535736f4171d855c8c08a563a0dcd8022f78355c7e81"},
@@ -1246,7 +1246,6 @@ files = [
     {file = "numpy-2.2.4-pp310-pypy310_pp73-win_amd64.whl", hash = "sha256:b4adfbbc64014976d2f91084915ca4e626fbf2057fb81af209c1a6d776d23e3d"},
     {file = "numpy-2.2.4.tar.gz", hash = "sha256:9ba03692a45d3eef66559efe1d1096c4b9b75c0986b5dff5530c378fb8331d4f"},
 <<<<<<< HEAD
-=======
 ]
 
 [[package]]
@@ -1390,7 +1389,8 @@ files = [
     {file = "nvidia_nvjitlink_cu12-12.8.93-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl", hash = "sha256:81ff63371a7ebd6e6451970684f916be2eab07321b73c9d244dc2b4da7f73b88"},
     {file = "nvidia_nvjitlink_cu12-12.8.93-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:adccd7161ace7261e01bb91e44e88da350895c270d23f744f0820c818b7229e7"},
     {file = "nvidia_nvjitlink_cu12-12.8.93-py3-none-win_amd64.whl", hash = "sha256:bd93fbeeee850917903583587f4fc3a4eafa022e34572251368238ab5e6bd67f"},
->>>>>>> 27a4a7f (poetry.lock update for ubuntu)
+=======
+>>>>>>> 0d0190e48a6ffba5144f25a66dd7c0af9dc37d8b
 ]
 
 [[package]]
@@ -1609,10 +1609,10 @@ fpx = ["olefile"]
 mic = ["olefile"]
 tests = ["check-manifest", "coverage (>=7.4.2)", "defusedxml", "markdown2", "olefile", "packaging", "pyroma", "pytest", "pytest-cov", "pytest-timeout", "trove-classifiers (>=2024.10.12)"]
 <<<<<<< HEAD
-typing = ["typing-extensions"]
-=======
 typing = ["typing-extensions ; python_version < \"3.10\""]
->>>>>>> 27a4a7f (poetry.lock update for ubuntu)
+=======
+typing = ["typing-extensions"]
+>>>>>>> 0d0190e48a6ffba5144f25a66dd7c0af9dc37d8b
 xmp = ["defusedxml"]
 
 [[package]]
@@ -1622,9 +1622,9 @@ description = "A small Python package for determining appropriate platform-speci
 optional = false
 python-versions = ">=3.9"
 <<<<<<< HEAD
-=======
 groups = ["main", "dev"]
->>>>>>> 27a4a7f (poetry.lock update for ubuntu)
+=======
+>>>>>>> 0d0190e48a6ffba5144f25a66dd7c0af9dc37d8b
 files = [
     {file = "platformdirs-4.3.7-py3-none-any.whl", hash = "sha256:a03875334331946f13c549dbd8f4bac7a13a50a895a0eb1e8c6a8ace80d40a94"},
     {file = "platformdirs-4.3.7.tar.gz", hash = "sha256:eb437d586b6a0986388f0d6f74aa0cde27b48d0e3d66843640bfb6bdcdb6e351"},
@@ -1658,9 +1658,9 @@ description = "Library for building powerful interactive command lines in Python
 optional = false
 python-versions = ">=3.8.0"
 <<<<<<< HEAD
-=======
 groups = ["dev"]
->>>>>>> 27a4a7f (poetry.lock update for ubuntu)
+=======
+>>>>>>> 0d0190e48a6ffba5144f25a66dd7c0af9dc37d8b
 files = [
     {file = "prompt_toolkit-3.0.50-py3-none-any.whl", hash = "sha256:9b6427eb19e479d98acff65196a307c555eb567989e6d88ebbb1b509d9779198"},
     {file = "prompt_toolkit-3.0.50.tar.gz", hash = "sha256:544748f3860a2623ca5cd6d2795e7a14f3d0e1c3c9728359013f79877fc89bab"},
@@ -1697,9 +1697,9 @@ description = "Cross-platform lib for process and system monitoring in Python.  
 optional = false
 python-versions = ">=3.6"
 <<<<<<< HEAD
-=======
 groups = ["main", "dev"]
->>>>>>> 27a4a7f (poetry.lock update for ubuntu)
+=======
+>>>>>>> 0d0190e48a6ffba5144f25a66dd7c0af9dc37d8b
 files = [
     {file = "psutil-7.0.0-cp36-abi3-macosx_10_9_x86_64.whl", hash = "sha256:101d71dc322e3cffd7cea0650b09b3d08b8e7c4109dd6809fe452dfd00e58b25"},
     {file = "psutil-7.0.0-cp36-abi3-macosx_11_0_arm64.whl", hash = "sha256:39db632f6bb862eeccf56660871433e111b6ea58f2caea825571951d4b6aa3da"},
@@ -1906,9 +1906,9 @@ description = "Python bindings for 0MQ"
 optional = false
 python-versions = ">=3.8"
 <<<<<<< HEAD
-=======
 groups = ["dev"]
->>>>>>> 27a4a7f (poetry.lock update for ubuntu)
+=======
+>>>>>>> 0d0190e48a6ffba5144f25a66dd7c0af9dc37d8b
 files = [
     {file = "pyzmq-26.4.0-cp310-cp310-macosx_10_15_universal2.whl", hash = "sha256:0329bdf83e170ac133f44a233fc651f6ed66ef8e66693b5af7d54f45d1ef5918"},
     {file = "pyzmq-26.4.0-cp310-cp310-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:398a825d2dea96227cf6460ce0a174cf7657d6f6827807d4d1ae9d0f9ae64315"},
@@ -2112,10 +2112,10 @@ numpy = ">=1.23.5,<2.5"
 dev = ["cython-lint (>=0.12.2)", "doit (>=0.36.0)", "mypy (==1.10.0)", "pycodestyle", "pydevtool", "rich-click", "ruff (>=0.0.292)", "types-psutil", "typing_extensions"]
 doc = ["intersphinx_registry", "jupyterlite-pyodide-kernel", "jupyterlite-sphinx (>=0.16.5)", "jupytext", "matplotlib (>=3.5)", "myst-nb", "numpydoc", "pooch", "pydata-sphinx-theme (>=0.15.2)", "sphinx (>=5.0.0,<8.0.0)", "sphinx-copybutton", "sphinx-design (>=0.4.0)"]
 <<<<<<< HEAD
-test = ["Cython", "array-api-strict (>=2.0,<2.1.1)", "asv", "gmpy2", "hypothesis (>=6.30)", "meson", "mpmath", "ninja", "pooch", "pytest", "pytest-cov", "pytest-timeout", "pytest-xdist", "scikit-umfpack", "threadpoolctl"]
-=======
 test = ["Cython", "array-api-strict (>=2.0,<2.1.1)", "asv", "gmpy2", "hypothesis (>=6.30)", "meson", "mpmath", "ninja ; sys_platform != \"emscripten\"", "pooch", "pytest", "pytest-cov", "pytest-timeout", "pytest-xdist", "scikit-umfpack", "threadpoolctl"]
->>>>>>> 27a4a7f (poetry.lock update for ubuntu)
+=======
+test = ["Cython", "array-api-strict (>=2.0,<2.1.1)", "asv", "gmpy2", "hypothesis (>=6.30)", "meson", "mpmath", "ninja", "pooch", "pytest", "pytest-cov", "pytest-timeout", "pytest-xdist", "scikit-umfpack", "threadpoolctl"]
+>>>>>>> 0d0190e48a6ffba5144f25a66dd7c0af9dc37d8b
 
 [[package]]
 name = "sentry-sdk"
@@ -2286,14 +2286,6 @@ files = [
 
 [package.extras]
 <<<<<<< HEAD
-check = ["pytest-checkdocs (>=2.4)", "pytest-ruff (>=0.2.1)", "ruff (>=0.8.0)"]
-core = ["importlib_metadata (>=6)", "jaraco.functools (>=4)", "jaraco.text (>=3.7)", "more_itertools", "more_itertools (>=8.8)", "packaging (>=24.2)", "platformdirs (>=4.2.2)", "tomli (>=2.0.1)", "wheel (>=0.43.0)"]
-cover = ["pytest-cov"]
-doc = ["furo", "jaraco.packaging (>=9.3)", "jaraco.tidelift (>=1.4)", "pygments-github-lexers (==0.0.5)", "pyproject-hooks (!=1.1)", "rst.linker (>=1.9)", "sphinx (>=3.5)", "sphinx-favicon", "sphinx-inline-tabs", "sphinx-lint", "sphinx-notfound-page (>=1,<2)", "sphinx-reredirects", "sphinxcontrib-towncrier", "towncrier (<24.7)"]
-enabler = ["pytest-enabler (>=2.2)"]
-test = ["build[virtualenv] (>=1.0.3)", "filelock (>=3.4.0)", "ini2toml[lite] (>=0.14)", "jaraco.develop (>=7.21)", "jaraco.envs (>=2.2)", "jaraco.path (>=3.7.2)", "jaraco.test (>=5.5)", "packaging (>=24.2)", "pip (>=19.1)", "pyproject-hooks (!=1.1)", "pytest (>=6,!=8.1.*)", "pytest-home (>=0.5)", "pytest-perf", "pytest-subprocess", "pytest-timeout", "pytest-xdist (>=3)", "tomli-w (>=1.0.0)", "virtualenv (>=13.0.0)", "wheel (>=0.44.0)"]
-type = ["importlib_metadata (>=7.0.2)", "jaraco.develop (>=7.21)", "mypy (==1.14.*)", "pytest-mypy"]
-=======
 check = ["pytest-checkdocs (>=2.4)", "pytest-ruff (>=0.2.1) ; sys_platform != \"cygwin\"", "ruff (>=0.8.0) ; sys_platform != \"cygwin\""]
 core = ["importlib_metadata (>=6) ; python_version < \"3.10\"", "jaraco.functools (>=4)", "jaraco.text (>=3.7)", "more_itertools", "more_itertools (>=8.8)", "packaging (>=24.2)", "platformdirs (>=4.2.2)", "tomli (>=2.0.1) ; python_version < \"3.11\"", "wheel (>=0.43.0)"]
 cover = ["pytest-cov"]
@@ -2301,7 +2293,15 @@ doc = ["furo", "jaraco.packaging (>=9.3)", "jaraco.tidelift (>=1.4)", "pygments-
 enabler = ["pytest-enabler (>=2.2)"]
 test = ["build[virtualenv] (>=1.0.3)", "filelock (>=3.4.0)", "ini2toml[lite] (>=0.14)", "jaraco.develop (>=7.21) ; python_version >= \"3.9\" and sys_platform != \"cygwin\"", "jaraco.envs (>=2.2)", "jaraco.path (>=3.7.2)", "jaraco.test (>=5.5)", "packaging (>=24.2)", "pip (>=19.1)", "pyproject-hooks (!=1.1)", "pytest (>=6,!=8.1.*)", "pytest-home (>=0.5)", "pytest-perf ; sys_platform != \"cygwin\"", "pytest-subprocess", "pytest-timeout", "pytest-xdist (>=3)", "tomli-w (>=1.0.0)", "virtualenv (>=13.0.0)", "wheel (>=0.44.0)"]
 type = ["importlib_metadata (>=7.0.2) ; python_version < \"3.10\"", "jaraco.develop (>=7.21) ; sys_platform != \"cygwin\"", "mypy (==1.14.*)", "pytest-mypy"]
->>>>>>> 27a4a7f (poetry.lock update for ubuntu)
+=======
+check = ["pytest-checkdocs (>=2.4)", "pytest-ruff (>=0.2.1)", "ruff (>=0.8.0)"]
+core = ["importlib_metadata (>=6)", "jaraco.functools (>=4)", "jaraco.text (>=3.7)", "more_itertools", "more_itertools (>=8.8)", "packaging (>=24.2)", "platformdirs (>=4.2.2)", "tomli (>=2.0.1)", "wheel (>=0.43.0)"]
+cover = ["pytest-cov"]
+doc = ["furo", "jaraco.packaging (>=9.3)", "jaraco.tidelift (>=1.4)", "pygments-github-lexers (==0.0.5)", "pyproject-hooks (!=1.1)", "rst.linker (>=1.9)", "sphinx (>=3.5)", "sphinx-favicon", "sphinx-inline-tabs", "sphinx-lint", "sphinx-notfound-page (>=1,<2)", "sphinx-reredirects", "sphinxcontrib-towncrier", "towncrier (<24.7)"]
+enabler = ["pytest-enabler (>=2.2)"]
+test = ["build[virtualenv] (>=1.0.3)", "filelock (>=3.4.0)", "ini2toml[lite] (>=0.14)", "jaraco.develop (>=7.21)", "jaraco.envs (>=2.2)", "jaraco.path (>=3.7.2)", "jaraco.test (>=5.5)", "packaging (>=24.2)", "pip (>=19.1)", "pyproject-hooks (!=1.1)", "pytest (>=6,!=8.1.*)", "pytest-home (>=0.5)", "pytest-perf", "pytest-subprocess", "pytest-timeout", "pytest-xdist (>=3)", "tomli-w (>=1.0.0)", "virtualenv (>=13.0.0)", "wheel (>=0.44.0)"]
+type = ["importlib_metadata (>=7.0.2)", "jaraco.develop (>=7.21)", "mypy (==1.14.*)", "pytest-mypy"]
+>>>>>>> 0d0190e48a6ffba5144f25a66dd7c0af9dc37d8b
 
 [[package]]
 name = "simplejson"
@@ -2637,9 +2637,9 @@ description = "HTTP library with thread-safe connection pooling, file post, and 
 optional = false
 python-versions = ">=3.9"
 <<<<<<< HEAD
-=======
 groups = ["main"]
->>>>>>> 27a4a7f (poetry.lock update for ubuntu)
+=======
+>>>>>>> 0d0190e48a6ffba5144f25a66dd7c0af9dc37d8b
 files = [
     {file = "urllib3-2.3.0-py3-none-any.whl", hash = "sha256:1cee9ad369867bfdbbb48b7dd50374c0967a0bb7710050facf0dd6911440e3df"},
     {file = "urllib3-2.3.0.tar.gz", hash = "sha256:f8c5449b3cf0861679ce7e0503c7b44b5ec981bec0d1d3795a07f1ba96f0204d"},

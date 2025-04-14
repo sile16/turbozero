@@ -1,6 +1,7 @@
 from functools import partial
 import os
 import shutil
+import time
 from typing import Any, List, Optional, Tuple
 
 import chex
@@ -363,15 +364,20 @@ class Trainer:
         Returns:
         - (CollectionState): updated collection state
         """
-        if num_steps > 0:
+        # Handle the case where num_steps=0 by immediately returning the state
+        # This prevents trying to split the key into 0 parts
+        def do_collect(s):
             collect = partial(self.collect, params=params)
             keys = jax.random.split(key, num_steps)
-            return jax.lax.fori_loop(
-                0, num_steps, 
-                lambda i, s: collect(keys[i], s), 
-                state
-            )
-        return state
+            return jax.lax.fori_loop(0, num_steps, lambda i, state: collect(keys[i], state), s)
+            
+        # Use jax.lax.cond instead of if statement for JAX compatibility
+        return jax.lax.cond(
+            num_steps > 0,
+            do_collect,
+            lambda s: s,
+            state
+        )
     
 
     @partial(jax.pmap, axis_name='d', static_broadcasted_argnums=(0,))
@@ -427,8 +433,9 @@ class Trainer:
         buffer_state = collection_state.buffer_state
         
         batch_metrics = []
+        train_start_time = jax.numpy.asarray(time.time())
         
-        for _ in range(num_steps):
+        for step_idx in range(num_steps):
             step_key, key = jax.random.split(key)
             # sample from replay memory
             batch = self.memory_buffer.sample(buffer_state, step_key, self.train_batch_size)
@@ -439,11 +446,23 @@ class Trainer:
             # append metrics from step
             if metrics:
                 batch_metrics.append(metrics)
+                
         # take mean of metrics across all training steps
         if batch_metrics:
             metrics = {k: jnp.stack([m[k] for m in batch_metrics]).mean() for k in batch_metrics[0].keys()}
         else:
             metrics = {}
+        
+        # Add replay buffer statistics
+        metrics["buffer/size"] = jnp.sum(buffer_state.populated)
+        metrics["buffer/valid_samples"] = jnp.sum(buffer_state.has_reward)
+        metrics["buffer/fullness_pct"] = 100.0 * jnp.sum(buffer_state.populated) / buffer_state.populated.size
+        
+        # Performance metrics
+        train_duration = jax.numpy.asarray(time.time()) - train_start_time
+        metrics["perf/train_steps_per_sec"] = num_steps / jnp.maximum(train_duration, 1e-6)
+        metrics["perf/samples_per_sec"] = (num_steps * self.train_batch_size) / jnp.maximum(train_duration, 1e-6)
+        
         # return updated collection state, train state, and metrics
         return collection_state, train_state, metrics
     
@@ -490,10 +509,34 @@ class Trainer:
                 wandb_metrics['training/policy_loss'] = wandb_metrics.pop('policy_loss')
             if 'value_loss' in wandb_metrics:
                 wandb_metrics['training/value_loss'] = wandb_metrics.pop('value_loss')
+            if 'l2_reg' in wandb_metrics:
+                wandb_metrics['training/l2_reg'] = wandb_metrics.pop('l2_reg')
+            if 'policy_entropy' in wandb_metrics:
+                wandb_metrics['training/policy_entropy'] = wandb_metrics.pop('policy_entropy')
                 
             # Add evaluation metrics with better organization
             if 'greedy_avg_outcome' in wandb_metrics:
                 wandb_metrics['evaluation/greedy_avg_outcome'] = wandb_metrics.pop('greedy_avg_outcome')
+                
+            # Organize performance metrics
+            perf_keys = [k for k in list(wandb_metrics.keys()) if k.startswith('perf/')]
+            for k in perf_keys:
+                wandb_metrics[k] = wandb_metrics[k]  # Keep the same but organized in wandb
+                
+            # Organize buffer metrics
+            buffer_keys = [k for k in list(wandb_metrics.keys()) if k.startswith('buffer/')]
+            for k in buffer_keys:
+                wandb_metrics[k] = wandb_metrics[k]  # Keep the same but organized in wandb
+                
+            # Organize MCTS metrics
+            mcts_keys = [k for k in list(wandb_metrics.keys()) if k.startswith('mcts/')]
+            for k in mcts_keys:
+                wandb_metrics[k] = wandb_metrics[k]  # Keep the same but organized in wandb
+                
+            # Organize game metrics
+            game_keys = [k for k in list(wandb_metrics.keys()) if k.startswith('game/')]
+            for k in game_keys:
+                wandb_metrics[k] = wandb_metrics[k]  # Keep the same but organized in wandb
                 
             wandb.log(wandb_metrics, step)
 
@@ -641,25 +684,64 @@ class Trainer:
                 state = jax.pmap(tester.init, axis_name='d')(params=params)
                 tester_states.append(state)
         
-        # warmup
-        # populate replay buffer with initial self-play games
+        # Define collect function before warmup
         collect = jax.vmap(self.collect_steps, in_axes=(1, 1, None, None), out_axes=1)
         params = self.extract_model_params_fn(train_state)
-        collect_key, key = jax.random.split(key)
-        collect_keys = partition(jax.random.split(collect_key, self.batch_size), self.num_devices)
-        collection_state = collect(collect_keys, collection_state, params, self.warmup_steps)
+        
+        # warmup
+        # populate replay buffer with initial self-play games
+        # Only do warmup if warmup_steps > 0
+        if self.warmup_steps > 0:
+            collect_key, key = jax.random.split(key)
+            collect_keys = partition(jax.random.split(collect_key, self.batch_size), self.num_devices)
+            collection_state = collect(collect_keys, collection_state, params, self.warmup_steps)
 
         # training loop
         while cur_epoch < num_epochs:
-            # collect self-play games
+            # Track epoch start time for performance metrics
+            epoch_start_time = time.time()
+            
+            # Collect self-play games
+            collect_start_time = time.time()
             collect_key, key = jax.random.split(key)
             collect_keys = partition(jax.random.split(collect_key, self.batch_size), self.num_devices)
             collection_state = collect(collect_keys, collection_state, params, self.collection_steps_per_epoch)
-            # train
+            collect_duration = time.time() - collect_start_time
+            
+            # Train
+            train_start_time = time.time()
             train_key, key = jax.random.split(key)
             collection_state, train_state, metrics = self.train_steps(train_key, collection_state, train_state, self.train_steps_per_epoch)
-            # log metrics
+            train_duration = time.time() - train_start_time
+            
+            # Add performance metrics
             collection_steps = self.batch_size * (cur_epoch+1) * self.collection_steps_per_epoch
+            metrics["perf/collect_time_sec"] = collect_duration
+            metrics["perf/train_time_sec"] = train_duration
+            metrics["perf/collect_steps_per_sec"] = self.collection_steps_per_epoch / max(collect_duration, 1e-6)
+            metrics["perf/collect_game_steps_per_sec"] = (self.collection_steps_per_epoch * self.batch_size) / max(collect_duration, 1e-6)
+            
+            # Add replay buffer metrics
+            buffer_state = collection_state.buffer_state
+            metrics["buffer/size"] = jnp.sum(jax.device_get(buffer_state.populated))
+            metrics["buffer/valid_samples"] = jnp.sum(jax.device_get(buffer_state.has_reward))
+            metrics["buffer/fullness_pct"] = 100.0 * jnp.sum(jax.device_get(buffer_state.populated)) / jax.device_get(buffer_state.populated).size
+            
+            # Add MCTS statistics if the evaluator has the method
+            # This is outside of JAX compilation, so if statements are fine
+            # Skip MCTS stats for now since there's a bug with get_tree_stats
+            """if hasattr(self.evaluator_train, "get_tree_stats"):
+                # Get first device's stats as a sample
+                eval_state_sample = jax.device_get(jax.tree_util.tree_map(lambda x: x[0], collection_state.eval_state))
+                tree_stats = self.evaluator_train.get_tree_stats(eval_state_sample)
+                metrics.update(tree_stats)"""
+            
+            # Track game completion statistics
+            metadata = jax.device_get(collection_state.metadata)
+            metrics["game/terminated_count"] = jnp.sum(metadata.terminated)
+            metrics["game/terminated_pct"] = 100.0 * jnp.sum(metadata.terminated) / metadata.terminated.size
+            
+            # Log metrics
             self.log_metrics(metrics, cur_epoch, step=collection_steps)
 
             # test 

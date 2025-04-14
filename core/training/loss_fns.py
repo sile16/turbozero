@@ -10,6 +10,20 @@ from flax.training.train_state import TrainState
 from core.memory.replay_memory import BaseExperience
 
 
+def entropy(probs: jnp.ndarray) -> jnp.ndarray:
+    """Calculate the entropy of a probability distribution.
+    
+    Args:
+        probs: Probabilities, should sum to 1 along the specified axis.
+        
+    Returns:
+        Entropy values.
+    """
+    # Add small epsilon to avoid log(0)
+    safe_probs = jnp.clip(probs, 1e-12, 1.0)
+    return -jnp.sum(safe_probs * jnp.log(safe_probs), axis=-1)
+
+
 def az_default_loss_fn(params: chex.ArrayTree, train_state: TrainState, experience: BaseExperience, 
                        l2_reg_lambda: float = 0.0001) -> Tuple[chex.Array, Tuple[chex.ArrayTree, optax.OptState]]:
     """ Implements the default AlphaZero loss function.
@@ -73,6 +87,8 @@ def az_default_loss_fn(params: chex.ArrayTree, train_state: TrainState, experien
     loss = policy_loss + value_loss + l2_reg
     aux_metrics = {
         'policy_loss': policy_loss,
-        'value_loss': value_loss
+        'value_loss': value_loss,
+        'l2_reg': l2_reg,
+        'policy_entropy': entropy(jax.nn.softmax(pred_policy, axis=-1)).mean()
     }
     return loss, (aux_metrics, updates)

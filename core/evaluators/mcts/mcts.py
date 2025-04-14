@@ -414,6 +414,38 @@ class MCTS(Evaluator):
         return state.reset()
 
 
+    def get_tree_stats(self, tree_state: MCTSTree) -> Dict:
+        """Extract statistics from the MCTS tree. JAX-compatible, no loops or conditionals.
+        
+        Args:
+        - `tree_state`: MCTS tree state
+        
+        Returns:
+        - Dict: Tree statistics
+        """
+        # Get the root node
+        root_node = tree_state.data_at(tree_state.ROOT_INDEX)
+        
+        # Basic tree statistics
+        stats = {
+            "mcts/tree_size": tree_state.next_free_idx,
+            "mcts/root_visits": root_node.n,
+        }
+        
+        # Child statistics using vectorized operations
+        child_visits = tree_state.get_child_data('n', tree_state.ROOT_INDEX)
+        total_child_visits = jnp.sum(child_visits)
+        
+        # Calculate statistics without loops or conditionals
+        stats["mcts/exploration_pct"] = (
+            100.0 * (1.0 - jnp.max(child_visits) / jnp.maximum(total_child_visits, 1.0))
+        )
+        
+        # Root node value
+        stats["mcts/root_q_value"] = root_node.q
+        
+        return stats
+    
     def init(self, template_embedding: chex.ArrayTree, *args, **kwargs) -> MCTSTree: #pylint: disable=arguments-differ
         """Initializes the internal state of the MCTS evaluator.
         
