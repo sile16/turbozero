@@ -260,9 +260,8 @@ trainer = StochasticTrainer(
             name='random_baseline'
         )
     ],
-    # Use the pip count MCTS evaluator for testing
+    
     evaluator_test=evaluator_test, 
-    data_transform_fns=[],  # No data transforms as requested
     wandb_project_name=None
 )
 
