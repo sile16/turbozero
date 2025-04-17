@@ -119,21 +119,24 @@ class SimpleMLP(nn.Module):
         return policy_logits, jnp.squeeze(value, axis=-1)
 
 # --- Pip Count Eval Fn (for test evaluator) ---
+@jax.jit
 def backgammon_pip_count_eval(state: chex.ArrayTree, params: chex.ArrayTree, key: chex.PRNGKey):
     """Calculates value based on pip count difference. Ignores params/key."""
     board = state._board
-    loc_player_0 = jnp.maximum(0, board[1:25])
-    loc_player_1 = jnp.maximum(0, -board[1:25])
-    points = jnp.arange(1, 25)
-    pip_player_0 = jnp.sum(loc_player_0 * points)
-    pip_player_1 = jnp.sum(loc_player_1 * (25 - points))
-    pip_player_0 += jnp.maximum(0, board[0]) * 25
-    pip_player_1 += jnp.maximum(0, -board[25]) * 25
-    total_pips = pip_player_0 + pip_player_1 + 1e-6
-    value_p0_perspective = (pip_player_1 - pip_player_0) / total_pips
-    value = jnp.where(state.current_player == 0, value_p0_perspective, -value_p0_perspective)
+    pips = state._board[1:25]
+    
+    born_off_current = board[26] * 30
+    born_off_opponent = board[27] * 30
+    
+    #ignore bar, basically 0 points per pip on bar
+    
+    point_map = jnp.arange(1, 25, dtype=jnp.int32)
+    
+    value = jnp.sum(pips * point_map) + born_off_current + born_off_opponent
+    
     # Uniform policy over legal actions for greedy baseline
     policy_logits = jnp.where(state.legal_action_mask, 0.0, -jnp.inf)
+    
     return policy_logits, jnp.array(value)
 
 
@@ -237,7 +240,7 @@ trainer = StochasticTrainer(
     # Use the stochastic evaluator for training
     evaluator=evaluator, 
     memory_buffer=replay_memory,
-    max_episode_steps=200,  # Super short episodes
+    max_episode_steps=500,  # Super short episodes
     env_step_fn=step_fn,
     env_init_fn=init_fn,
     state_to_nn_input_fn=state_to_nn_input,
