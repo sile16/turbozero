@@ -2,6 +2,7 @@ checkpoints/
 .vscode/
 wandb/*
 venv*
+poetry.lock
 
 visualizations/mcts_trees/*
 visualizations/

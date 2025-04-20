@@ -46,7 +46,7 @@ STOCHASTIC_PROBS = env.stochastic_action_probs
 print(f"STOCHASTIC_PROBS: {STOCHASTIC_PROBS}")
 
 # --- Environment Interface Functions ---
-def step_fn(state: bg.State, action: int, key: chex.PRNGKey) -> Tuple[bg.State, StepMetadata]:
+def stochastic_bg_step_fn(state: bg.State, action: int, key: chex.PRNGKey) -> Tuple[bg.State, StepMetadata]:
     """Combined step function for backgammon environment that handles both deterministic and stochastic actions."""
     # print(f"[DEBUG-BG_STEP-{time.time()}] Called with state (stochastic={state.is_stochastic}), action={action}") # Optional debug
 
@@ -232,7 +232,7 @@ trainer = StochasticTrainer(
     batch_size=8,      # Minimal batch size
     train_batch_size=8,
     warmup_steps=0,
-    collection_steps_per_epoch=10,  # Just 2 collection step
+    collection_steps_per_epoch=300,  # Just 2 collection step
     train_steps_per_epoch=10,       # Just 2 training step
     nn=mlp_policy_value_net,
     loss_fn=partial(az_default_loss_fn, l2_reg_lambda=0.0),
@@ -240,8 +240,8 @@ trainer = StochasticTrainer(
     # Use the stochastic evaluator for training
     evaluator=evaluator, 
     memory_buffer=replay_memory,
-    max_episode_steps=500,  # Super short episodes
-    env_step_fn=step_fn,
+    max_episode_steps=500,  
+    env_step_fn=stochastic_bg_step_fn,
     env_init_fn=init_fn,
     state_to_nn_input_fn=state_to_nn_input,
     testers=[
