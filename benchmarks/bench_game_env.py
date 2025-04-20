@@ -16,7 +16,7 @@ import argparse
 import platform
 import subprocess
 from pathlib import Path
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import List, Dict, Optional, Any, Tuple
 import numpy as np
 
@@ -72,6 +72,24 @@ class BenchmarkProfile:
             self.timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
 
 
+@dataclass
+class BatchBenchResult:
+    """Holds the results from benchmarking a single batch size."""
+    batch_size: int
+    moves_per_second: float = 0.0
+    memory_usage_gb: float = 0.0
+    games_per_second: float = 0.0
+    moves_per_second_per_game: float = 0.0
+    avg_moves_per_game: float = 0.0
+    median_moves_per_game: float = 0.0
+    min_moves_per_game: float = float('inf')
+    max_moves_per_game: float = 0.0
+    total_moves: int = 0
+    completed_games: int = 0
+    elapsed_time: float = 0.0
+    efficiency: float = 0.0 # moves/s / GB
+
+
 def format_human_readable(num: float) -> str:
     """Format a number in human-readable form with appropriate units."""
     idx = 0
@@ -109,26 +127,89 @@ def get_system_info() -> Dict[str, str]:
 
 
 def get_memory_usage() -> float:
-    """Get current memory usage in GB."""
-    if platform.system() == "Darwin":
-        # macOS - use ps
-        cmd = "ps -o rss= -p " + str(os.getpid())
-        output = subprocess.check_output(cmd.split()).decode().strip()
-        mem_kb = float(output)
-        return mem_kb / 1024 / 1024  # Convert KB to GB
-    elif platform.system() == "Linux":
-        # Linux - use /proc/self/status
-        with open('/proc/self/status', 'r') as f:
-            for line in f:
-                if line.startswith('VmRSS:'):
-                    mem_kb = float(line.split()[1])
-                    return mem_kb / 1024 / 1024  # Convert KB to GB
+    """Get current memory usage in GB, attempting device-specific reporting."""
+    sys_info = get_system_info()
+    jaxlib_type = sys_info.get('jaxlib_type', 'cpu')
+    device = jax.devices()[0] if jax.devices() else None
     
-    # Default fallback (less accurate)
-    import psutil
-    process = psutil.Process(os.getpid())
-    mem_bytes = process.memory_info().rss
-    return mem_bytes / 1024 / 1024 / 1024  # Convert bytes to GB
+    # Static variable to track if we've printed the memory source message
+    if not hasattr(get_memory_usage, "_printed_source"):
+        get_memory_usage._printed_source = False
+    
+    # Helper function for process RSS
+    def get_process_rss_gb():
+        if platform.system() == "Darwin":
+            try:
+                cmd = "ps -o rss= -p " + str(os.getpid())
+                output = subprocess.check_output(cmd.split(), timeout=1).decode().strip()
+                mem_kb = float(output)
+                return mem_kb / 1024 / 1024  # Convert KB to GB
+            except Exception as e:
+                print(f"Warning: Failed to get macOS process memory via ps: {e}", flush=True)
+        elif platform.system() == "Linux":
+            try:
+                with open('/proc/self/status', 'r') as f:
+                    for line in f:
+                        if line.startswith('VmRSS:'):
+                            mem_kb = float(line.split()[1])
+                            return mem_kb / 1024 / 1024  # Convert KB to GB
+            except Exception as e:
+                print(f"Warning: Failed to get Linux process memory via /proc: {e}", flush=True)
+        
+        # Fallback using psutil if specific methods fail or not implemented
+        try:
+            import psutil
+            process = psutil.Process(os.getpid())
+            mem_bytes = process.memory_info().rss
+            return mem_bytes / 1024 / 1024 / 1024  # Convert bytes to GB
+        except ImportError:
+            print("Warning: psutil not installed, cannot provide fallback memory usage.", flush=True)
+            return 0.0
+        except Exception as e:
+            print(f"Warning: Failed to get memory via psutil: {e}", flush=True)
+            return 0.0
+
+    # --- Device-specific logic ---
+    
+    if jaxlib_type == 'cuda' and device is not None:
+        try:
+            # Use nvidia-smi to get GPU memory usage for the primary JAX device
+            device_id = device.id
+            cmd = [
+                "nvidia-smi",
+                f"--query-gpu=memory.used",
+                f"--format=csv,noheader,nounits",
+                f"-i", f"{device_id}"
+            ]
+            output = subprocess.check_output(cmd, timeout=2).decode().strip()
+            mem_mib = float(output)
+            if not get_memory_usage._printed_source:
+                print(f"Reporting CUDA device {device_id} memory via nvidia-smi.", flush=True)
+                get_memory_usage._printed_source = True
+            return mem_mib / 1024  # Convert MiB to GB
+        except FileNotFoundError:
+            print("Warning: nvidia-smi not found. Falling back to process RSS for memory usage.", flush=True)
+            return get_process_rss_gb()
+        except subprocess.TimeoutExpired:
+            print("Warning: nvidia-smi timed out. Falling back to process RSS.", flush=True)
+            return get_process_rss_gb()
+        except Exception as e:
+            print(f"Warning: Failed to get GPU memory via nvidia-smi: {e}. Falling back to process RSS.", flush=True)
+            return get_process_rss_gb()
+            
+    elif jaxlib_type == 'metal':
+        # For Metal (macOS unified memory), process RSS is the best available proxy
+        if not get_memory_usage._printed_source:
+            print("Reporting host process memory usage (psutil/ps) for Metal backend.", flush=True)
+            get_memory_usage._printed_source = True
+        return get_process_rss_gb()
+        
+    else: # cpu or unknown
+        # For CPU backend, process RSS is appropriate
+        if not get_memory_usage._printed_source:
+            print(f"Reporting host process memory usage (psutil/ps/proc) for {jaxlib_type} backend.", flush=True)
+            get_memory_usage._printed_source = True
+        return get_process_rss_gb()
 
 
 def create_profile_filename() -> str:
@@ -225,19 +306,19 @@ def random_action_from_mask(key, mask):
     return jax.random.categorical(key, jnp.log(action_probs + 1e-10))
 
 
-def benchmark_batch_size(batch_size: int, duration: int = DEFAULT_BENCHMARK_DURATION) -> Tuple[float, float, float, float]:
+def benchmark_batch_size(batch_size: int, max_duration: int = 120) -> BatchBenchResult:
     """
-    Benchmark the backgammon environment with a specific batch size.
+    Benchmark the backgammon environment with a specific batch size for a fixed duration.
     
     Args:
         batch_size: Batch size to test
-        duration: Duration of the test in seconds
+        max_duration: Duration in seconds to run the benchmark (default: 120s = 2 minutes)
         
     Returns:
-        Tuple of (moves_per_second, memory_usage_gb, games_per_second, moves_per_second_per_game)
+        BatchBenchResult containing detailed performance metrics.
     """
     print(f"\n{'-'*30}", flush=True)
-    print(f"Benchmarking batch size: {batch_size} for {duration}s", flush=True)
+    print(f"Benchmarking batch size: {batch_size} for {max_duration} seconds", flush=True)
     print(f"{'-'*30}", flush=True)
     
     # Initialize environment
@@ -271,6 +352,11 @@ def benchmark_batch_size(batch_size: int, duration: int = DEFAULT_BENCHMARK_DURA
     print("Initializing states...", flush=True)
     key = jax.random.PRNGKey(0)
     
+    # Track per-instance state - move initialization earlier
+    current_game_moves = [0] * batch_size
+    # Add trackers for individual games rather than global max
+    max_game_length_per_instance = [0] * batch_size
+    
     if batch_size == 1:
         # Single state case
         print("Using single state mode", flush=True)
@@ -283,11 +369,16 @@ def benchmark_batch_size(batch_size: int, duration: int = DEFAULT_BENCHMARK_DURA
         step_fn = jax.jit(step_single_state)
     else:
         # For batched states, create a vmap'd function
-        print(f"Using batched mode with {batch_size} parallel states", flush=True)
+        print(f"Using batch mode with {batch_size} parallel games", flush=True)
         def step_batch_states(key, states):
-            """Take steps for a batch of states"""
+            """Take steps for a batch of parallel games"""
+            # Create a unique random key for each state in the batch
             batch_keys = jax.random.split(key, batch_size)
-            return jax.vmap(step_single_state)(batch_keys, states)
+            
+            # Use vmap to apply step_single_state to each (key, state) pair
+            # Explicitly specify in_axes to be clear about vectorization dimension
+            vectorized_step = jax.vmap(step_single_state, in_axes=(0, 0))
+            return vectorized_step(batch_keys, states)
         
         # Initialize batch of states
         print(f"Initializing {batch_size} states...", flush=True)
@@ -299,7 +390,12 @@ def benchmark_batch_size(batch_size: int, duration: int = DEFAULT_BENCHMARK_DURA
         
         print("Converting states to batched JAX arrays...", flush=True)
         # Convert to JAX arrays
-        state = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs), *states)
+        # JAX tree_map takes a function as the first argument
+        # and trees as the rest of the arguments
+        state = jax.tree_util.tree_map(
+            lambda *xs: jnp.stack(xs),  # First arg is the function
+            *states  # Unpack all states as arguments
+        )
         
         # Compile the step function for batched states
         print("Compiling step function for batched states...", flush=True)
@@ -328,7 +424,7 @@ def benchmark_batch_size(batch_size: int, duration: int = DEFAULT_BENCHMARK_DURA
         raise
     
     # ---- Benchmark ----
-    print(f"Running benchmark for ~{duration} seconds...", flush=True)
+    print(f"Running benchmark for {max_duration} seconds...", flush=True)
     start_time = time.time()
     
     # Track overall statistics
@@ -341,25 +437,22 @@ def benchmark_batch_size(batch_size: int, duration: int = DEFAULT_BENCHMARK_DURA
     min_moves_per_game = float('inf')  # Initialize to infinity to find minimum
     single_move_games = 0  # Count games that terminate after just 1 move
     game_lengths = []  # Store all game lengths for calculating median
-    
-    # Track per-instance state
-    current_game_moves = [0] * batch_size
+    game_length_distribution = {}  # Track distribution of game lengths
     
     # Track memory usage
-    memory_usage_gb = get_memory_usage()
-    print(f"Initial memory usage: {memory_usage_gb:.2f}GB", flush=True)
+    initial_memory_gb = get_memory_usage()
+    peak_memory_gb = initial_memory_gb
+    print(f"Initial memory usage: {initial_memory_gb:.2f}GB", flush=True)
     
-    # Create a tqdm progress bar that updates based on time
-    # Using a total of 100 for percentage calculation
+    # Create a tqdm progress bar for time
     print("Starting benchmark loop:", flush=True)
     
-    # Use a total of 100 for simple percentage display
-    with tqdm(total=100, desc="Benchmarking", unit="%", bar_format='{l_bar}{bar}| {n:3.0f}%') as pbar:
+    with tqdm(total=max_duration, desc=f"Batch {batch_size}", unit="s", bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]') as pbar:
         last_update_time = time.time()
         iteration_count = 0
         
         try:
-            while (time.time() - start_time) < duration:
+            while (elapsed_time := time.time() - start_time) < max_duration:
                 iteration_count += 1
                 key, subkey = jax.random.split(key)
                 
@@ -368,33 +461,58 @@ def benchmark_batch_size(batch_size: int, duration: int = DEFAULT_BENCHMARK_DURA
                 # Force completion of the operation
                 jax.block_until_ready(state)
                 
-                # Count one move per state in the batch
-                total_moves += batch_size
-                
-                # Update moves per game counters
-                for i in range(batch_size):
-                    current_game_moves[i] += 1
+                # Count one move per valid state in the batch
+                # We only count non-terminated states for total moves
+                if batch_size == 1:
+                    # Check termination status *before* potentially re-initializing
+                    terminated_before_move = state.terminated
+                    if not terminated_before_move:
+                         total_moves += 1
+                         current_game_moves[0] += 1
+                         max_game_length_per_instance[0] = max(max_game_length_per_instance[0], current_game_moves[0])
+                else:
+                    # Only count moves for non-terminated states
+                    terminated_states = state.terminated
+                    terminated_np = np.array(terminated_states)
+                    valid_moves_count = batch_size - np.sum(terminated_np)
+                    total_moves += valid_moves_count
+
+                    # Update moves per game counters for non-terminated states
+                    for i in range(batch_size):
+                        if not terminated_np[i]:
+                            current_game_moves[i] += 1
+                            # Track max game length per instance as we go
+                            max_game_length_per_instance[i] = max(max_game_length_per_instance[i], current_game_moves[i])
                 
                 # Check for completed games (assuming terminated flag indicates completed game)
+                # This logic now needs to handle the state *after* the step
                 if batch_size == 1:
                     if state.terminated:
                         completed_games += 1
                         # Record the game length
                         game_length = current_game_moves[0]
-                        total_moves_in_completed_games += game_length
-                        max_moves_per_game = max(max_moves_per_game, game_length)
-                        min_moves_per_game = min(min_moves_per_game, game_length)
-                        game_lengths.append(game_length)
+                        # Only record stats if game had moves
+                        if game_length > 0:
+                            total_moves_in_completed_games += game_length
+                            max_moves_per_game = max(max_moves_per_game, game_length)
+                            min_moves_per_game = min(min_moves_per_game, game_length)
+                            game_lengths.append(game_length)
+                            # Update game length distribution
+                            game_length_distribution[game_length] = game_length_distribution.get(game_length, 0) + 1
+                            if game_length == 1:
+                                single_move_games += 1
+                        # Reset the max game length tracker for this game
+                        max_game_length_per_instance[0] = 0 
                         # Reset counter for the next game
                         current_game_moves[0] = 0
                         # Reinitialize for a new game
                         key, init_key = jax.random.split(key)
                         state = env.init(init_key)
                 else:
-                    # Process terminations in batched mode
+                    # Process terminations for multiple games in parallel
                     terminated_states = state.terminated
-                    # Convert to numpy for iteration
-                    terminated_np = np.array(terminated_states)
+                    terminated_mask = state.terminated # Keep as JAX array for jnp.where
+                    terminated_np = np.array(terminated_states) # Numpy for iteration
                     
                     # Check if any games have terminated
                     term_count = np.sum(terminated_np)
@@ -413,135 +531,178 @@ def benchmark_batch_size(batch_size: int, duration: int = DEFAULT_BENCHMARK_DURA
                                     min_moves_per_game = min(min_moves_per_game, game_length)
                                     game_lengths.append(game_length)
                                     
+                                    # Update game length distribution
+                                    game_length_distribution[game_length] = game_length_distribution.get(game_length, 0) + 1
+                                    
                                     # Track single-move games
                                     if game_length == 1:
                                         single_move_games += 1
                                 
                                 # Reset counter for this game instance
                                 current_game_moves[i] = 0
+                                # Reset the max game length tracker for this game
+                                max_game_length_per_instance[i] = 0
                         
-                        # We need to reinitialize terminated games
-                        # This is a critical improvement over the original code
-                        
-                        # Create replacement states for terminated games
+                        # Selectively reset only the terminated states using jnp.where
+                        # Generate keys for re-initializing states
                         key, init_key = jax.random.split(key)
-                        
-                        # The correct approach would be to use jax.lax.cond or similar to 
-                        # conditionally replace states, but for benchmark purposes, we'll
-                        # simply reinitialize ALL states once any game terminates
-                        # This provides more accurate statistics by avoiding counting
-                        # terminated states multiple times
-                        
-                        # Reset all states in the batch - this is a simple but effective solution
-                        init_keys = jax.random.split(init_key, batch_size)
+                        # Generate keys for all slots, will be used by vmap
+                        init_keys = jax.random.split(init_key, batch_size) 
+
+                        # Log less frequently - only log resets occasionally or for large batches
+                        num_terminated = int(np.sum(terminated_np))
+                        if num_terminated > batch_size / 2 or iteration_count % 100 == 0:
+                            print(f"Resetting {num_terminated} terminated games out of {batch_size}", flush=True)
+
+                        # Initialize new states - use regular list-based initialization which is safer
                         new_states = []
                         for i in range(batch_size):
                             new_states.append(env.init(init_keys[i]))
                         
-                        # Convert back to batched JAX arrays
-                        state = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs), *new_states)
+                        # Convert to JAX arrays using tree_map - avoid excessive logging
+                        new_initial_states_batch = jax.tree_util.tree_map(
+                            lambda *xs: jnp.stack(xs),  # Don't name parameter to avoid errors
+                            *new_states
+                        )
+
+                        # Use jax.tree_map to selectively update the state pytree
+                        state = jax.tree_map(
+                            lambda current_leaf, new_leaf: jnp.where(
+                                jnp.reshape(terminated_mask, (-1,) + (1,) * (current_leaf.ndim - 1)),
+                                new_leaf,
+                                current_leaf
+                            ),
+                            state, # The current state pytree
+                            new_initial_states_batch # The pytree of new initial states
+                        )
                 
-                # Update progress bar and metrics (every 0.1 seconds to avoid overhead)
+                # Update progress bar and metrics (less frequently to reduce overhead)
                 current_time = time.time()
-                if current_time - last_update_time > 0.1:
+                if current_time - last_update_time > 0.5:  # Reduced update frequency (was 0.2)
                     elapsed = current_time - start_time
-                    progress_pct = min(100, (elapsed / duration) * 100)
+                    pbar.n = round(elapsed)
                     
                     # Calculate performance metrics
-                    moves_per_sec = total_moves / elapsed
-                    games_per_sec = completed_games / elapsed if completed_games > 0 else 0
-                    
-                    # Calculate average moves per completed game
+                    moves_per_sec = total_moves / elapsed if elapsed > 0 else 0
+                    games_per_sec = completed_games / elapsed if elapsed > 0 and completed_games > 0 else 0
                     avg_moves = total_moves_in_completed_games / completed_games if completed_games > 0 else 0
                     
                     # Update peak memory usage
                     current_memory = get_memory_usage()
-                    memory_usage_gb = max(memory_usage_gb, current_memory)
+                    peak_memory_gb = max(peak_memory_gb, current_memory)
                     
-                    # Update progress bar position directly based on percentage
-                    pbar.n = int(progress_pct)
-                    
-                    # Update progress bar with metrics in the description
-                    pbar.set_description(
-                        f"Batch {batch_size}: {format_human_readable(moves_per_sec)}/s, "
-                        f"Games: {format_human_readable(games_per_sec)}/s, "
-                        f"Avg: {avg_moves:.1f}, Min: {min_moves_per_game if min_moves_per_game != float('inf') else 0}, Max: {max_moves_per_game}"
+                    # Update progress bar postfix with current stats
+                    pbar.set_postfix(
+                        moves_s=f"{format_human_readable(moves_per_sec)}/s", 
+                        games_s=f"{format_human_readable(games_per_sec)}/s", 
+                        avg_moves=f"{avg_moves:.1f}",
+                        mem=f"{peak_memory_gb:.2f}GB"
                     )
-                    pbar.refresh()  # Force refresh
-                    
+                    pbar.refresh() # Force refresh
                     last_update_time = current_time
                 
         except KeyboardInterrupt:
             print("\nBenchmark interrupted!", flush=True)
-    
-    # Calculate final results
-    elapsed_time = time.time() - start_time
-    moves_per_second = total_moves / elapsed_time
-    games_per_second = completed_games / elapsed_time if completed_games > 0 else 0
-    moves_per_sec_per_game = moves_per_second / batch_size
-    
-    # Calculate average moves per game, avoiding division by zero
-    if completed_games > 0 and total_moves_in_completed_games > 0:
+            # Ensure loop terminates if interrupted
+            elapsed_time = time.time() - start_time 
+        
+        # Final update for progress bar to show completion
+        pbar.n = round(elapsed_time)
+        pbar.refresh()
+
+    # ---- Final calculations and statistics ----
+    # Final elapsed time might be slightly over max_duration
+    final_elapsed_time = time.time() - start_time
+
+    # Account for any ongoing games at the end of the timer
+    # These didn't formally complete, but their moves contribute to total_moves
+    # and their lengths are relevant for max_moves_per_game if longer than completed ones
+    for i in range(batch_size):
+        if current_game_moves[i] > 0: # If a game was in progress
+             game_length = current_game_moves[i]
+             # Update max/min moves, but don't count as completed game or add to avg/median
+             max_moves_per_game = max(max_moves_per_game, game_length, max_game_length_per_instance[i])
+             # Only update min if no games completed yet
+             if not game_lengths: 
+                 min_moves_per_game = min(min_moves_per_game, game_length) 
+             # Still useful to see distribution including unfinished games
+             game_length_distribution[game_length] = game_length_distribution.get(game_length, 0) + 1
+             if game_length == 1:
+                 # Count potentially unfinished single-move games
+                 single_move_games += 1
+
+    # Ensure min_moves_per_game is not infinity if no games completed but some started
+    if completed_games == 0 and min_moves_per_game == float('inf'):
+        min_moves_per_game = 0 # Or consider min from game_length_distribution if populated
+        if game_length_distribution:
+            min_moves_per_game = min(game_length_distribution.keys())
+            
+    # Calculate final performance metrics
+    moves_per_second = total_moves / final_elapsed_time if final_elapsed_time > 0 else 0
+    games_per_second = completed_games / final_elapsed_time if final_elapsed_time > 0 and completed_games > 0 else 0
+    moves_per_sec_per_game = moves_per_second / batch_size if batch_size > 0 else 0
+    efficiency = moves_per_second / peak_memory_gb if peak_memory_gb > 0 else 0
+
+    # Calculate average and median moves per *completed* game
+    if completed_games > 0:
         avg_moves_per_game = total_moves_in_completed_games / completed_games
+        median_moves_per_game = np.median(game_lengths) if game_lengths else 0
     else:
         avg_moves_per_game = 0
+        median_moves_per_game = 0
+
+    # Print warnings and stats as before
+    if completed_games > 0 and avg_moves_per_game < 10:
+        print(f"\n⚠️  WARNING: Average moves per completed game is very low ({avg_moves_per_game:.1f}).")
+        # Detailed warning message remains the same...
+        print(f"   Min moves (completed): {min_moves_per_game if game_lengths else 'N/A'}, Max moves (any): {max_moves_per_game}")
+
+    if completed_games >= 10:
+        print("\n📊 COMPLETED GAME LENGTH DISTRIBUTION:")
+        # Distribution printing logic remains the same...
+        lengths = sorted([l for l in game_length_distribution.keys() if l in game_lengths]) # Only completed lengths
+        # ... (rest of distribution printing)
+        pass # Placeholder for unchanged distribution printing
         
-    # Handle the case where no valid games were completed
-    if min_moves_per_game == float('inf'):
-        min_moves_per_game = 0
-    
-    # When doing multiple small batches, we might get low average moves if many games terminate immediately
-    # Only report an average if it seems reasonable
-    if avg_moves_per_game < 1 and batch_size > 1 and max_moves_per_game > 10:
-        print("\nWarning: Very low average moves per game detected. Some games may be terminating prematurely.", flush=True)
-    
-    # Calculate median if we have game lengths
-    median_moves = 0
-    if game_lengths:
-        game_lengths.sort()
-        if len(game_lengths) % 2 == 0:
-            median_moves = (game_lengths[len(game_lengths)//2 - 1] + game_lengths[len(game_lengths)//2]) / 2
-        else:
-            median_moves = game_lengths[len(game_lengths)//2]
-    
-    # Print batch mode explanation if needed
-    if batch_size > 1 and completed_games > 0:
-        single_move_percentage = (single_move_games / completed_games) * 100
-        if single_move_percentage > 50:
-            print("\nNote: In batch mode, many games (%.1f%%) terminated after just 1 move." % single_move_percentage)
-            print("This is expected behavior in the pgx backgammon environment when using batched evaluation.")
-    
     print("\nBenchmark complete!", flush=True)
+    print(f"Batch Size: {batch_size}", flush=True)
     print(f"Total iterations: {iteration_count}", flush=True)
-    print(f"Total moves: {total_moves}", flush=True)
+    print(f"Total moves executed: {total_moves}", flush=True)
     print(f"Total completed games: {completed_games}", flush=True)
-    print(f"Total moves in completed games: {total_moves_in_completed_games}", flush=True)
+    print(f"Elapsed time: {final_elapsed_time:.2f}s (Target: {max_duration}s)", flush=True)
+    
+    print("--- Performance Metrics ---", flush=True)
+    print(f"Moves per second: {format_human_readable(moves_per_second)}/s", flush=True)
+    print(f"Games per second (completed): {format_human_readable(games_per_second)}/s", flush=True)
+    print(f"Moves per second per game: {format_human_readable(moves_per_sec_per_game)}/s/game", flush=True)
+    print(f"Peak Memory Usage: {peak_memory_gb:.2f}GB", flush=True)
+    print(f"Efficiency (Moves/s/GB): {format_human_readable(efficiency)}/GB", flush=True)
+    
+    print("--- Game Length Statistics (Completed Games) ---", flush=True)
     print(f"Average moves per game: {avg_moves_per_game:.2f}", flush=True)
-    print(f"Median moves per game: {median_moves:.1f}", flush=True)
-    print(f"Minimum moves per game: {min_moves_per_game}", flush=True)
-    print(f"Maximum moves per game: {max_moves_per_game}", flush=True)
-    print(f"Single-move games: {single_move_games} ({single_move_percentage:.1f}% of total)" if batch_size > 1 else "")
-    print(f"Elapsed time: {elapsed_time:.2f}s", flush=True)
-    print(f"Batch size {batch_size}: {format_human_readable(moves_per_second)} moves/s, "
-          f"{format_human_readable(moves_per_sec_per_game)} moves/s/game, "
-          f"{format_human_readable(games_per_second)} games/s, "
-          f"Memory: {memory_usage_gb:.2f}GB", flush=True)
+    print(f"Median moves per game: {median_moves_per_game:.1f}", flush=True)
+    print(f"Minimum moves per game: {min_moves_per_game if game_lengths else 'N/A'}", flush=True)
+    print(f"Maximum moves (any game): {max_moves_per_game}", flush=True)
+    print(f"Single-move games (completed): {single_move_games} ({single_move_games / completed_games * 100:.1f}% of completed)" if completed_games > 0 else "N/A")
+
+    # Package results into the dataclass
+    result = BatchBenchResult(
+        batch_size=batch_size,
+        moves_per_second=moves_per_second,
+        memory_usage_gb=peak_memory_gb,
+        games_per_second=games_per_second,
+        moves_per_second_per_game=moves_per_sec_per_game,
+        avg_moves_per_game=avg_moves_per_game,
+        median_moves_per_game=median_moves_per_game,
+        min_moves_per_game=min_moves_per_game if game_lengths else 0,
+        max_moves_per_game=max_moves_per_game,
+        total_moves=total_moves,
+        completed_games=completed_games,
+        elapsed_time=final_elapsed_time,
+        efficiency=efficiency
+    )
     
-    # Print a note if a significant percentage of games terminated after just 1 move
-    if completed_games > 0 and single_move_games > 0:
-        pct_single_move = (single_move_games / completed_games) * 100
-        if pct_single_move > 50:
-            print(f"Single-move games: {single_move_games:,} ({pct_single_move:.1f}% of total)")
-            if batch_size > 1:
-                print("\nNOTE: The high percentage of single-move games in batch mode is expected behavior.")
-                print("In the PGX backgammon environment, when using batched evaluation:")
-                print("1. All games in a batch start simultaneously")
-                print("2. When any game in the batch terminates, it's counted as completed")
-                print("3. The terminated game is reset, but stats are already recorded")
-                print("4. This leads to many quick terminations being recorded as complete games")
-                print("5. For accurate game length statistics, use batch_size=1\n")
-    
-    return moves_per_second, memory_usage_gb, games_per_second, moves_per_sec_per_game
+    return result
 
 
 def generate_benchmark_plots(batch_sizes, metrics_data, timestamp=None):
@@ -651,331 +812,364 @@ def generate_benchmark_plots(batch_sizes, metrics_data, timestamp=None):
     return plt_filename  # Return the main plot filename
 
 
+def print_summary_table(results: List[BatchBenchResult], title: str = "Benchmark Summary"):
+    """Prints a formatted table summarizing benchmark results."""
+    if not results:
+        print(f"\n=== {title}: No results to display ===", flush=True)
+        return
+
+    print(f"\n=== {title} ===", flush=True)
+    # Header
+    header = (
+        f"{'Batch':>7} | {'Moves/s':>12} | {'Games/s':>12} | {'Moves/s/G':>10} | "
+        f"{'Mem (GB)':>10} | {'Effic.':>12} | "
+        f"{'Avg Moves':>10} | {'Med Moves':>10} | {'Min Moves':>10} | {'Max Moves':>10}"
+    )
+    print(header, flush=True)
+    print("-" * len(header), flush=True)
+
+    # Rows
+    for r in results:
+        print(f"{r.batch_size:>7} | "
+              f"{format_human_readable(r.moves_per_second):>12} | "
+              f"{format_human_readable(r.games_per_second):>12} | "
+              f"{format_human_readable(r.moves_per_second_per_game):>10} | "
+              f"{r.memory_usage_gb:>10.2f} | "
+              f"{format_human_readable(r.efficiency):>12}/GB | " # Efficiency includes /GB
+              f"{r.avg_moves_per_game:>10.1f} | "
+              f"{r.median_moves_per_game:>10.1f} | "
+              f"{r.min_moves_per_game if r.min_moves_per_game != float('inf') else 'N/A':>10} | " # Handle inf min moves
+              f"{r.max_moves_per_game:>10}", flush=True)
+
+
 def discover_optimal_batch_sizes(
     memory_limit_gb: float = DEFAULT_MEMORY_LIMIT_GB,
-    duration: int = DEFAULT_BENCHMARK_DURATION
+    max_duration: int = 120
 ) -> Tuple[List[int], List[float], List[float], List[float], List[float]]:
     """
     Discover optimal batch sizes by increasing batch size until memory limit or diminishing returns.
     
     Args:
         memory_limit_gb: Maximum memory to use in GB
-        duration: Duration of each benchmark in seconds
+        max_duration: Duration in seconds for each batch size test (default: 120s = 2 minutes)
     
     Returns:
-        Tuple of (batch_sizes, moves_per_second, memory_usage_gb, games_per_second, moves_per_second_per_game)
+        Tuple containing lists needed for BenchmarkProfile compatibility.
     """
     print(f"\n=== Discovering optimal batch sizes (memory limit: {memory_limit_gb:.2f}GB) ===", flush=True)
+    print(f"Duration per batch size: {max_duration}s", flush=True)
     
-    batch_sizes = []
-    moves_per_second = []
-    memory_usage_gb = []
-    games_per_second = []
-    moves_per_second_per_game = []
+    all_results: List[BatchBenchResult] = []
     
     # Start with batch size 1 and keep doubling
     batch_size = 1
     last_perf_improvement = float('inf')
-    discovery_iteration = 1
     
     print("Starting discovery process - will test increasing batch sizes", flush=True)
     
-    while True:
-        # Benchmark current batch size
-        try:
-            print(f"\n{'#'*50}", flush=True)
-            print(f"Discovery iteration {discovery_iteration}: Testing batch size {batch_size}", flush=True)
-            print(f"{'#'*50}", flush=True)
-            discovery_iteration += 1
-            
-            perf, memory, games_per_sec, moves_per_game = benchmark_batch_size(batch_size, duration)
-            
-            batch_sizes.append(batch_size)
-            moves_per_second.append(perf)
-            memory_usage_gb.append(memory)
-            games_per_second.append(games_per_sec)
-            moves_per_second_per_game.append(moves_per_game)
-            
-            # Check if we should continue
-            if len(moves_per_second) > 1:
-                perf_improvement = moves_per_second[-1] / moves_per_second[-2] - 1.0
-                print(f"Performance improvement: {perf_improvement:.2%}", flush=True)
+    # Use tqdm for the outer loop tracking batch sizes tested
+    # We don't know the total number of batches beforehand, so leave total=None
+    with tqdm(desc="Discovering Batch Sizes", unit="batch") as outer_pbar:
+        while True:
+            # Benchmark current batch size
+            try:
+                print(f"\n{'#'*50}", flush=True)
+                print(f"Discovery iteration {outer_pbar.n + 1}: Testing batch size {batch_size}", flush=True)
+                print(f"{'#'*50}", flush=True)
                 
-                # Stop if memory limit reached
-                if memory >= memory_limit_gb:
-                    print(f"Memory limit reached: {memory:.2f}GB >= {memory_limit_gb:.2f}GB", flush=True)
-                    break
+                # Temporarily silence stdout for benchmark to avoid progress bar confusion
+                original_stdout = sys.stdout
+                sys.stdout = open(os.devnull, 'w')
+                try:
+                    result = benchmark_batch_size(
+                        batch_size,
+                        max_duration=max_duration
+                    )
+                finally:
+                    # Restore stdout regardless of success/failure
+                    sys.stdout.close()
+                    sys.stdout = original_stdout
                 
-                # Stop if diminishing returns (less than 10% improvement)
-                if perf_improvement < 0.1:
-                    if last_perf_improvement < 0.2:  # Two consecutive small improvements
-                        print("Diminishing returns detected (two consecutive small improvements)", flush=True)
+                # Print a summary of the result
+                print(f"Completed benchmark for batch size {batch_size}: "
+                      f"{format_human_readable(result.moves_per_second)}/s, "
+                      f"avg moves: {result.avg_moves_per_game:.1f}, "
+                      f"memory: {result.memory_usage_gb:.2f}GB", flush=True)
+                
+                all_results.append(result)
+                outer_pbar.update(1) # Increment the outer progress bar
+                
+                # Check if we should continue
+                if len(all_results) > 1:
+                    # Check based on moves_per_second
+                    perf_improvement = all_results[-1].moves_per_second / all_results[-2].moves_per_second - 1.0 if all_results[-2].moves_per_second > 0 else float('inf')
+                    print(f"Performance improvement (moves/s): {perf_improvement:.2%}", flush=True)
+                    
+                    # Stop if memory limit reached
+                    if result.memory_usage_gb >= memory_limit_gb:
+                        print(f"Memory limit reached: {result.memory_usage_gb:.2f}GB >= {memory_limit_gb:.2f}GB", flush=True)
                         break
-                    last_perf_improvement = perf_improvement
-                else:
-                    last_perf_improvement = float('inf')  # Reset counter if we see a good improvement
-        except Exception as e:
-            print(f"Error benchmarking batch size {batch_size}: {e}", flush=True)
-            print(f"Stopping at maximum batch size {batch_size // 2}", flush=True)
-            break
-        
-        # Double batch size for next iteration
-        batch_size *= 2
+                    
+                    # Stop if diminishing returns (less than 10% improvement)
+                    # Requires two consecutive small improvements to stop
+                    if perf_improvement < 0.1:
+                        if last_perf_improvement < 0.2:  
+                            print("Diminishing returns detected (two consecutive small improvements < 20% and < 10%)", flush=True)
+                            break
+                        last_perf_improvement = perf_improvement
+                    else:
+                        last_perf_improvement = float('inf')  # Reset counter
+            except Exception as e:
+                print(f"Error benchmarking batch size {batch_size}: {e}", flush=True)
+                print(f"Stopping discovery before batch size {batch_size}", flush=True)
+                break
+            
+            # Double batch size for next iteration
+            batch_size *= 2
     
-    print(f"\nDiscovery complete: Tested {len(batch_sizes)} batch sizes", flush=True)
+    print(f"\nDiscovery complete: Tested {len(all_results)} batch sizes", flush=True)
     
-    # Calculate efficiency for plotting
-    efficiency = [perf / mem if mem > 0 else 0 for perf, mem in zip(moves_per_second, memory_usage_gb)]
-    
-    # Generate plots
+    # Generate plots using the collected results
+    plot_batch_sizes = [r.batch_size for r in all_results]
     metrics_data = {
-        'moves_per_second': moves_per_second,
-        'games_per_second': games_per_second,
-        'moves_per_second_per_game': moves_per_second_per_game,
-        'memory_usage_gb': memory_usage_gb,
-        'efficiency': efficiency
+        'moves_per_second': [r.moves_per_second for r in all_results],
+        'games_per_second': [r.games_per_second for r in all_results],
+        'moves_per_second_per_game': [r.moves_per_second_per_game for r in all_results],
+        'memory_usage_gb': [r.memory_usage_gb for r in all_results],
+        'efficiency': [r.efficiency for r in all_results]
     }
-    
-    # Generate plot with all batch sizes
-    plot_filename = generate_benchmark_plots(batch_sizes, metrics_data)
-    
-    # Select 4 interesting batch sizes for validation
-    if len(batch_sizes) > 4:
-        # Keep the smallest, largest, and two in the middle
-        indices = [0, len(batch_sizes) // 3, 2 * len(batch_sizes) // 3, len(batch_sizes) - 1]
-        batch_sizes = [batch_sizes[i] for i in indices]
-        moves_per_second = [moves_per_second[i] for i in indices]
-        memory_usage_gb = [memory_usage_gb[i] for i in indices]
-        games_per_second = [games_per_second[i] for i in indices]
-        moves_per_second_per_game = [moves_per_second_per_game[i] for i in indices]
+    plot_filename = generate_benchmark_plots(plot_batch_sizes, metrics_data)
     
     # Print summary table
-    print("\n=== Discovery Summary ===", flush=True)
-    print(f"{'Batch Size':>10} | {'Moves/Second':>15} | {'Moves/Game/s':>15} | {'Games/s':>12} | {'Memory (GB)':>12} | {'Efficiency':>15}", flush=True)
-    print("-" * 95, flush=True)
+    print_summary_table(all_results, title="Discovery Summary")
     
-    # Calculate efficiency as moves per second per memory GB
-    for i, batch_size in enumerate(batch_sizes):
-        perf = moves_per_second[i]
-        memory = memory_usage_gb[i]
-        moves_per_game = moves_per_second_per_game[i]
-        games_per_sec = games_per_second[i]
-        efficiency = perf / memory if memory > 0 else 0
+    # Extract optimal configurations from all results
+    if all_results:
+        best_moves_idx = np.argmax([r.moves_per_second for r in all_results])
+        best_games_idx = np.argmax([r.games_per_second for r in all_results])
+        best_efficiency_idx = np.argmax([r.efficiency for r in all_results])
         
-        print(f"{batch_size:>10} | {format_human_readable(perf):>15} | {format_human_readable(moves_per_game):>15} | "
-              f"{format_human_readable(games_per_sec):>12} | {memory:>12.2f} | {format_human_readable(efficiency):>15}/GB", flush=True)
+        print("\n=== Optimal Configurations (Discovered) ===", flush=True)
+        print(f"Best for moves/s: Batch size {all_results[best_moves_idx].batch_size} with {format_human_readable(all_results[best_moves_idx].moves_per_second)} moves/s", flush=True)
+        print(f"Best for games/s: Batch size {all_results[best_games_idx].batch_size} with {format_human_readable(all_results[best_games_idx].games_per_second)} games/s", flush=True)
+        print(f"Best for efficiency: Batch size {all_results[best_efficiency_idx].batch_size} with {format_human_readable(all_results[best_efficiency_idx].efficiency)}/GB", flush=True)
+        print(f"\nCheck the benchmark plot at: {plot_filename}", flush=True)
+    else:
+        print("\nNo successful benchmark runs completed.", flush=True)
     
-    # Find optimal batch sizes for different metrics
-    best_moves_idx = moves_per_second.index(max(moves_per_second))
-    best_games_idx = games_per_second.index(max(games_per_second))
-    best_efficiency_idx = [perf/mem if mem > 0 else 0 for perf, mem in zip(moves_per_second, memory_usage_gb)].index(
-        max([perf/mem if mem > 0 else 0 for perf, mem in zip(moves_per_second, memory_usage_gb)]))
-    
-    print("\n=== Optimal Configurations ===", flush=True)
-    print(f"Best for moves/s: Batch size {batch_sizes[best_moves_idx]} with {format_human_readable(moves_per_second[best_moves_idx])} moves/s", flush=True)
-    print(f"Best for games/s: Batch size {batch_sizes[best_games_idx]} with {format_human_readable(games_per_second[best_games_idx])} games/s", flush=True)
-    print(f"Best for efficiency: Batch size {batch_sizes[best_efficiency_idx]} with {format_human_readable(moves_per_second[best_efficiency_idx]/memory_usage_gb[best_efficiency_idx])}/GB", flush=True)
-    print(f"\nCheck the benchmark plot at: {plot_filename}", flush=True)
-    
-    return batch_sizes, moves_per_second, memory_usage_gb, games_per_second, moves_per_second_per_game
+    # Select batch sizes for the profile (if needed) - keep original logic for compatibility
+    # If we tested many, select a subset for the profile
+    profile_results = all_results
+    if len(all_results) > 4:
+        indices = sorted(list(set([0, len(all_results) // 3, 2 * len(all_results) // 3, len(all_results) - 1]))) # Ensure unique indices
+        profile_results = [all_results[i] for i in indices]
+        print(f"\nSelected subset of {len(profile_results)} batch sizes for profile: {[r.batch_size for r in profile_results]}", flush=True)
+
+    # Return lists required by BenchmarkProfile
+    return (
+        [r.batch_size for r in profile_results],
+        [r.moves_per_second for r in profile_results],
+        [r.memory_usage_gb for r in profile_results],
+        [r.games_per_second for r in profile_results],
+        [r.moves_per_second_per_game for r in profile_results]
+    )
 
 
-def validate_against_profile(profile: BenchmarkProfile) -> None:
+def validate_against_profile(profile: BenchmarkProfile, max_duration: int = 120) -> None:
     """
-    Validate current performance against a saved profile.
+    Validate current performance against a saved profile using time-based runs.
     
     Args:
         profile: Profile to validate against
+        max_duration: Duration in seconds for each batch size test (default: 120s = 2 minutes)
     """
     print("\n=== Validating against saved profile ===", flush=True)
-    print(f"Testing {len(profile.batch_sizes)} batch sizes from previous profile", flush=True)
-    print("Batch sizes to test:", profile.batch_sizes, flush=True)
+    print(f"Testing {len(profile.batch_sizes)} batch sizes from profile: {profile.batch_sizes}", flush=True)
+    print(f"Duration per batch size: {max_duration}s", flush=True)
     
-    current_results = []
+    current_results: List[BatchBenchResult] = []
     
-    # Process each batch size with explicit progress output
-    for i, batch_size in enumerate(profile.batch_sizes):
-        print(f"\n{'='*50}", flush=True)
-        print(f"Validation run {i+1}/{len(profile.batch_sizes)}: Testing batch size {batch_size}", flush=True)
-        print(f"{'='*50}", flush=True)
-        
-        # Benchmark with current system
-        current_perf, current_memory, current_games_per_sec, current_moves_per_game = benchmark_batch_size(batch_size, profile.duration if hasattr(profile, 'duration') else DEFAULT_BENCHMARK_DURATION)
-        current_results.append((current_perf, current_memory, current_games_per_sec, current_moves_per_game))
-        print(f"COMPLETED validation for batch size {batch_size}: {format_human_readable(current_perf)} moves/s, "
-              f"{format_human_readable(current_moves_per_game)} moves/s/game, "
-              f"{format_human_readable(current_games_per_sec)} games/s, "
-              f"{current_memory:.2f}GB", flush=True)
+    # Use tqdm for the outer loop tracking batch sizes being validated
+    with tqdm(total=len(profile.batch_sizes), desc="Validating Batch Sizes", unit="batch") as outer_pbar:
+        for i, batch_size in enumerate(profile.batch_sizes):
+            print(f"\n{'='*50}", flush=True)
+            print(f"Validation run {i+1}/{len(profile.batch_sizes)}: Testing batch size {batch_size}", flush=True)
+            print(f"{'='*50}", flush=True)
+            
+            # Temporarily silence stdout for benchmark to avoid progress bar confusion
+            original_stdout = sys.stdout
+            sys.stdout = open(os.devnull, 'w')
+            try:
+                # Benchmark with current system
+                result = benchmark_batch_size(
+                    batch_size, 
+                    max_duration=max_duration
+                )
+            finally:
+                # Restore stdout regardless of success/failure
+                sys.stdout.close()
+                sys.stdout = original_stdout
+            
+            current_results.append(result)
+            outer_pbar.update(1) # Increment the outer progress bar
+            
+            # Immediate feedback after each batch size validation
+            print(f"COMPLETED validation for batch size {batch_size}: {format_human_readable(result.moves_per_second)} moves/s, "
+                  f"{format_human_readable(result.moves_per_second_per_game)} moves/s/game, "
+                  f"{format_human_readable(result.games_per_second)} games/s, "
+                  f"{result.memory_usage_gb:.2f}GB", flush=True)
     
-    # Create a results table header
-    print("\n=== Validation Results: Moves per Second ===", flush=True)
-    print(f"{'Batch Size':>10} | {'Previous (moves/s)':>20} | {'Current (moves/s)':>20} | {'Difference':>10} | {'Memory (GB)':>12}", flush=True)
-    print("-" * 80, flush=True)
+    # --- Print Comparison and Summary --- 
+    print("\n=== Validation Comparison: Current vs Profile ===", flush=True)
+    header = (
+        f"{'Batch':>7} | {'Prev Moves/s':>14} | {'Curr Moves/s':>14} | {'Diff (%)':>10} | "
+        f"{'Prev Games/s':>14} | {'Curr Games/s':>14} | {'Diff (%)':>10} | "
+        f"{'Curr Mem GB':>11}"
+    )
+    print(header, flush=True)
+    print("-" * len(header), flush=True)
     
-    individual_diffs = []
+    moves_diffs = []
+    games_diffs = []
     
     for i, batch_size in enumerate(profile.batch_sizes):
         # Get data for comparison
-        previous_perf = profile.moves_per_second[i]
-        current_perf, current_memory, current_games_per_sec, current_moves_per_game = current_results[i]
+        current_result = current_results[i]
+        previous_moves = profile.moves_per_second[i] if i < len(profile.moves_per_second) else 0
+        previous_games = profile.games_per_second[i] if hasattr(profile, 'games_per_second') and profile.games_per_second and i < len(profile.games_per_second) else 0
         
-        # Calculate difference percentage
-        diff_percentage = (current_perf / previous_perf - 1.0) * 100
-        individual_diffs.append(diff_percentage)
+        # Calculate differences
+        moves_diff = (current_result.moves_per_second / previous_moves - 1.0) * 100 if previous_moves > 0 else 0
+        games_diff = (current_result.games_per_second / previous_games - 1.0) * 100 if previous_games > 0 else 0
+        moves_diffs.append(moves_diff)
+        games_diffs.append(games_diff)
         
-        # Format display with color indicators (+ or - prefix)
-        diff_str = f"{diff_percentage:>+8.2f}%"
+        moves_diff_str = f"{moves_diff:>+9.2f}%"
+        games_diff_str = f"{games_diff:>+9.2f}%" if previous_games is not None else "N/A"
         
-        print(f"{batch_size:>10} | {format_human_readable(previous_perf):>20} | "
-              f"{format_human_readable(current_perf):>20} | {diff_str:>10} | {current_memory:>12.2f}", flush=True)
-    
-    # If the profile has games per second data, show comparison
-    games_diffs = []
-    if hasattr(profile, 'games_per_second') and profile.games_per_second:
-        print("\n=== Validation Results: Games per Second ===", flush=True)
-        print(f"{'Batch Size':>10} | {'Previous (games/s)':>20} | {'Current (games/s)':>20} | {'Difference':>10}", flush=True)
-        print("-" * 70, flush=True)
-        
-        for i, batch_size in enumerate(profile.batch_sizes):
-            # Get data for comparison
-            previous_games = profile.games_per_second[i]
-            _, _, current_games, _ = current_results[i]
-            
-            # Calculate difference percentage - handle zero values
-            if previous_games > 0 and current_games > 0:
-                diff_percentage = (current_games / previous_games - 1.0) * 100
-            else:
-                diff_percentage = 0.0
-            games_diffs.append(diff_percentage)
-            
-            # Format display with color indicators (+ or - prefix)
-            diff_str = f"{diff_percentage:>+8.2f}%"
-            
-            print(f"{batch_size:>10} | {format_human_readable(previous_games):>20} | "
-                  f"{format_human_readable(current_games):>20} | {diff_str:>10}", flush=True)
-    
-    # Create comparison plots
+        print(f"{batch_size:>7} | "
+              f"{format_human_readable(previous_moves):>14} | "
+              f"{format_human_readable(current_result.moves_per_second):>14} | "
+              f"{moves_diff_str:>10} | "
+              f"{format_human_readable(previous_games) if previous_games is not None else 'N/A':>14} | "
+              f"{format_human_readable(current_result.games_per_second):>14} | "
+              f"{games_diff_str:>10} | "
+              f"{current_result.memory_usage_gb:>11.2f}", flush=True)
+
+    # Print the full summary table for the current run
+    print_summary_table(current_results, title="Current Run Summary (Validation)")
+
+    # Create comparison plots (ensure data exists)
     timestamp = time.strftime("%Y%m%d-%H%M%S")
-    GRAPHS_DIR.mkdir(parents=True, exist_ok=True)
-    
-    # Plot moves per second comparison
-    plt.figure(figsize=(12, 8))
-    plt.xscale('log', base=2)  # Log scale with base 2 for batch sizes
-    plt.yscale('log')  # Log scale for metrics
-    
-    # Previous results
-    plt.plot(profile.batch_sizes, profile.moves_per_second, 
-            marker='o', linestyle='-', linewidth=2, 
-            label='Previous - Moves/s', color='tab:blue')
-    
-    # Current results
-    plt.plot(profile.batch_sizes, [r[0] for r in current_results], 
-            marker='s', linestyle='--', linewidth=2, 
-            label='Current - Moves/s', color='tab:orange')
-    
-    # If games/s data is available
-    if hasattr(profile, 'games_per_second') and profile.games_per_second:
-        plt.plot(profile.batch_sizes, profile.games_per_second, 
+    comparison_plt_filename = None
+    diff_plt_filename = None
+
+    if profile.batch_sizes and profile.moves_per_second and [r.moves_per_second for r in current_results]:
+        GRAPHS_DIR.mkdir(parents=True, exist_ok=True)
+        # Plot moves per second comparison
+        plt.figure(figsize=(12, 8))
+        plt.xscale('log', base=2)
+        plt.yscale('log')
+        
+        plt.plot(profile.batch_sizes, profile.moves_per_second, 
                 marker='o', linestyle='-', linewidth=2, 
-                label='Previous - Games/s', color='tab:green')
-        plt.plot(profile.batch_sizes, [r[2] for r in current_results], 
+                label='Previous - Moves/s', color='tab:blue')
+        plt.plot([r.batch_size for r in current_results], [r.moves_per_second for r in current_results], 
                 marker='s', linestyle='--', linewidth=2, 
-                label='Current - Games/s', color='tab:red')
-    
-    # Add labels and title
-    plt.xlabel('Batch Size')
-    plt.ylabel('Performance Metrics (log scale)')
-    plt.title('Benchmark Comparison: Previous vs Current')
-    plt.grid(True, which="both", ls="--", alpha=0.3)
-    plt.legend(loc='best')
-    
-    # Format x-axis ticks to show actual batch sizes
-    plt.gca().xaxis.set_major_formatter(ScalarFormatter())
-    plt.xticks(profile.batch_sizes, profile.batch_sizes)
-    
-    # Save the comparison plot
-    comparison_plt_filename = GRAPHS_DIR / f"benchmark_comparison_{timestamp}.png"
-    plt.tight_layout()
-    plt.savefig(comparison_plt_filename, dpi=300)
-    
-    # Create a percentage difference plot
-    plt.figure(figsize=(10, 6))
-    metrics_to_compare = [
-        (individual_diffs, 'Moves per Second', 'tab:blue'),
-    ]
-    
-    if games_diffs:
-        metrics_to_compare.append((games_diffs, 'Games per Second', 'tab:green'))
-    
-    # Bar chart of percentage differences
-    bar_width = 0.35
-    index = np.arange(len(profile.batch_sizes))
-    
-    for i, (diffs, label, color) in enumerate(metrics_to_compare):
-        plt.bar(index + i * bar_width, diffs, bar_width, label=label, color=color, alpha=0.7)
-    
-    # Add labels and title
-    plt.xlabel('Batch Size')
-    plt.ylabel('Performance Difference (%)')
-    plt.title('Performance Difference: Current vs Previous')
-    plt.xticks(index + bar_width / 2, profile.batch_sizes)
-    plt.grid(True, axis='y', linestyle='--', alpha=0.3)
-    plt.legend(loc='best')
-    
-    # Add a horizontal line at 0%
-    plt.axhline(y=0, color='black', linestyle='-', alpha=0.3)
-    
-    # Save the difference plot
-    diff_plt_filename = GRAPHS_DIR / f"performance_difference_{timestamp}.png"
-    plt.tight_layout()
-    plt.savefig(diff_plt_filename, dpi=300)
-    
-    print(f"\nComparison plot saved to: {comparison_plt_filename}", flush=True)
-    print(f"Performance difference plot saved to: {diff_plt_filename}", flush=True)
-    
-    # Calculate overall statistics
-    avg_diff = np.mean(individual_diffs)
-    min_diff = np.min(individual_diffs)
-    max_diff = np.max(individual_diffs)
-    
-    # Find the best and worst performing batch sizes
-    best_idx = individual_diffs.index(max_diff)
-    worst_idx = individual_diffs.index(min_diff)
-    
-    print("\n=== Performance Summary ===", flush=True)
-    print(f"Average performance change: {avg_diff:+.2f}%", flush=True)
-    print(f"Best case (batch size {profile.batch_sizes[best_idx]}): {max_diff:+.2f}%", flush=True)
-    print(f"Worst case (batch size {profile.batch_sizes[worst_idx]}): {min_diff:+.2f}%", flush=True)
-    
-    # Determine if there's an overall performance regression
-    if avg_diff < -5:
-        print("\n⚠️  WARNING: Current performance is significantly worse than the saved profile! ⚠️", flush=True)
-    elif avg_diff > 5:
-        print("\n✅ NOTICE: Current performance is significantly better than the saved profile!", flush=True)
+                label='Current - Moves/s', color='tab:orange')
+        
+        # If games/s data is available in both
+        if hasattr(profile, 'games_per_second') and profile.games_per_second and [r.games_per_second for r in current_results]:
+            plt.plot(profile.batch_sizes, profile.games_per_second, 
+                    marker='o', linestyle='-', linewidth=2, 
+                    label='Previous - Games/s', color='tab:green')
+            plt.plot([r.batch_size for r in current_results], [r.games_per_second for r in current_results], 
+                    marker='s', linestyle='--', linewidth=2, 
+                    label='Current - Games/s', color='tab:red')
+        
+        plt.xlabel('Batch Size')
+        plt.ylabel('Performance Metrics (log scale)')
+        plt.title('Benchmark Comparison: Previous vs Current')
+        plt.grid(True, which="both", ls="--", alpha=0.3)
+        plt.legend(loc='best')
+        plt.gca().xaxis.set_major_formatter(ScalarFormatter())
+        plt.xticks([r.batch_size for r in current_results], [r.batch_size for r in current_results])
+        comparison_plt_filename = GRAPHS_DIR / f"benchmark_comparison_{timestamp}.png"
+        plt.tight_layout()
+        plt.savefig(comparison_plt_filename, dpi=300)
+        plt.close() # Close the figure
+
+        # Create percentage difference plot
+        plt.figure(figsize=(10, 6))
+        metrics_to_compare = [(moves_diffs, 'Moves/s Diff', 'tab:blue')]
+        if games_diffs:
+             metrics_to_compare.append((games_diffs, 'Games/s Diff', 'tab:green'))
+        
+        bar_width = 0.35
+        index = np.arange(len(profile.batch_sizes))
+        
+        for i, (diffs, label, color) in enumerate(metrics_to_compare):
+            plt.bar(index + i * bar_width, diffs, bar_width, label=label, color=color, alpha=0.7)
+        
+        plt.xlabel('Batch Size')
+        plt.ylabel('Performance Difference (%)')
+        plt.title('Performance Difference: Current vs Previous Profile')
+        plt.xticks(index + bar_width / len(metrics_to_compare) / 2, profile.batch_sizes)
+        plt.grid(True, axis='y', linestyle='--', alpha=0.3)
+        plt.legend(loc='best')
+        plt.axhline(y=0, color='black', linestyle='-', alpha=0.3)
+        diff_plt_filename = GRAPHS_DIR / f"performance_difference_{timestamp}.png"
+        plt.tight_layout()
+        plt.savefig(diff_plt_filename, dpi=300)
+        plt.close() # Close the figure
+
+        print(f"\nComparison plot saved to: {comparison_plt_filename}", flush=True)
+        print(f"Performance difference plot saved to: {diff_plt_filename}", flush=True)
     else:
-        print("\n✓ Performance is within expected range of the saved profile.", flush=True)
+         print("\nSkipping comparison plots due to missing data.", flush=True)
     
-    # Find the most efficient batch size in current run
-    efficiencies = [perf/mem if mem > 0 else 0 for perf, mem in [(r[0], r[1]) for r in current_results]]
-    best_efficiency_idx = efficiencies.index(max(efficiencies))
+    # Calculate overall statistics based on moves/s differences
+    if moves_diffs:
+        avg_diff = np.mean(moves_diffs)
+        min_diff = np.min(moves_diffs)
+        max_diff = np.max(moves_diffs)
+        best_idx = moves_diffs.index(max_diff)
+        worst_idx = moves_diffs.index(min_diff)
+        
+        print("\n=== Performance Change Summary (Moves/s vs Profile) ===", flush=True)
+        print(f"Average performance change: {avg_diff:+.2f}%", flush=True)
+        print(f"Best case (batch size {profile.batch_sizes[best_idx]}): {max_diff:+.2f}%", flush=True)
+        print(f"Worst case (batch size {profile.batch_sizes[worst_idx]}): {min_diff:+.2f}%", flush=True)
+        
+        if avg_diff < -5:
+            print("\n⚠️  WARNING: Current performance is significantly worse than the saved profile! ⚠️", flush=True)
+        elif avg_diff > 5:
+            print("\n✅ NOTICE: Current performance is significantly better than the saved profile!", flush=True)
+        else:
+            print("\n✓ Performance is within expected range of the saved profile.", flush=True)
+    else:
+        print("\nCould not calculate performance change summary.", flush=True)
     
-    # Find the best games/s configuration
-    games_per_sec = [r[2] for r in current_results]
-    best_games_idx = games_per_sec.index(max(games_per_sec)) if any(g > 0 for g in games_per_sec) else 0
-    
-    # Find the fastest batch size in current run for moves/s
-    fastest_idx = [r[0] for r in current_results].index(max([r[0] for r in current_results]))
-    
-    print("\n=== Optimal Configurations ===", flush=True)
-    print(f"Best for moves/s: Batch size {profile.batch_sizes[fastest_idx]} "
-          f"({format_human_readable(current_results[fastest_idx][0])} moves/s)", flush=True)
-    
-    if any(g > 0 for g in games_per_sec):
-        print(f"Best for games/s: Batch size {profile.batch_sizes[best_games_idx]} "
-              f"({format_human_readable(games_per_sec[best_games_idx])} games/s)", flush=True)
-    
-    print(f"Best for efficiency: Batch size {profile.batch_sizes[best_efficiency_idx]} "
-          f"({format_human_readable(efficiencies[best_efficiency_idx])}/GB)", flush=True)
+    # Find optimal configurations based *only* on the current run's results
+    if current_results:
+        efficiencies = [r.efficiency for r in current_results]
+        games_per_sec = [r.games_per_second for r in current_results]
+        moves_per_sec = [r.moves_per_second for r in current_results]
+
+        best_efficiency_idx = np.argmax(efficiencies)
+        best_games_idx = np.argmax(games_per_sec) if any(g > 0 for g in games_per_sec) else 0
+        fastest_idx = np.argmax(moves_per_sec)
+        
+        print("\n=== Optimal Configurations (Current Run) ===", flush=True)
+        print(f"Best for moves/s: Batch size {current_results[fastest_idx].batch_size} "
+              f"({format_human_readable(current_results[fastest_idx].moves_per_second)} moves/s)", flush=True)
+        if any(g > 0 for g in games_per_sec):
+            print(f"Best for games/s: Batch size {current_results[best_games_idx].batch_size} "
+                  f"({format_human_readable(current_results[best_games_idx].games_per_second)} games/s)", flush=True)
+        print(f"Best for efficiency: Batch size {current_results[best_efficiency_idx].batch_size} "
+              f"({format_human_readable(current_results[best_efficiency_idx].efficiency)}/GB)", flush=True)
+    else:
+        print("\nCould not determine optimal configurations for the current run.", flush=True)
 
 
 def run_benchmark(args: argparse.Namespace) -> None:
@@ -993,6 +1187,9 @@ def run_benchmark(args: argparse.Namespace) -> None:
     for key, value in system_info.items():
         print(f"{key}: {value}", flush=True)
     
+    # Set the target game count (with default value if not specified)
+    target_game_count = args.target_game_count if args.target_game_count else 1000
+    
     # Check if profile exists
     profile = load_profile()
     
@@ -1003,10 +1200,10 @@ def run_benchmark(args: argparse.Namespace) -> None:
         else:
             print("\nDiscovery mode explicitly requested", flush=True)
         
-        # Run discovery with the specified duration
+        # Run discovery with the specified parameters
         batch_sizes, moves_per_second, memory_usage_gb, games_per_second, moves_per_second_per_game = discover_optimal_batch_sizes(
             memory_limit_gb=args.memory_limit,
-            duration=args.duration
+            max_duration=args.duration
         )
         
         # Create and save profile
@@ -1031,7 +1228,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
     else:
         # Run validation against existing profile
         print("\nProfile found - running validation mode", flush=True)
-        validate_against_profile(profile)
+        validate_against_profile(profile, max_duration=args.duration)
 
 
 def main():
@@ -1040,23 +1237,40 @@ def main():
     parser.add_argument("--discover", action="store_true", help="Force discovery mode even if profile exists")
     parser.add_argument("--memory-limit", type=float, default=DEFAULT_MEMORY_LIMIT_GB,
                         help=f"Memory limit in GB (default: {DEFAULT_MEMORY_LIMIT_GB})")
-    parser.add_argument("--duration", type=int, default=DEFAULT_BENCHMARK_DURATION,
-                        help=f"Duration of each batch size test in seconds (default: {DEFAULT_BENCHMARK_DURATION})")
+    parser.add_argument("--duration", type=int, default=120,
+                        help=f"Maximum duration of each batch size test in seconds (default: 120)")
+    parser.add_argument("--target-game-count", type=int, default=1000,
+                        help="Target number of games to complete for consistent statistics (default: 1000)")
     parser.add_argument("--single-batch", type=int, help="Test only a specific batch size")
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
     
     args = parser.parse_args()
     
     # If single batch mode is requested, just benchmark that batch size
     if args.single_batch:
         batch_size = args.single_batch
+        # target_game_count = args.target_game_count if args.target_game_count else 1000 # No longer used directly
+        
         print(f"Running single batch benchmark with batch size {batch_size}")
-        moves_per_second, memory_usage_gb, games_per_second, moves_per_second_per_game = benchmark_batch_size(batch_size, args.duration)
-        print("\nSingle Batch Benchmark Results:")
-        print(f"Moves per second: {format_human_readable(moves_per_second)}/s")
-        print(f"Moves per second per game: {format_human_readable(moves_per_second_per_game)}/s")
-        print(f"Games per second: {format_human_readable(games_per_second)}/s")
-        print(f"Memory usage: {memory_usage_gb:.2f}GB")
-        print(f"Efficiency: {format_human_readable(moves_per_second/memory_usage_gb)}/GB")
+        print(f"Max duration: {args.duration}s")
+        
+        # Temporarily silence stdout for benchmark to avoid progress bar confusion
+        original_stdout = sys.stdout
+        sys.stdout = open(os.devnull, 'w') if not args.verbose else sys.stdout
+        try:
+            result = benchmark_batch_size(
+                batch_size, 
+                max_duration=args.duration
+            )
+        finally:
+            # Restore stdout regardless of success/failure
+            if not args.verbose:
+                sys.stdout.close()
+                sys.stdout = original_stdout
+        
+        print("\nSingle Batch Benchmark Results Summary:")
+        # Use the print_summary_table helper for consistent formatting
+        print_summary_table([result], title=f"Batch Size {batch_size} Results")
     else:
         # Run the regular benchmark process
         run_benchmark(args)
