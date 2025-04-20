@@ -5,14 +5,14 @@ alwaysApply: true
 ---
 # Your rule content
 
-- Files only modify test_backgammon_training.py & stochastic_mcts.py,
-- Do Not modify any other file, if changes are needed output the changes and ask the user to make them
+
+
 - This is a large project codebase, so we need to make concise updates and edit as few lines as possible. Only modify code that directly affects functionality or correctness.
 - Preserve existing code, comments, formatting, and white space unless a change is strictly necessary.
 - Do not move code blocks or change white space in ways that generate unnecessary diffs.
 - Keep related changes together in one area whenever possible.
 - For new functions, add them at the end of files while ensuring proper dependency ordering.
-- Unless specifically asked to refactor for performance, our preference is to add new code without altering existing logic.
+- Unless specifically asked to refactor for performance, our preference is to add new code without altering existing logic, however be aware if it's in a jax jit decorator.
 - Use performant JAX style coding:
   - Avoid using standard Python if-then-else constructs within JAX compiled functions; instead, use `jax.lax.cond`, `jax.lax.switch`, or vectorized operations.
   - When using loops, consider using `jax.lax.fori_loop`.
@@ -26,6 +26,7 @@ alwaysApply: true
 - step is overloaded to handled both actions and stochastic actions
 - The stochastic action probabilities are provided in `env.stochastic_action_probs` (ensure these probabilities are valid and sum to 1, or handle errors appropriately).
 - This project uses poetry for package management
+- do not run pip commands, do not think about pip for management.
 
 # Project Goal
 

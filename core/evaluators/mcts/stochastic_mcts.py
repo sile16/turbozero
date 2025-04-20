@@ -1,4 +1,4 @@
-from typing import Optional, Tuple
+from typing import Tuple
 import jax
 import jax.numpy as jnp
 import chex
@@ -6,7 +6,6 @@ from core.evaluators.mcts.action_selection import MCTSActionSelector
 from core.evaluators.mcts.state import BackpropState, MCTSNode, MCTSTree, TraversalState, MCTSOutput
 from core.evaluators.mcts.mcts import MCTS
 from core.types import EnvStepFn, EvalFn, StepMetadata
-from core.trees.tree import init_tree
 
 
 class StochasticMCTS(MCTS):
@@ -399,33 +398,6 @@ class StochasticMCTS(MCTS):
         )
         return state.tree
 
-    @staticmethod
-    def stochastic_new_q_value(node: MCTSNode, value: float) -> float:
-        """Calculate the new Q value for a node.
-        
-        Args:
-        - `node`: MCTSNode to calculate the new Q value for
-        - `value`: value estimate of the leaf node
-        """
-        # do a normalized weighted sum of the q values of the children
-        # get the q values of the children
-        q_values = node.q
-        # get the visit counts of the children
-        visit_counts = node.n
-        # normalize the visit counts
-        visit_counts = visit_counts / jnp.sum(visit_counts)
-        # do a weighted sum of the q values
-        return jnp.sum(q_values * visit_counts)
-
-    @staticmethod
-    def deterministic_new_q_value(node: MCTSNode, value: float) -> float:
-        """Calculate the new Q value for a node.
-
-        Args:
-        - `node`: MCTSNode to calculate the new Q value for
-        - `value`: value estimate of the leaf node
-        """
-        return((node.q * node.n) + value) / (node.n + 1)
 
     @staticmethod
     def is_node_stochastic(node: MCTSNode) -> jnp.bool_:
@@ -446,47 +418,3 @@ class StochasticMCTS(MCTS):
         # Access the is_stochastic flag directly from the embedded state
         # Don't convert to Python bool as that would break JAX tracing
         return tree.data_at(node_idx).embedding.is_stochastic
-
-    @staticmethod
-    def visit_node(
-        node: MCTSNode,
-        value: float,
-        p: Optional[chex.Array] = None,
-        terminated: Optional[bool] = None,
-        embedding: Optional[chex.ArrayTree] = None
-    ) -> MCTSNode:
-        """ Update the visit counts and value estimate of a node.
-
-        Args:
-        - `node`: MCTSNode to update
-        - `value`: value estimate to update the node with
-
-        ( we could optionally overwrite the following: )
-        - `p`: policy weights to update the node with
-        - `terminated`: whether the node is terminal
-        - `embedding`: embedding to update the node with
-
-        Returns:
-        - (MCTSNode): updated MCTSNode
-        """
-        # update running value estimate
-        q_value = jax.lax.cond(
-            StochasticMCTS.is_node_stochastic(node), 
-            StochasticMCTS.stochastic_new_q_value, 
-            StochasticMCTS.deterministic_new_q_value, 
-            node, value
-        )
-        # update other node attributes
-        if p is None:
-            p = node.p
-        if terminated is None:
-            terminated = node.terminated
-        if embedding is None:
-            embedding = node.embedding
-        return node.replace(
-            n=node.n + 1, # increment visit count
-            q=q_value,
-            p=p,
-            terminated=terminated,
-            embedding=embedding
-        )
