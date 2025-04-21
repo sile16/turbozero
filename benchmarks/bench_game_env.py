@@ -310,6 +310,11 @@ def benchmark_batch_size(batch_size: int, max_duration: int = 120) -> BatchBench
     """
     Benchmark the backgammon environment with a specific batch size for a fixed duration.
     
+    This implementation uses a "Complete All Games" batching strategy:
+    - For batch sizes > 1, we run all games in a batch until ALL games are terminated
+    - Only then do we reset the entire batch and start fresh games
+    - This avoids expensive selective state resets and is more GPU-friendly
+    
     Args:
         batch_size: Batch size to test
         max_duration: Duration in seconds to run the benchmark (default: 120s = 2 minutes)
@@ -471,13 +476,13 @@ def benchmark_batch_size(batch_size: int, max_duration: int = 120) -> BatchBench
                          current_game_moves[0] += 1
                          max_game_length_per_instance[0] = max(max_game_length_per_instance[0], current_game_moves[0])
                 else:
-                    # Only count moves for non-terminated states
+                    # Only count moves for non-terminated states (active games)
                     terminated_states = state.terminated
                     terminated_np = np.array(terminated_states)
                     valid_moves_count = batch_size - np.sum(terminated_np)
                     total_moves += valid_moves_count
 
-                    # Update moves per game counters for non-terminated states
+                    # Update moves per game counters ONLY for active (non-terminated) states
                     for i in range(batch_size):
                         if not terminated_np[i]:
                             current_game_moves[i] += 1
@@ -511,7 +516,6 @@ def benchmark_batch_size(batch_size: int, max_duration: int = 120) -> BatchBench
                 else:
                     # Process terminations for multiple games in parallel
                     terminated_states = state.terminated
-                    terminated_mask = state.terminated # Keep as JAX array for jnp.where
                     terminated_np = np.array(terminated_states) # Numpy for iteration
                     
                     # Check if any games have terminated
@@ -538,43 +542,31 @@ def benchmark_batch_size(batch_size: int, max_duration: int = 120) -> BatchBench
                                     if game_length == 1:
                                         single_move_games += 1
                                 
-                                # Reset counter for this game instance
+                                # Reset counter for this game instance but don't reset the state yet
                                 current_game_moves[i] = 0
                                 # Reset the max game length tracker for this game
                                 max_game_length_per_instance[i] = 0
                         
-                        # Selectively reset only the terminated states using jnp.where
-                        # Generate keys for re-initializing states
-                        key, init_key = jax.random.split(key)
-                        # Generate keys for all slots, will be used by vmap
-                        init_keys = jax.random.split(init_key, batch_size) 
-
-                        # Log less frequently - only log resets occasionally or for large batches
-                        num_terminated = int(np.sum(terminated_np))
-                        if num_terminated > batch_size / 2 or iteration_count % 100 == 0:
-                            print(f"Resetting {num_terminated} terminated games out of {batch_size}", flush=True)
-
-                        # Initialize new states - use regular list-based initialization which is safer
-                        new_states = []
-                        for i in range(batch_size):
-                            new_states.append(env.init(init_keys[i]))
-                        
-                        # Convert to JAX arrays using tree_map - avoid excessive logging
-                        new_initial_states_batch = jax.tree_util.tree_map(
-                            lambda *xs: jnp.stack(xs),  # Don't name parameter to avoid errors
-                            *new_states
-                        )
-
-                        # Use jax.tree_map to selectively update the state pytree
-                        state = jax.tree_map(
-                            lambda current_leaf, new_leaf: jnp.where(
-                                jnp.reshape(terminated_mask, (-1,) + (1,) * (current_leaf.ndim - 1)),
-                                new_leaf,
-                                current_leaf
-                            ),
-                            state, # The current state pytree
-                            new_initial_states_batch # The pytree of new initial states
-                        )
+                        # Check if ALL games in this batch have terminated
+                        if np.all(terminated_np):
+                            # Only reset the entire batch when all games have finished
+                            print(f"All {batch_size} games terminated, resetting entire batch", flush=True)
+                            
+                            # Generate keys for the new batch
+                            key, init_key = jax.random.split(key)
+                            init_keys = jax.random.split(init_key, batch_size)
+                            
+                            # Initialize a fresh batch of states
+                            new_states = []
+                            for i in range(batch_size):
+                                new_states.append(env.init(init_keys[i]))
+                            
+                            # Convert to JAX arrays - single tree_map operation is more efficient
+                            state = jax.tree_util.tree_map(
+                                lambda *xs: jnp.stack(xs),
+                                *new_states
+                            )
+                            print("Full batch reset complete", flush=True)
                 
                 # Update progress bar and metrics (less frequently to reduce overhead)
                 current_time = time.time()
