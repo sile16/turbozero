@@ -734,3 +734,41 @@ def test_step_deterministic(stochastic_mcts, backgammon_env, key, mock_params):
         pass
     
     print("test_step_deterministic PASSED")
+
+
+
+def test_vmap_step_fn():
+    def act_randomly(rng_key, obs, mask):
+        """Ignore observation and choose randomly from legal actions"""
+        del obs
+        probs = mask / mask.sum()
+        logits = jnp.maximum(jnp.log(probs), jnp.finfo(probs.dtype).min)
+        return jax.random.categorical(rng_key, logits=logits, axis=-1)
+
+
+    # Load the environment
+    env = bg.Backgammon()
+    init_fn = jax.jit(jax.vmap(env.init))
+    step_fn = jax.jit(jax.vmap(env.step))
+
+    # Initialize the states
+    key, subkey = jax.random.split(key)
+    keys = jax.random.split(subkey, batch_size)
+    state = init_fn(keys)
+
+    # Run random simulation
+    while not (state.terminated | state.truncated).all():
+        # Get one key for action selection, one base key for step keys
+        key, action_key, step_key_base = jax.random.split(key, 3)
+
+        # Calculate actions for the batch (using one key)
+        action = act_randomly(action_key, state.observation, state.legal_action_mask)
+
+        # --- Generate a BATCH of keys for the step function ---
+        step_keys = jax.random.split(step_key_base, batch_size) # Shape: (batch_size, 2)
+
+        # Call step_fn with batched state, batched action, and BATCHED keys
+        state = step_fn(state, action, step_keys)
+
+        # Optional: print something to see progress or state info
+        # print(f"Step done. Terminated: {state.terminated.sum()}")
