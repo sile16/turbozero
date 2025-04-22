@@ -319,14 +319,18 @@ def create_results_dir(name: str = "graphs") -> Path:
 def generate_benchmark_plots(
     batch_sizes: List[int], 
     metrics_data: List[BatchBenchResult], 
-    timestamp: Optional[str] = None
+    timestamp: Optional[str] = None,
+    include_efficiency: bool = True,
+    include_cpu_usage: bool = False
 ) -> Tuple[str, str]:
     """Generate and save plots of benchmark results.
     
     Args:
         batch_sizes: List of batch sizes that were benchmarked
         metrics_data: List of benchmark results
-        timestamp: Optional timestamp string to include in filenames
+        timestamp: Optional string to include in filenames (e.g., test name and simulation count)
+        include_efficiency: Whether to include efficiency metrics in the plots
+        include_cpu_usage: Whether to include CPU usage in the memory plot
     
     Returns:
         Tuple of (performance_plot_path, memory_plot_path)
@@ -366,7 +370,7 @@ def generate_benchmark_plots(
     lines2, labels2 = ax1_right.get_legend_handles_labels()
     ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
     
-    # Second plot for memory efficiency
+    # Second plot for memory usage
     ax2.plot(batch_sizes, memory_usage, 'g-o', label='Memory (GB)')
     ax2.set_xscale('log', base=2)
     ax2.set_ylabel('Memory Usage (GB)', color='g')
@@ -375,16 +379,19 @@ def generate_benchmark_plots(
     ax2.set_title('Memory Usage vs Batch Size')
     ax2.grid(True, alpha=0.3)
     
-    # Add efficiency as a secondary y-axis
-    ax2_right = ax2.twinx()
-    ax2_right.plot(batch_sizes, efficiency, 'm-^', label='Efficiency')
-    ax2_right.set_ylabel('Efficiency (Moves/s/GB)', color='m')
-    ax2_right.tick_params(axis='y', labelcolor='m')
-    
-    # Create legend for both lines
-    lines1, labels1 = ax2.get_legend_handles_labels()
-    lines2, labels2 = ax2_right.get_legend_handles_labels()
-    ax2.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
+    # Add efficiency as a secondary y-axis if requested
+    if include_efficiency:
+        ax2_right = ax2.twinx()
+        ax2_right.plot(batch_sizes, efficiency, 'm-^', label='Efficiency')
+        ax2_right.set_ylabel('Efficiency (Moves/s/GB)', color='m')
+        ax2_right.tick_params(axis='y', labelcolor='m')
+        
+        # Create legend for both lines
+        lines1, labels1 = ax2.get_legend_handles_labels()
+        lines2, labels2 = ax2_right.get_legend_handles_labels()
+        ax2.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
+    else:
+        ax2.legend(loc='upper left')
     
     plt.tight_layout()
     
@@ -395,16 +402,34 @@ def generate_benchmark_plots(
     plt.savefig(performance_plot_path, dpi=120)
     plt.close()
     
-    # Create separate memory plot
+    # Create separate memory plot with memory as percentage and CPU usage if requested
     plt.figure(figsize=(10, 6))
-    plt.plot(batch_sizes, memory_usage, 'g-o', label='Memory Usage (GB)')
-    plt.plot(batch_sizes, [m/1000 for m in moves_per_second], 'b-^', label='Moves/s (thousands)')
-    plt.plot(batch_sizes, efficiency, 'm-s', label='Efficiency (k-Moves/s/GB)')
+    
+    # Estimate system RAM and convert memory to percentage
+    try:
+        import psutil
+        total_memory_gb = psutil.virtual_memory().total / (1024 * 1024 * 1024)
+        memory_percent = [mem / total_memory_gb * 100 for mem in memory_usage]
+        plt.plot(batch_sizes, memory_percent, 'g-o', label='Memory Usage (%)')
+    except ImportError:
+        # Fall back to absolute values if psutil not available
+        memory_percent = memory_usage
+        plt.plot(batch_sizes, memory_usage, 'g-o', label='Memory Usage (GB)')
+    
+    # Add CPU usage if requested
+    if include_cpu_usage:
+        # We don't have historical CPU usage per batch size, so we'll run a sample now
+        current_cpu_usage, _ = get_cpu_gpu_usage()
+        # Just use the current CPU usage as a horizontal line for reference
+        plt.axhline(y=current_cpu_usage, color='orange', linestyle='-', label=f'Current CPU Usage ({current_cpu_usage:.1f}%)')
+    
+    # Add moves per second (scaled down) for reference
+    plt.plot(batch_sizes, [m/max(moves_per_second)*50 for m in moves_per_second], 'b-^', label='Moves/s (scaled)')
     
     plt.xscale('log', base=2)
     plt.xlabel('Batch Size')
     plt.ylabel('Value')
-    plt.title('Memory Usage and Efficiency')
+    plt.title('Memory Usage and CPU Utilization')
     plt.grid(True, alpha=0.3)
     plt.legend()
     
