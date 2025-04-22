@@ -743,6 +743,18 @@ def run_stochastic_mcts_benchmark(args: argparse.Namespace) -> None:
     # Register signal handler
     signal.signal(signal.SIGINT, signal_handler)
     
+    # Parse custom batch sizes if provided
+    custom_batch_sizes = None
+    if args.batch_sizes:
+        try:
+            # Split by comma, strip whitespace, and convert to integers
+            custom_batch_sizes = [int(b.strip()) for b in args.batch_sizes.split(',')]
+            print(f"Using custom batch sizes: {custom_batch_sizes}", flush=True)
+        except ValueError as e:
+            print(f"Error parsing batch sizes: {e}. Format should be comma-separated integers.", flush=True)
+            print("Example: --batch-sizes 1,2,4,8,16", flush=True)
+            sys.exit(1)
+    
     # Check if profile exists
     profile = load_stochastic_mcts_profile(args.num_simulations)
     
@@ -765,7 +777,7 @@ def run_stochastic_mcts_benchmark(args: argparse.Namespace) -> None:
             args.num_simulations,
             args.memory_limit,
             args.max_duration,
-            args.batch_sizes
+            custom_batch_sizes
         )
         
         # Save profile if benchmarks succeeded
@@ -788,8 +800,8 @@ def main():
                         help=f"Maximum duration in seconds for each batch size (default: {DEFAULT_BENCHMARK_DURATION})")
     parser.add_argument("--memory-limit", type=float, default=DEFAULT_MEMORY_LIMIT_GB,
                         help=f"Memory limit in GB (default: {DEFAULT_MEMORY_LIMIT_GB})")
-    parser.add_argument("--batch-sizes", type=int, nargs="*",
-                        help="Custom batch sizes to benchmark (default: auto-selected)")
+    parser.add_argument("--batch-sizes", type=str,
+                        help="Comma-separated list of batch sizes to test (e.g., '1,2,4,8,16')")
     parser.add_argument("--validate", action="store_true",
                         help="Validate against existing benchmark profile")
     parser.add_argument("--force", action="store_true",

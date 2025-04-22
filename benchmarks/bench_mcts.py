@@ -828,7 +828,8 @@ def main():
                         help=f"Maximum duration of each batch size test in seconds (default: {DEFAULT_BENCHMARK_DURATION})")
     parser.add_argument("--single-batch", type=int, help="Test only a specific batch size instead of discovery")
     parser.add_argument("--validate", action="store_true", help="Validate against existing profiles")
-    parser.add_argument("--batch-sizes", type=str, help="Comma-separated list of batch sizes to test (e.g., '1,2,4,8,16')")
+    parser.add_argument("--batch-sizes", type=str,
+                       help="Comma-separated list of batch sizes to test (e.g., '1,2,4,8,16')")
 
     args = parser.parse_args()
     run_mcts_benchmark(args)
