@@ -379,9 +379,15 @@ def benchmark_batch_size_stochastic_mcts(
                 # Count steps
                 num_complete_steps += batch_size
                 
-                # Update progress bar
+                # Update progress bar with current moves/s rate
                 current_time = time.time()
                 elapsed = current_time - start_time
+                if step_times:
+                    current_mean_time = np.mean(step_times[-min(10, len(step_times)):])  # Average of last 10 steps
+                    current_moves_per_sec = batch_size / current_mean_time
+                    current_games_per_sec = num_complete_games / elapsed if elapsed > 0 and num_complete_games > 0 else 0
+                    pbar.set_postfix({"moves/s": f"{current_moves_per_sec:.2f}", "games/s": f"{current_games_per_sec:.2f}"})
+                
                 pbar.update(min(elapsed, max_duration) - pbar.n)
                 
                 # Record highest observed node count in the tree
