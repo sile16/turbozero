@@ -11,7 +11,7 @@ import platform
 import subprocess
 from pathlib import Path
 from dataclasses import dataclass, asdict, field
-from typing import List, Dict, Optional, Any, Tuple
+from typing import List, Dict, Optional, Any, Tuple, NamedTuple
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -19,13 +19,30 @@ import chex
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from matplotlib.ticker import ScalarFormatter
+from datetime import datetime
 
 # Constants
 DEFAULT_MEMORY_LIMIT_GB = 16  # Maximum memory to use (in GB)
 DEFAULT_BENCHMARK_DURATION = 30  # Duration of each batch size test in seconds
-PROFILE_DIR = Path("benchmarks/profiles")
-GRAPHS_DIR = Path("benchmarks/graphs")
+
+# Get the directory where the benchmark script is located
+BENCHMARK_DIR = Path(__file__).parent.absolute()
+PROFILE_DIR = BENCHMARK_DIR / "profiles"
+GRAPHS_DIR = BENCHMARK_DIR / "graphs"
 HUMAN_READABLE_UNITS = ["", "K", "M", "B", "T"]
+
+# Define common data structures
+class BatchBenchResult(NamedTuple):
+    batch_size: int
+    moves_per_second: float
+    games_per_second: float
+    avg_game_length: float
+    median_game_length: float
+    min_game_length: float
+    max_game_length: float
+    memory_gb: float
+    efficiency: float
+    valid: bool = True
 
 
 @dataclass
@@ -66,30 +83,22 @@ def format_human_readable(num: float) -> str:
 
 
 def get_system_info() -> Dict[str, str]:
-    """Get system information for the profile."""
-    system_info = {
+    """Get system information for benchmarking context."""
+    return {
         "platform": platform.system(),
         "processor": platform.processor(),
         "python_version": platform.python_version(),
-        "jax_version": jax.__version__
+        "jax_version": jax.__version__,
+        "jaxlib_type": "cpu" if jax.devices()[0].platform == "cpu" else "gpu",
+        "device_info": str(jax.devices()[0]),
     }
-    
-    # Determine JAXlib type (CPU, CUDA, Metal)
-    jaxlib_type = "cpu"
-    if jax.default_backend() == "gpu":
-        jaxlib_type = "cuda"
-    elif jax.default_backend() == "metal":
-        jaxlib_type = "metal"
-    system_info["jaxlib_type"] = jaxlib_type
-    
-    # Get detailed device info
-    devices = jax.devices()
-    if devices:
-        system_info["device_info"] = str(devices[0])
-    else:
-        system_info["device_info"] = "No devices found"
-    
-    return system_info
+
+
+def print_system_info(system_info: Dict[str, str]) -> None:
+    """Print system information to the console."""
+    print("\n=== System Information ===")
+    for key, value in system_info.items():
+        print(f"{key}: {value}")
 
 
 def get_memory_usage() -> float:
@@ -262,138 +271,315 @@ def load_profile() -> Optional[BenchmarkProfile]:
         return None
 
 
-def generate_benchmark_plots(batch_sizes, metrics_data, timestamp=None):
-    """
-    Generate and save plots of benchmark results.
+def get_cpu_gpu_usage() -> Tuple[float, float]:
+    """Get CPU and GPU usage percentages."""
+    cpu_usage = 0.0
+    gpu_usage = 0.0
+    
+    # Get CPU usage
+    try:
+        import psutil
+        cpu_usage = psutil.cpu_percent(interval=0.1)  # Sample over 0.1s
+    except ImportError:
+        print("Warning: psutil not installed, cannot measure CPU usage", flush=True)
+    
+    # Get GPU usage if available
+    sys_info = get_system_info()
+    if sys_info["jaxlib_type"] == "cuda":
+        try:
+            device = jax.devices()[0]
+            device_id = device.id
+            cmd = [
+                "nvidia-smi",
+                f"--query-gpu=utilization.gpu",
+                f"--format=csv,noheader,nounits",
+                f"-i", f"{device_id}"
+            ]
+            output = subprocess.check_output(cmd, timeout=2).decode().strip()
+            gpu_usage = float(output)
+        except Exception as e:
+            print(f"Warning: Failed to get GPU usage via nvidia-smi: {e}", flush=True)
+    
+    return cpu_usage, gpu_usage
+
+
+def random_action_from_mask(key, mask):
+    """Sample a random action index based on the legal action mask."""
+    logits = jnp.where(mask, 0.0, -1e9)
+    return jax.random.categorical(key, logits)
+
+
+def create_results_dir(name: str = "graphs") -> Path:
+    """Create a directory for benchmark results if it doesn't exist."""
+    results_dir = Path("benchmarks") / name
+    results_dir.mkdir(exist_ok=True, parents=True)
+    return results_dir
+
+
+def generate_benchmark_plots(
+    batch_sizes: List[int], 
+    metrics_data: List[BatchBenchResult], 
+    timestamp: Optional[str] = None
+) -> Tuple[str, str]:
+    """Generate and save plots of benchmark results.
     
     Args:
-        batch_sizes: List of batch sizes tested
-        metrics_data: Dictionary of metric names to lists of values
-        timestamp: Optional timestamp to include in filenames
+        batch_sizes: List of batch sizes that were benchmarked
+        metrics_data: List of benchmark results
+        timestamp: Optional timestamp string to include in filenames
+    
+    Returns:
+        Tuple of (performance_plot_path, memory_plot_path)
     """
-    # Create graphs directory if it doesn't exist
-    GRAPHS_DIR.mkdir(parents=True, exist_ok=True)
+    results_dir = create_results_dir()
     
-    # Set the timestamp for filenames
-    if timestamp is None:
-        timestamp = time.strftime("%Y%m%d-%H%M%S")
+    system_info = get_system_info()
+    platform_name = system_info["platform"].lower()
+    processor_name = system_info["processor"].lower()
     
-    # Create figure with log-log scale for better visualization
-    plt.figure(figsize=(12, 8))
+    # Extract metrics for plotting
+    moves_per_second = [result.moves_per_second for result in metrics_data]
+    games_per_second = [result.games_per_second for result in metrics_data]
+    memory_usage = [result.memory_gb for result in metrics_data]
+    efficiency = [result.efficiency for result in metrics_data]
     
-    # Plot batch size vs moves per second
-    metrics_to_plot = [
-        ('moves_per_second', 'Moves per Second', 'tab:blue'),
-        ('moves_per_second_per_game', 'Moves per Second per Game', 'tab:green'),
-        ('games_per_second', 'Games per Second', 'tab:red'),
-    ]
+    # Create performance plot
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
     
-    # Use log-log scale for better visualization of wide range of values
-    plt.xscale('log', base=2)  # Log scale with base 2 for batch sizes
-    plt.yscale('log')  # Log scale for metrics
+    # First plot for raw performance
+    ax1.plot(batch_sizes, moves_per_second, 'b-o', label='Moves/s')
+    ax1.set_xscale('log', base=2)
+    ax1.set_ylabel('Moves per Second', color='b')
+    ax1.tick_params(axis='y', labelcolor='b')
+    ax1.set_xlabel('Batch Size')
+    ax1.set_title('Performance Scaling with Batch Size')
+    ax1.grid(True, alpha=0.3)
     
-    # Plot each metric
-    for metric_name, label, color in metrics_to_plot:
-        if metric_name in metrics_data and metrics_data[metric_name]:
-            plt.plot(batch_sizes, metrics_data[metric_name], 
-                    marker='o', linestyle='-', linewidth=2, 
-                    label=label, color=color)
+    # Add games/s as a secondary y-axis
+    ax1_right = ax1.twinx()
+    ax1_right.plot(batch_sizes, games_per_second, 'r-^', label='Games/s')
+    ax1_right.set_ylabel('Games per Second', color='r')
+    ax1_right.tick_params(axis='y', labelcolor='r')
     
-    # Add efficiency as a separate plot with twin axis
-    if 'efficiency' in metrics_data and metrics_data['efficiency']:
-        ax2 = plt.twinx()
-        ax2.set_yscale('log')
-        ax2.plot(batch_sizes, metrics_data['efficiency'], 
-                marker='s', linestyle='--', linewidth=2,
-                label='Efficiency (moves/s/GB)', color='tab:purple')
-        ax2.set_ylabel('Efficiency (moves/s/GB)')
-        ax2.grid(False)  # Disable grid for second axis to avoid clutter
-        
-        # Combine legends
-        lines1, labels1 = plt.gca().get_legend_handles_labels()
-        lines2, labels2 = ax2.get_legend_handles_labels()
-        ax2.legend(lines1 + lines2, labels1 + labels2, loc='best')
-    else:
-        plt.legend(loc='best')
+    # Create legend for both lines
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax1_right.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
     
-    # Add labels and title
-    plt.xlabel('Batch Size')
-    plt.ylabel('Performance Metrics (log scale)')
-    plt.title('Backgammon Environment Performance by Batch Size')
-    plt.grid(True, which="both", ls="--", alpha=0.3)
+    # Second plot for memory efficiency
+    ax2.plot(batch_sizes, memory_usage, 'g-o', label='Memory (GB)')
+    ax2.set_xscale('log', base=2)
+    ax2.set_ylabel('Memory Usage (GB)', color='g')
+    ax2.tick_params(axis='y', labelcolor='g')
+    ax2.set_xlabel('Batch Size')
+    ax2.set_title('Memory Usage vs Batch Size')
+    ax2.grid(True, alpha=0.3)
     
-    # Format x-axis ticks to show actual batch sizes
-    plt.gca().xaxis.set_major_formatter(ScalarFormatter())
-    plt.xticks(batch_sizes, batch_sizes)
+    # Add efficiency as a secondary y-axis
+    ax2_right = ax2.twinx()
+    ax2_right.plot(batch_sizes, efficiency, 'm-^', label='Efficiency')
+    ax2_right.set_ylabel('Efficiency (Moves/s/GB)', color='m')
+    ax2_right.tick_params(axis='y', labelcolor='m')
     
-    # Annotate optimal points
-    if 'moves_per_second' in metrics_data:
-        best_moves_idx = metrics_data['moves_per_second'].index(max(metrics_data['moves_per_second']))
-        plt.annotate(f"Best moves/s: {format_human_readable(metrics_data['moves_per_second'][best_moves_idx])}/s",
-                    xy=(batch_sizes[best_moves_idx], metrics_data['moves_per_second'][best_moves_idx]),
-                    xytext=(0, 30), textcoords='offset points',
-                    arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=.2'))
+    # Create legend for both lines
+    lines1, labels1 = ax2.get_legend_handles_labels()
+    lines2, labels2 = ax2_right.get_legend_handles_labels()
+    ax2.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
     
-    if 'games_per_second' in metrics_data and any(g > 0 for g in metrics_data['games_per_second']):
-        best_games_idx = metrics_data['games_per_second'].index(max(metrics_data['games_per_second']))
-        plt.annotate(f"Best games/s: {format_human_readable(metrics_data['games_per_second'][best_games_idx])}/s",
-                    xy=(batch_sizes[best_games_idx], metrics_data['games_per_second'][best_games_idx]),
-                    xytext=(0, -30), textcoords='offset points',
-                    arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=.2'))
-    
-    # Save the plot
-    plt_filename = GRAPHS_DIR / f"benchmark_results_{timestamp}.png"
     plt.tight_layout()
-    plt.savefig(plt_filename, dpi=300)
-    print(f"\nBenchmark plot saved to: {plt_filename}", flush=True)
     
-    # Generate additional plots for specific metrics
+    # Define filenames
+    timestamp_str = f"_{timestamp}" if timestamp else ""
+    performance_plot_path = results_dir / f"{platform_name}_{processor_name}{timestamp_str}.png"
     
-    # Memory usage plot
-    if 'memory_usage_gb' in metrics_data:
-        plt.figure(figsize=(10, 6))
-        plt.plot(batch_sizes, metrics_data['memory_usage_gb'], 
-                marker='o', linestyle='-', linewidth=2, color='tab:orange')
-        plt.xscale('log', base=2)
-        plt.xlabel('Batch Size')
-        plt.ylabel('Memory Usage (GB)')
-        plt.title('Memory Usage by Batch Size')
-        plt.grid(True, which="both", ls="--", alpha=0.3)
-        plt.gca().xaxis.set_major_formatter(ScalarFormatter())
-        plt.xticks(batch_sizes, batch_sizes)
-        plt_filename = GRAPHS_DIR / f"memory_usage_{timestamp}.png"
-        plt.tight_layout()
-        plt.savefig(plt_filename, dpi=300)
-        print(f"Memory usage plot saved to: {plt_filename}", flush=True)
+    plt.savefig(performance_plot_path, dpi=120)
+    plt.close()
     
-    return plt_filename  # Return the main plot filename
+    # Create separate memory plot
+    plt.figure(figsize=(10, 6))
+    plt.plot(batch_sizes, memory_usage, 'g-o', label='Memory Usage (GB)')
+    plt.plot(batch_sizes, [m/1000 for m in moves_per_second], 'b-^', label='Moves/s (thousands)')
+    plt.plot(batch_sizes, efficiency, 'm-s', label='Efficiency (k-Moves/s/GB)')
+    
+    plt.xscale('log', base=2)
+    plt.xlabel('Batch Size')
+    plt.ylabel('Value')
+    plt.title('Memory Usage and Efficiency')
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    
+    memory_plot_path = results_dir / f"{platform_name}_{processor_name}_memory{timestamp_str}.png"
+    plt.savefig(memory_plot_path, dpi=120)
+    plt.close()
+    
+    print(f"Benchmark plot saved to: {performance_plot_path}")
+    print(f"Memory usage plot saved to: {memory_plot_path}")
+    
+    return str(performance_plot_path), str(memory_plot_path)
 
 
-def print_summary_table(results: List[Any], title: str = "Benchmark Summary"):
-    """Prints a formatted table summarizing benchmark results."""
-    if not results:
-        print(f"\n=== {title}: No results to display ===", flush=True)
+def validate_against_profile(
+    batch_results: List[BatchBenchResult],
+    profile_path: Path,
+    system_info: Dict[str, str]
+) -> None:
+    """Compare current benchmark results against a previous profile."""
+    if not profile_path.exists():
+        print(f"No profile found at {profile_path}")
         return
+    
+    with open(profile_path, 'r') as f:
+        profile = json.load(f)
+    
+    if 'batch_sizes' not in profile or 'moves_per_second' not in profile:
+        print("Profile doesn't contain required data for comparison")
+        return
+    
+    # Extract current results
+    current_batch_sizes = [result.batch_size for result in batch_results]
+    current_moves_per_second = [result.moves_per_second for result in batch_results]
+    
+    # Create comparison directory if it doesn't exist
+    results_dir = create_results_dir("graphs/comparisons")
+    results_dir.mkdir(exist_ok=True, parents=True)
+    
+    # Extract platform info for filenames
+    platform_name = system_info["platform"].lower()
+    processor_name = system_info["processor"].lower()
+    
+    # Find common batch sizes for comparison
+    common_batch_sizes = []
+    profile_moves = []
+    current_moves = []
+    
+    for i, b in enumerate(current_batch_sizes):
+        if b in profile['batch_sizes']:
+            idx = profile['batch_sizes'].index(b)
+            common_batch_sizes.append(b)
+            profile_moves.append(profile['moves_per_second'][idx])
+            current_moves.append(current_moves_per_second[i])
+    
+    if not common_batch_sizes:
+        print("No common batch sizes found for comparison")
+        return
+    
+    # Create a comparison plot
+    plt.figure(figsize=(12, 6))
+    width = 0.35
+    x = np.arange(len(common_batch_sizes))
+    
+    plt.bar(x - width/2, profile_moves, width, label='Previous')
+    plt.bar(x + width/2, current_moves, width, label='Current')
+    
+    plt.xlabel('Batch Size')
+    plt.ylabel('Moves per Second')
+    plt.title('Performance Comparison: Previous vs Current')
+    plt.xticks(x, common_batch_sizes)
+    plt.legend()
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    comparison_path = results_dir / f"{platform_name}_{processor_name}_comparison_{timestamp}.png"
+    plt.savefig(comparison_path, dpi=120)
+    plt.close()
+    
+    # Create a difference plot
+    percentage_diff = [(c - p) / p * 100 for p, c in zip(profile_moves, current_moves)]
+    
+    plt.figure(figsize=(12, 6))
+    plt.bar(common_batch_sizes, percentage_diff)
+    plt.axhline(y=0, color='r', linestyle='-', alpha=0.3)
+    
+    plt.xscale('log', base=2)
+    plt.xlabel('Batch Size')
+    plt.ylabel('Performance Difference (%)')
+    plt.title('Performance Difference: (Current - Previous) / Previous * 100%')
+    
+    diff_path = results_dir / f"{platform_name}_{processor_name}_diff_{timestamp}.png"
+    plt.savefig(diff_path, dpi=120)
+    plt.close()
+    
+    print(f"Comparison plot saved to: {comparison_path}")
+    print(f"Difference plot saved to: {diff_path}")
+    
+    # Print summary
+    avg_diff = sum(percentage_diff) / len(percentage_diff)
+    print(f"\n=== Performance Comparison Summary ===")
+    print(f"Average performance difference: {avg_diff:.2f}%")
+    
+    if avg_diff > 5:
+        print("Performance IMPROVED compared to previous profile")
+    elif avg_diff < -5:
+        print("Performance DEGRADED compared to previous profile")
+    else:
+        print("Performance is similar to previous profile")
 
-    print(f"\n=== {title} ===", flush=True)
-    # Header
-    header = (
-        f"{'Batch':>7} | {'Moves/s':>12} | {'Games/s':>12} | {'Moves/s/G':>10} | "
-        f"{'Mem (GB)':>10} | {'Effic.':>12} | "
-        f"{'Avg Moves':>10} | {'Med Moves':>10} | {'Min Moves':>10} | {'Max Moves':>10}"
-    )
-    print(header, flush=True)
-    print("-" * len(header), flush=True)
 
-    # Rows
-    for r in results:
-        print(f"{r.batch_size:>7} | "
-              f"{format_human_readable(r.moves_per_second):>12} | "
-              f"{format_human_readable(r.games_per_second):>12} | "
-              f"{format_human_readable(r.moves_per_second_per_game):>10} | "
-              f"{r.memory_usage_gb:>10.2f} | "
-              f"{format_human_readable(r.efficiency):>12}/GB | " # Efficiency includes /GB
-              f"{r.avg_moves_per_game:>10.1f} | "
-              f"{r.median_moves_per_game:>10.1f} | "
-              f"{r.min_moves_per_game if r.min_moves_per_game != float('inf') else 'N/A':>10} | " # Handle inf min moves
-              f"{r.max_moves_per_game:>10}", flush=True) 
+def print_benchmark_summary(results: List[BatchBenchResult]) -> None:
+    """Print a formatted summary of benchmark results."""
+    valid_results = [r for r in results if r.valid]
+    
+    if not valid_results:
+        print("No valid benchmark results to display")
+        return
+    
+    print("\n=== Discovery Summary (Valid Results) ===")
+    header = f"{'Batch':>7} | {'Moves/s':>12} | {'Games/s':>12} | {'Moves/s/G':>10} | {'Mem (GB)':>10} | " \
+             f"{'Effic.':>12} | {'Avg Moves':>10} | {'Med Moves':>10} | {'Min Moves':>10} | {'Max Moves':>10}"
+    print(header)
+    print("-" * 100)
+    
+    for result in valid_results:
+        print(f"{result.batch_size:>7} | {result.moves_per_second:>12,.2f} | {result.games_per_second:>12,.2f} | "
+              f"{result.moves_per_second / result.batch_size:>10,.2f} | {result.memory_gb:>10,.2f} | "
+              f"{result.efficiency:>12,.2f}/GB | {result.avg_game_length:>10,.1f} | {result.median_game_length:>10,.1f} | "
+              f"{result.min_game_length:>10} | {result.max_game_length:>10}")
+    
+    # Print optimal configurations
+    moves_optimal = max(valid_results, key=lambda x: x.moves_per_second)
+    games_optimal = max(valid_results, key=lambda x: x.games_per_second)
+    efficiency_optimal = max(valid_results, key=lambda x: x.efficiency)
+    
+    print("\n=== Optimal Configurations (Discovered) ===")
+    print(f"Best for moves/s: Batch size {moves_optimal.batch_size} with {moves_optimal.moves_per_second:,.2f} moves/s")
+    print(f"Best for games/s: Batch size {games_optimal.batch_size} with {games_optimal.games_per_second:,.2f} games/s")
+    print(f"Best for efficiency: Batch size {efficiency_optimal.batch_size} with {efficiency_optimal.efficiency:,.2f}/GB")
+
+
+def select_batch_sizes_for_profile(results: List[BatchBenchResult], num_sizes: int = 4) -> List[int]:
+    """Select a meaningful subset of batch sizes for inclusion in the profile."""
+    valid_results = [r for r in results if r.valid]
+    
+    if len(valid_results) <= num_sizes:
+        return [r.batch_size for r in valid_results]
+    
+    # Always include the smallest and largest batch sizes
+    smallest = min(valid_results, key=lambda x: x.batch_size).batch_size
+    largest = max(valid_results, key=lambda x: x.batch_size).batch_size
+    
+    # Include the batch size with the best raw performance
+    best_perf = max(valid_results, key=lambda x: x.moves_per_second).batch_size
+    
+    # Include the batch size with the best games/s if different
+    best_games = max(valid_results, key=lambda x: x.games_per_second).batch_size
+    
+    # Start with these candidates
+    selected = [smallest, largest, best_perf, best_games]
+    selected = list(set(selected))  # Remove duplicates
+    
+    # If we need more, add intermediate sizes evenly distributed
+    batch_sizes = sorted([r.batch_size for r in valid_results])
+    
+    if len(selected) < num_sizes:
+        # How many more do we need?
+        needed = num_sizes - len(selected)
+        
+        # Filter out already selected batch sizes
+        remaining = [b for b in batch_sizes if b not in selected]
+        
+        if remaining:
+            # Take evenly spaced items
+            indices = np.linspace(0, len(remaining) - 1, needed).astype(int)
+            additional = [remaining[i] for i in indices]
+            selected.extend(additional)
+    
+    return sorted(selected[:num_sizes])  # Return sorted list, capped at num_sizes 

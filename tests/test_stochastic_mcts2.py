@@ -745,13 +745,14 @@ def test_vmap_step_fn():
         logits = jnp.maximum(jnp.log(probs), jnp.finfo(probs.dtype).min)
         return jax.random.categorical(rng_key, logits=logits, axis=-1)
 
-
+    batch_size = 10
     # Load the environment
     env = bg.Backgammon()
     init_fn = jax.jit(jax.vmap(env.init))
     step_fn = jax.jit(jax.vmap(env.step))
 
     # Initialize the states
+    key = jax.random.PRNGKey(0)
     key, subkey = jax.random.split(key)
     keys = jax.random.split(subkey, batch_size)
     state = init_fn(keys)
