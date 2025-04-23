@@ -29,7 +29,7 @@ flax = ">=0.10.5"
 optax = ">=0.1.8"
 orbax-checkpoint = ">=0.10.1"
 chex = ">=0.1.85"
-pgx = { git = "https://github.com/sile16/pgx.git" } # Git dependency remains unchanged
+pgx = { git = "https://github.com/sile16/pgx.git@master" } # Git dependency remains unchanged
 dm-haiku = ">=0.0.12"
 cairosvg = ">=2.7.1"
 tqdm = ">=4.67.1"
