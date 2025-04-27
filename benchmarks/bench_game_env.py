@@ -112,6 +112,35 @@ def random_action_from_mask(key, mask):
     return jax.random.categorical(key, logits=logits, axis=-1)
 
 
+def print_memory_usage(stage: str):
+    """Print current memory usage for a given stage."""
+    if jax.default_backend() == 'gpu':
+        memory = jax.devices()[0].memory_stats()
+        used_gb = memory['bytes_in_use'] / (1024**3)
+        total_gb = memory['bytes_limit'] / (1024**3)
+        print(f"Memory usage at {stage}: {used_gb:.2f}GB / {total_gb:.2f}GB", flush=True)
+        
+        # Get CUDA memory info
+        try:
+            import torch
+            torch_mem = torch.cuda.memory_allocated() / (1024**3)
+            torch_cached = torch.cuda.memory_reserved() / (1024**3)
+            print(f"PyTorch memory: {torch_mem:.2f}GB allocated, {torch_cached:.2f}GB cached", flush=True)
+        except ImportError:
+            pass
+            
+        # Get NVIDIA-SMI info
+        try:
+            import subprocess
+            nvidia_smi = subprocess.check_output(['nvidia-smi', '--query-gpu=memory.used,memory.total', '--format=csv,nounits,noheader'])
+            gpu_mem = [int(x) for x in nvidia_smi.decode('utf-8').strip().split(',')]
+            print(f"NVIDIA-SMI memory: {gpu_mem[0]/1024:.2f}GB used / {gpu_mem[1]/1024:.2f}GB total", flush=True)
+        except Exception:
+            pass
+    else:
+        print(f"Memory profiling not available for {jax.default_backend()} backend", flush=True)
+
+
 def benchmark_batch_size(batch_size: int, max_duration: int = 120) -> 'BatchBenchResult':
     """
     Benchmark with individual state reset on termination within the JIT step.
@@ -134,17 +163,6 @@ def benchmark_batch_size(batch_size: int, max_duration: int = 120) -> 'BatchBenc
     print("Initializing environment...", flush=True)
     env = bg.Backgammon(simple_doubles=True)
     num_stochastic_outcomes = len(env.stochastic_action_probs)
-
-    # Memory profiling
-    def print_memory_usage(stage: str):
-        """Print current memory usage for a given stage."""
-        if jax.default_backend() == 'gpu':
-            memory = jax.devices()[0].memory_stats()
-            used_gb = memory['bytes_in_use'] / (1024**3)
-            print(f"Memory usage at {stage}: {used_gb:.2f} GB", flush=True)
-        else:
-            print(f"Memory profiling not available for {jax.default_backend()} backend", flush=True)
-
     print_memory_usage("after env init")
 
     # Check if the environment has a 'reset' method, otherwise alias 'init'
@@ -222,8 +240,8 @@ def benchmark_batch_size(batch_size: int, max_duration: int = 120) -> 'BatchBenc
         for i in range(4):
             key, subkey = jax.random.split(key)
             new_state, _ = step_fn(subkey, new_state)
-        jax.block_until_ready(new_state)
-        print_memory_usage("after warm-up")
+            jax.block_until_ready(new_state)
+            print_memory_usage(f"after warm-up iteration {i+1}")
         state = new_state
     except Exception as e:
         print(f"Error during compilation/warm-up: {e}", flush=True)
@@ -531,8 +549,10 @@ def discover_optimal_batch_sizes(
         python_version=get_system_info()["python_version"],
         jax_version=get_system_info()["jax_version"],
         batch_sizes=plot_batch_sizes,
-        moves_per_second=[r.moves_per_second for r in valid_results],
-        memory_usage_gb=[r.memory_usage_gb for r in valid_results],
+        moves_per_second=metrics_data['moves_per_second'],
+        memory_usage_gb=metrics_data['memory_usage_gb'],
+        games_per_second=metrics_data['games_per_second'],
+        moves_per_second_per_game=metrics_data['moves_per_second_per_game']
     )
     
     plot_filename = generate_benchmark_plots(plot_batch_sizes, metrics_data, temp_profile)
