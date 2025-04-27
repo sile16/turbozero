@@ -470,85 +470,7 @@ def discover_optimal_batch_sizes(
     
     print("Starting discovery process - will test provided batch sizes", flush=True)
     
-    # Use tqdm for the outer loop tracking batch sizes tested
-    with tqdm(total=len(batch_sizes), desc="Discovering Batch Sizes", unit="batch") as outer_pbar:
-        for batch_size in batch_sizes:
-            # Benchmark current batch size
-            try:
-                print(f"\n{'#'*50}", flush=True)
-                print(f"Discovery iteration {outer_pbar.n + 1}: Testing batch size {batch_size}", flush=True)
-                print(f"{'#'*50}", flush=True)
-                
-                # Temporarily silence stdout for benchmark to avoid progress bar confusion
-                original_stdout = sys.stdout
-                sys.stdout = open(os.devnull, 'w')
-                try:
-                    result = benchmark_batch_size(
-                        batch_size,
-                        max_duration=max_duration
-                    )
-                except Exception as e:
-                    # Check if it's an out-of-memory error
-                    if "RESOURCE_EXHAUSTED" in str(e) or "Out of memory" in str(e):
-                        print(f"\nOut of memory error for batch size {batch_size}. Stopping discovery.", flush=True)
-                        # Keep the last valid result if we have one
-                        if valid_results:
-                            print(f"Last valid batch size was {valid_results[-1].batch_size}", flush=True)
-                        break
-                    raise  # Re-raise if it's not an OOM error
-                finally:
-                    # Restore stdout regardless of success/failure
-                    sys.stdout.close()
-                    sys.stdout = original_stdout
-                
-                # Print a summary of the result
-                print(f"Completed benchmark for batch size {batch_size}: "
-                      f"{format_human_readable(result.moves_per_second)}/s, "
-                      f"avg moves: {result.avg_game_length:.1f}, "
-                      f"memory: {result.memory_usage_gb:.2f}GB", flush=True)
-                
-                all_results.append(result)
-                valid_results.append(result)  # Add to valid results
-                outer_pbar.update(1)
-                
-                # Check if we should continue
-                if len(valid_results) > 1:
-                    # Check based on moves_per_second
-                    perf_improvement = valid_results[-1].moves_per_second / valid_results[-2].moves_per_second - 1.0 if valid_results[-2].moves_per_second > 0 else float('inf')
-                    print(f"Performance improvement (moves/s): {perf_improvement:.2%}", flush=True)
-                    
-                    # Stop if memory limit reached
-                    if result.memory_usage_gb >= memory_limit_gb:
-                        print(f"Memory limit reached: {result.memory_usage_gb:.2f}GB >= {memory_limit_gb:.2f}GB", flush=True)
-                        break
-                    
-                    # Stop if diminishing returns (less than 10% improvement)
-                    # Requires two consecutive small improvements to stop
-                    if perf_improvement < 0.1:
-                        if last_perf_improvement < 0.2:  
-                            print("Diminishing returns detected (two consecutive small improvements < 20% and < 10%)", flush=True)
-                            break
-                        last_perf_improvement = perf_improvement
-                    else:
-                        last_perf_improvement = float('inf')  # Reset counter
-            except Exception as e:
-                print(f"Error benchmarking batch size {batch_size}: {e}", flush=True)
-                print(f"Stopping discovery before batch size {batch_size}", flush=True)
-                break
-    
-    print(f"\nDiscovery complete: Tested {len(all_results)} batch sizes, {len(valid_results)} valid results", flush=True)
-    
-    # Generate plots using only valid results
-    plot_batch_sizes = [r.batch_size for r in valid_results]
-    metrics_data = {
-        'moves_per_second': [r.moves_per_second for r in valid_results],
-        'games_per_second': [r.games_per_second for r in valid_results],
-        'moves_per_second_per_game': [r.moves_per_second_per_game for r in valid_results],
-        'memory_usage_gb': [r.memory_usage_gb for r in valid_results],
-        'efficiency': [r.efficiency for r in valid_results]
-    }
-    
-    # Create a minimal profile for plotting
+    # Create a temporary profile for plotting
     temp_profile = BenchmarkProfile(
         platform=get_system_info()["platform"],
         processor=get_system_info()["processor"],
@@ -556,52 +478,61 @@ def discover_optimal_batch_sizes(
         device_info=get_system_info()["device_info"],
         python_version=get_system_info()["python_version"],
         jax_version=get_system_info()["jax_version"],
-        batch_sizes=plot_batch_sizes,
-        moves_per_second=metrics_data['moves_per_second'],
-        memory_usage_gb=metrics_data['memory_usage_gb'],
-        games_per_second=metrics_data['games_per_second'],
-        moves_per_second_per_game=metrics_data['moves_per_second_per_game']
+        batch_sizes=batch_sizes,
+        moves_per_second=[],
+        memory_usage_gb=[],
+        games_per_second=[],
+        moves_per_second_per_game=[],
+        timestamp=datetime.now().strftime("%Y%m%d_%H%M%S")
     )
     
-    # Create a list of BatchBenchResult objects for plotting
-    plot_results = [
-        BatchBenchResult(
-            batch_size=plot_batch_sizes[i],
-            moves_per_second=metrics_data['moves_per_second'][i],
-            games_per_second=metrics_data['games_per_second'][i],
-            moves_per_second_per_game=metrics_data['moves_per_second_per_game'][i],
-            memory_usage_gb=metrics_data['memory_usage_gb'][i],
-            efficiency=metrics_data['efficiency'][i],
-            valid=True
-        ) for i in range(len(plot_batch_sizes))
-    ]
+    with tqdm(total=len(batch_sizes), desc="Discovering Batch Sizes", unit="batch") as pbar:
+        for batch_size in batch_sizes:
+            try:
+                result = benchmark_batch_size(batch_size, max_duration)
+                all_results.append(result)
+                
+                if result.valid:
+                    valid_results.append(result)
+                    temp_profile.moves_per_second.append(result.moves_per_second)
+                    temp_profile.memory_usage_gb.append(result.memory_usage_gb)
+                    temp_profile.games_per_second.append(result.games_per_second)
+                    temp_profile.moves_per_second_per_game.append(result.moves_per_second / batch_size)
+                    
+                    # Check termination conditions
+                    if result.memory_usage_gb >= memory_limit_gb:
+                        print(f"Memory limit reached: {result.memory_usage_gb:.2f}GB >= {memory_limit_gb:.2f}GB", flush=True)
+                        break
+                        
+                    if len(valid_results) > 1:
+                        perf_improvement = (valid_results[-1].moves_per_second / 
+                                          valid_results[-2].moves_per_second - 1.0)
+                        if perf_improvement < 0.1:
+                            print("Diminishing returns detected (less than 10% improvement)", flush=True)
+                            break
+                
+            except Exception as e:
+                print(f"Error benchmarking batch size {batch_size}: {e}", flush=True)
+                break
+                
+            pbar.update(1)
     
-    plot_filename = generate_benchmark_plots(plot_batch_sizes, plot_results, temp_profile)
+    print(f"\nDiscovery complete: Tested {len(batch_sizes)} batch sizes, {len(valid_results)} valid results")
     
-    # Print summary table using only valid results
-    print_summary_table(valid_results, title="Discovery Summary (Valid Results)")
+    # Extract lists for plotting
+    plot_batch_sizes = [r.batch_size for r in valid_results]
+    plot_results = valid_results
     
-    # Extract optimal configurations from valid results
-    if valid_results:
-        best_moves_idx = np.argmax([r.moves_per_second for r in valid_results])
-        best_games_idx = np.argmax([r.games_per_second for r in valid_results])
-        best_efficiency_idx = np.argmax([r.efficiency for r in valid_results])
-        
-        print("\n=== Optimal Configurations (Discovered) ===", flush=True)
-        print(f"Best for moves/s: Batch size {valid_results[best_moves_idx].batch_size} with {format_human_readable(valid_results[best_moves_idx].moves_per_second)} moves/s", flush=True)
-        print(f"Best for games/s: Batch size {valid_results[best_games_idx].batch_size} with {format_human_readable(valid_results[best_games_idx].games_per_second)} games/s", flush=True)
-        print(f"Best for efficiency: Batch size {valid_results[best_efficiency_idx].batch_size} with {format_human_readable(valid_results[best_efficiency_idx].efficiency)}/GB", flush=True)
-        print(f"\nCheck the benchmark plot at: {plot_filename}", flush=True)
-    else:
-        print("\nNo successful benchmark runs completed.", flush=True)
+    # Generate plots using the timestamp from the profile
+    plot_filename = generate_benchmark_plots(plot_batch_sizes, plot_results, temp_profile.timestamp)
     
-    # Return lists required by BenchmarkProfile
+    # Return results in format compatible with BenchmarkProfile
     return (
         [r.batch_size for r in valid_results],
         [r.moves_per_second for r in valid_results],
         [r.memory_usage_gb for r in valid_results],
         [r.games_per_second for r in valid_results],
-        [r.moves_per_second_per_game for r in valid_results]
+        [r.moves_per_second / r.batch_size for r in valid_results]
     )
 
 
