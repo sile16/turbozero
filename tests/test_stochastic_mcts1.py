@@ -858,6 +858,80 @@ def test_sequence_stoch_det_det_det_stoch(stochastic_mcts, backgammon_env, mock_
     
     print("test_sequence_stoch_det_det_det_stoch PASSED")
 
+def test_root_state_preservation(stochastic_mcts, backgammon_env, mock_params, key):
+    """Test that root node state is properly preserved and updated between evaluate calls when persist_tree=True."""
+    key, init_key, eval_key1, eval_key2 = jax.random.split(key, 4)
+    
+    # Create the step function closure with the env instance
+    step_fn = backgammon_step_fn(backgammon_env)
+
+    # Initialize a deterministic state
+    initial_state = backgammon_env.init(init_key)
+    if initial_state.is_stochastic:
+        initial_state = backgammon_env.stochastic_step(initial_state, 0)
+    
+    assert not initial_state.is_stochastic, "Initial state should be deterministic"
+    
+    # First evaluate call
+    initial_eval_state = stochastic_mcts.init(template_embedding=initial_state)
+    root_metadata = StepMetadata(
+        rewards=initial_state.rewards,
+        action_mask=initial_state.legal_action_mask,
+        terminated=initial_state.terminated,
+        cur_player_id=initial_state.current_player,
+        step=initial_state._step_count
+    )
+    
+    mcts_output1 = stochastic_mcts.evaluate(
+        key=eval_key1,
+        eval_state=initial_eval_state,
+        env_state=initial_state,
+        root_metadata=root_metadata,
+        params=mock_params,
+        env_step_fn=step_fn
+    )
+    
+    # Store the root node state after first evaluate
+    root_node1 = mcts_output1.eval_state.data_at(mcts_output1.eval_state.ROOT_INDEX)
+    
+    # Second evaluate call with same state
+    mcts_output2 = stochastic_mcts.evaluate(
+        key=eval_key2,
+        eval_state=mcts_output1.eval_state,  # Use the tree from first evaluate
+        env_state=initial_state,
+        root_metadata=root_metadata,
+        params=mock_params,
+        env_step_fn=step_fn
+    )
+    
+    # Get root node state after second evaluate
+    root_node2 = mcts_output2.eval_state.data_at(mcts_output2.eval_state.ROOT_INDEX)
+    
+    # Verify that tree state is properly preserved and updated
+    # Policy should be preserved since it comes from the initial evaluation
+    assert jnp.all(root_node1.p == root_node2.p), "Root policy should be preserved"
+    
+    # Visit count should increase by num_iterations
+    assert root_node2.n == root_node1.n + stochastic_mcts.num_iterations, "Root visit count should increase by num_iterations"
+    
+    # Value should be updated but not reset
+    # We can't check exact values since they depend on the random rollouts
+    # but we can verify the value isn't being reset to initial values
+    assert root_node2.n > root_node1.n, "Visit count should increase"
+    assert root_node2.q != 0.0, "Value should not be reset"
+    
+    # Embedding should be preserved exactly
+    # Compare each field of the embedding separately since they're JAX arrays
+    assert jnp.all(root_node1.embedding.current_player == root_node2.embedding.current_player), "Current player should be preserved"
+    assert jnp.all(root_node1.embedding._board == root_node2.embedding._board), "Board state should be preserved"
+    assert jnp.all(root_node1.embedding._dice == root_node2.embedding._dice), "Dice state should be preserved"
+    assert jnp.all(root_node1.embedding._playable_dice == root_node2.embedding._playable_dice), "Playable dice should be preserved"
+    assert jnp.all(root_node1.embedding._played_dice_num == root_node2.embedding._played_dice_num), "Played dice num should be preserved"
+    assert jnp.all(root_node1.embedding._turn == root_node2.embedding._turn), "Turn should be preserved"
+    assert jnp.all(root_node1.embedding.is_stochastic == root_node2.embedding.is_stochastic), "Stochastic flag should be preserved"
+    
+    print("test_root_state_preservation PASSED")
+
 @pytest.fixture
 def stochastic_mcts(branching_factor, stochastic_action_probs):
     """Create a real StochasticMCTS instance for testing without mocking."""

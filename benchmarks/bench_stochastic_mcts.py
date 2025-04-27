@@ -245,8 +245,18 @@ def main():
             )
             validate_against_profile(results, profile, benchmark.system_info)
             print(f"Maximum nodes observed: {max_nodes}")
+            
+            # If force flag is set, update the profile with new results
+            if args.force:
+                print("\nForce flag set - updating profile with new results...", flush=True)
+                benchmark.save_profile(results, {"max_node_count": max_nodes})
         else:
             # Discovery mode
+            if profile and not args.force:
+                print(f"Profile already exists. Use --force to overwrite, or --validate to validate against it.")
+                return
+            
+            # Run benchmarks
             results, max_nodes = benchmark.discover_optimal_batch_sizes(
                 args.memory_limit,
                 args.duration,

@@ -1,0 +1,26 @@
+{
+  "platform": "Darwin",
+  "processor": "arm",
+  "jaxlib_type": "cpu",
+  "device_info": "TFRT_CPU_0",
+  "python_version": "3.12.5",
+  "jax_version": "0.5.3",
+  "implementation": "StochasticMCTS",
+  "num_simulations": 200,
+  "max_duration": 10,
+  "max_nodes": 10000,
+  "max_observed_nodes": 375,
+  "batch_sizes": [
+    1
+  ],
+  "moves_per_second": [
+    2.6802188750670166
+  ],
+  "games_per_second": [
+    0
+  ],
+  "memory_usage_gb": [
+    8.62060546875e-10
+  ],
+  "timestamp": "2025-04-22T01:13:32.222087"
+}

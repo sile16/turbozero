@@ -1,4 +1,3 @@
-
 from functools import partial
 from typing import Dict, Optional, Tuple
 import jax
@@ -90,14 +89,24 @@ class MCTS(Evaluator):
         Returns:
         - (MCTSOutput): contains new tree state, selected action, root value, and policy weights
         """
-        # store current state metadata in the root node
+        # Only update root if tree is empty or persist_tree=False
         key, root_key = jax.random.split(key)
-        eval_state = self.update_root(root_key, eval_state, env_state, params, root_metadata=root_metadata)
+        root_node = eval_state.data_at(eval_state.ROOT_INDEX)
+        should_update_root = jnp.logical_or(
+            not self.persist_tree,
+            root_node.n == 0
+        )
+        eval_state = jax.lax.cond(
+            should_update_root,
+            lambda: self.update_root(root_key, eval_state, env_state, params, root_metadata=root_metadata),
+            lambda: eval_state
+        )
+        
         # perform 'num_iterations' iterations of MCTS
         iterate = partial(self.iterate, params=params, env_step_fn=env_step_fn)
-
         iterate_keys = jax.random.split(key, self.num_iterations)
         eval_state, _ = jax.lax.scan(lambda state, k: (iterate(k, state), None), eval_state, iterate_keys)
+        
         # sample action based on root visit counts
         # (also get normalized policy weights for training purposes)
         action, policy_weights = self.sample_root_action(key, eval_state)
@@ -374,13 +383,24 @@ class MCTS(Evaluator):
         - (MCTSNode): updated root node
         """
         visited = root_node.n > 0
+        # For arrays (policy, value, visit count), use jnp.where
+        new_policy = jnp.where(visited, root_node.p, root_policy)
+        new_value = jnp.where(visited, root_node.q, root_value)
+        new_visits = jnp.where(visited, root_node.n, 1)
+        
+        # For the embedding, use jax.lax.cond to handle the state object
+        new_embedding = jax.lax.cond(
+            visited,
+            lambda _: root_node.embedding,
+            lambda _: root_embedding,
+            operand=None
+        )
+        
         return root_node.replace(
-            p=root_policy,
-            # keep old value estimate if the node has already been visited
-            q=jnp.where(visited, root_node.q, root_value), 
-            # keep old visit count if the node has already been visited
-            n=jnp.where(visited, root_node.n, 1), 
-            embedding=root_embedding
+            p=new_policy,
+            q=new_value,
+            n=new_visits,
+            embedding=new_embedding
         )
     
 

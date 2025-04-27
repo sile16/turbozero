@@ -22,7 +22,7 @@ from matplotlib.ticker import ScalarFormatter
 from datetime import datetime
 
 # Constants
-DEFAULT_MEMORY_LIMIT_GB = 16  # Maximum memory to use (in GB)
+DEFAULT_MEMORY_LIMIT_GB = 24  # Maximum memory to use (in GB)
 DEFAULT_BENCHMARK_DURATION = 30  # Duration of each batch size test in seconds
 
 # Get the directory where the benchmark script is located
