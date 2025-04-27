@@ -434,7 +434,8 @@ def benchmark_batch_size(batch_size: int, max_duration: int = 120) -> 'BatchBenc
 
 def discover_optimal_batch_sizes(
     memory_limit_gb: float = DEFAULT_MEMORY_LIMIT_GB,
-    max_duration: int = 120
+    max_duration: int = 120,
+    batch_sizes: Optional[List[int]] = None
 ) -> Tuple[List[int], List[float], List[float], List[float], List[float]]:
     """
     Discover optimal batch sizes by increasing batch size until memory limit or diminishing returns.
@@ -442,6 +443,7 @@ def discover_optimal_batch_sizes(
     Args:
         memory_limit_gb: Maximum memory to use in GB
         max_duration: Duration in seconds for each batch size test (default: 120s = 2 minutes)
+        batch_sizes: Optional list of batch sizes to test. If None, will use exponential growth.
     
     Returns:
         Tuple containing lists needed for BenchmarkProfile compatibility.
@@ -452,16 +454,25 @@ def discover_optimal_batch_sizes(
     all_results: List[BatchBenchResult] = []
     valid_results: List[BatchBenchResult] = []  # Track only valid results
     
-    # Start with batch size 1 and keep doubling
-    batch_size = 1
+    if batch_sizes is None:
+        # Start with batch size 1 and keep doubling
+        batch_size = 1
+        batch_sizes = []
+        while True:
+            batch_sizes.append(batch_size)
+            batch_size *= 2
+            if batch_size > 32768:  # Reasonable upper limit
+                break
+    else:
+        print(f"Using provided batch sizes: {batch_sizes}", flush=True)
+    
     last_perf_improvement = float('inf')
     
-    print("Starting discovery process - will test increasing batch sizes", flush=True)
+    print("Starting discovery process - will test provided batch sizes", flush=True)
     
     # Use tqdm for the outer loop tracking batch sizes tested
-    # We don't know the total number of batches beforehand, so leave total=None
-    with tqdm(desc="Discovering Batch Sizes", unit="batch") as outer_pbar:
-        while True:
+    with tqdm(total=len(batch_sizes), desc="Discovering Batch Sizes", unit="batch") as outer_pbar:
+        for batch_size in batch_sizes:
             # Benchmark current batch size
             try:
                 print(f"\n{'#'*50}", flush=True)
@@ -524,9 +535,6 @@ def discover_optimal_batch_sizes(
                 print(f"Error benchmarking batch size {batch_size}: {e}", flush=True)
                 print(f"Stopping discovery before batch size {batch_size}", flush=True)
                 break
-            
-            # Double batch size for next iteration
-            batch_size *= 2
     
     print(f"\nDiscovery complete: Tested {len(all_results)} batch sizes, {len(valid_results)} valid results", flush=True)
     
@@ -574,43 +582,39 @@ def discover_optimal_batch_sizes(
     else:
         print("\nNo successful benchmark runs completed.", flush=True)
     
-    # Select batch sizes for the profile (if needed) - keep original logic for compatibility
-    # If we tested many, select a subset for the profile
-    profile_results = valid_results
-    if len(valid_results) > 4:
-        indices = sorted(list(set([0, len(valid_results) // 3, 2 * len(valid_results) // 3, len(valid_results) - 1]))) # Ensure unique indices
-        profile_results = [valid_results[i] for i in indices]
-        print(f"\nSelected subset of {len(profile_results)} batch sizes for profile: {[r.batch_size for r in profile_results]}", flush=True)
-
     # Return lists required by BenchmarkProfile
     return (
-        [r.batch_size for r in profile_results],
-        [r.moves_per_second for r in profile_results],
-        [r.memory_usage_gb for r in profile_results],
-        [r.games_per_second for r in profile_results],
-        [r.moves_per_second_per_game for r in profile_results]
+        [r.batch_size for r in valid_results],
+        [r.moves_per_second for r in valid_results],
+        [r.memory_usage_gb for r in valid_results],
+        [r.games_per_second for r in valid_results],
+        [r.moves_per_second_per_game for r in valid_results]
     )
 
 
-def validate_against_profile(profile: BenchmarkProfile, max_duration: int = 120) -> None:
+def validate_against_profile(profile: BenchmarkProfile, max_duration: int = 120, batch_sizes: Optional[List[int]] = None) -> None:
     """
     Validate current performance against a saved profile using time-based runs.
     
     Args:
         profile: Profile to validate against
         max_duration: Duration in seconds for each batch size test (default: 120s = 2 minutes)
+        batch_sizes: Optional list of batch sizes to test. If None, will use profile's batch sizes.
     """
     print("\n=== Validating against saved profile ===", flush=True)
-    print(f"Testing {len(profile.batch_sizes)} batch sizes from profile: {profile.batch_sizes}", flush=True)
+    
+    # Use provided batch sizes or fall back to profile's batch sizes
+    test_batch_sizes = batch_sizes if batch_sizes is not None else profile.batch_sizes
+    print(f"Testing {len(test_batch_sizes)} batch sizes: {test_batch_sizes}", flush=True)
     print(f"Duration per batch size: {max_duration}s", flush=True)
     
     current_results: List[BatchBenchResult] = []
     
     # Use tqdm for the outer loop tracking batch sizes being validated
-    with tqdm(total=len(profile.batch_sizes), desc="Validating Batch Sizes", unit="batch") as outer_pbar:
-        for i, batch_size in enumerate(profile.batch_sizes):
+    with tqdm(total=len(test_batch_sizes), desc="Validating Batch Sizes", unit="batch") as outer_pbar:
+        for i, batch_size in enumerate(test_batch_sizes):
             print(f"\n{'='*50}", flush=True)
-            print(f"Validation run {i+1}/{len(profile.batch_sizes)}: Testing batch size {batch_size}", flush=True)
+            print(f"Validation run {i+1}/{len(test_batch_sizes)}: Testing batch size {batch_size}", flush=True)
             print(f"{'='*50}", flush=True)
             
             # Temporarily silence stdout for benchmark to avoid progress bar confusion
@@ -649,7 +653,7 @@ def validate_against_profile(profile: BenchmarkProfile, max_duration: int = 120)
     moves_diffs = []
     games_diffs = []
     
-    for i, batch_size in enumerate(profile.batch_sizes):
+    for i, batch_size in enumerate(test_batch_sizes):
         # Get data for comparison
         current_result = current_results[i]
         previous_moves = profile.moves_per_second[i] if i < len(profile.moves_per_second) else 0
@@ -685,7 +689,7 @@ def validate_against_profile(profile: BenchmarkProfile, max_duration: int = 120)
         device_info=profile.device_info,
         python_version=profile.python_version,
         jax_version=profile.jax_version,
-        batch_sizes=profile.batch_sizes,
+        batch_sizes=test_batch_sizes,
         moves_per_second=[r.moves_per_second for r in current_results],
         memory_usage_gb=[r.memory_usage_gb for r in current_results],
         games_per_second=[r.games_per_second for r in current_results],
@@ -695,7 +699,7 @@ def validate_against_profile(profile: BenchmarkProfile, max_duration: int = 120)
     comparison_plt_filename = None
     diff_plt_filename = None
 
-    if profile.batch_sizes and profile.moves_per_second and [r.moves_per_second for r in current_results]:
+    if test_batch_sizes and profile.moves_per_second and [r.moves_per_second for r in current_results]:
         GRAPHS_DIR.mkdir(parents=True, exist_ok=True)
         
         # Get platform and processor for filenames
@@ -748,7 +752,7 @@ def validate_against_profile(profile: BenchmarkProfile, max_duration: int = 120)
              metrics_to_compare.append((games_diffs, 'Games/s Diff', 'tab:green'))
         
         bar_width = 0.35
-        index = np.arange(len(profile.batch_sizes))
+        index = np.arange(len(test_batch_sizes))
         
         for i, (diffs, label, color) in enumerate(metrics_to_compare):
             plt.bar(index + i * bar_width, diffs, bar_width, label=label, color=color, alpha=0.7)
@@ -756,7 +760,7 @@ def validate_against_profile(profile: BenchmarkProfile, max_duration: int = 120)
         plt.xlabel('Batch Size')
         plt.ylabel('Performance Difference (%)')
         plt.title('Performance Difference: Current vs Previous Profile')
-        plt.xticks(index + bar_width / len(metrics_to_compare) / 2, profile.batch_sizes)
+        plt.xticks(index + bar_width / len(metrics_to_compare) / 2, test_batch_sizes)
         plt.grid(True, axis='y', linestyle='--', alpha=0.3)
         plt.legend(loc='best')
         plt.axhline(y=0, color='black', linestyle='-', alpha=0.3)
@@ -780,8 +784,8 @@ def validate_against_profile(profile: BenchmarkProfile, max_duration: int = 120)
         
         print("\n=== Performance Change Summary (Moves/s vs Profile) ===", flush=True)
         print(f"Average performance change: {avg_diff:+.2f}%", flush=True)
-        print(f"Best case (batch size {profile.batch_sizes[best_idx]}): {max_diff:+.2f}%", flush=True)
-        print(f"Worst case (batch size {profile.batch_sizes[worst_idx]}): {min_diff:+.2f}%", flush=True)
+        print(f"Best case (batch size {test_batch_sizes[best_idx]}): {max_diff:+.2f}%", flush=True)
+        print(f"Worst case (batch size {test_batch_sizes[worst_idx]}): {min_diff:+.2f}%", flush=True)
         
         if avg_diff < -5:
             print("\n⚠️  WARNING: Current performance is significantly worse than the saved profile! ⚠️", flush=True)
@@ -852,7 +856,8 @@ def run_benchmark(args: argparse.Namespace) -> None:
         # Run discovery with the specified parameters
         batch_sizes, moves_per_second, memory_usage_gb, games_per_second, moves_per_second_per_game = discover_optimal_batch_sizes(
             memory_limit_gb=args.memory_limit,
-            max_duration=args.duration
+            max_duration=args.duration,
+            batch_sizes=custom_batch_sizes
         )
         
         # Create and save profile
@@ -877,7 +882,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
     else:
         # Run validation against existing profile
         print("\nProfile found - running validation mode", flush=True)
-        validate_against_profile(profile, max_duration=args.duration)
+        validate_against_profile(profile, max_duration=args.duration, batch_sizes=custom_batch_sizes)
 
 
 def main():
