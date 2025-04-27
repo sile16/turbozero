@@ -563,7 +563,20 @@ def discover_optimal_batch_sizes(
         moves_per_second_per_game=metrics_data['moves_per_second_per_game']
     )
     
-    plot_filename = generate_benchmark_plots(plot_batch_sizes, metrics_data, temp_profile)
+    # Create a list of BatchBenchResult objects for plotting
+    plot_results = [
+        BatchBenchResult(
+            batch_size=plot_batch_sizes[i],
+            moves_per_second=metrics_data['moves_per_second'][i],
+            games_per_second=metrics_data['games_per_second'][i],
+            moves_per_second_per_game=metrics_data['moves_per_second_per_game'][i],
+            memory_usage_gb=metrics_data['memory_usage_gb'][i],
+            efficiency=metrics_data['efficiency'][i],
+            valid=True
+        ) for i in range(len(plot_batch_sizes))
+    ]
+    
+    plot_filename = generate_benchmark_plots(plot_batch_sizes, plot_results, temp_profile)
     
     # Print summary table using only valid results
     print_summary_table(valid_results, title="Discovery Summary (Valid Results)")
