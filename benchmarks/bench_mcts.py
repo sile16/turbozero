@@ -163,7 +163,7 @@ class MCTSBenchmarkBase(BaseBenchmark):
         
         return next_env_state, next_eval_state
     
-    def step_batch_with_reset(self, key: chex.PRNGKey, env_states: chex.ArrayTree, eval_states: chex.ArrayTree):
+    def step_batch_with_reset(self, key: chex.PRNGKey, env_states: chex.ArrayTree, eval_states: chex.ArrayTree, *args):
         """Step a batch of environments with reset handling."""
         step_keys, reset_keys = jax.random.split(key, 2)
         batch_step_keys = jax.random.split(step_keys, self.batch_size)
@@ -194,7 +194,7 @@ class MCTSBenchmarkBase(BaseBenchmark):
         final_env_states = jax.tree_util.tree_map(where_terminated, next_env_states, reset_env_states)
         final_eval_states = jax.tree_util.tree_map(where_terminated, next_eval_states, reset_eval_states)
         
-        return final_env_states, final_eval_states, terminated
+        return final_env_states, final_eval_states
     
     def benchmark_batch_size(self, batch_size: int, max_duration: int = DEFAULT_BENCHMARK_DURATION) -> Tuple[BatchBenchResult, int]:
         """Run benchmark for a specific batch size."""
@@ -238,7 +238,7 @@ class MCTSBenchmarkBase(BaseBenchmark):
             jax.block_until_ready(new_states)
             print("Warm-up complete", flush=True)
             # pylint: enable=not-callable
-            return new_states
+            env_states, eval_states = new_states  # Update states after warm-up
         except Exception as e:
             print(f"Error warming up: {e}", flush=True)
             return None
@@ -258,14 +258,12 @@ class MCTSBenchmarkBase(BaseBenchmark):
         with tqdm(total=max_duration, desc=f"MCTS B={batch_size} S={self.num_simulations}", unit="s") as pbar:
             while (elapsed_time := time.time() - start_time) < max_duration:
                 # Run iteration
-                result = self.run_benchmark_iteration(step_fn, [env_states, eval_states], pbar, start_time, max_duration)
-                if result is None:
-                    break
-                    
-                env_states, eval_states, terminated = result
+                key, subkey = jax.random.split(key)
+                new_states = step_fn(subkey, env_states, eval_states)
+                env_states, eval_states = new_states
                 
                 # Update statistics
-                active_mask = ~terminated
+                active_mask = ~env_states.terminated
                 moves_this_step = np.sum(active_mask)
                 total_moves += moves_this_step
                 current_game_moves[active_mask] += 1
@@ -279,6 +277,7 @@ class MCTSBenchmarkBase(BaseBenchmark):
                     print(f"Error getting node count: {e}", flush=True)
                 
                 # Process completed games
+                terminated = env_states.terminated
                 if np.any(terminated):
                     terminated_indices = np.where(terminated)[0]
                     for i in terminated_indices:

@@ -339,7 +339,14 @@ def generate_benchmark_plots(
     
     system_info = get_system_info()
     platform_name = system_info["platform"].lower()
-    processor_name = system_info["processor"].lower()
+    processor_name = system_info["processor"].lower().split()[0]  # Take just the first part
+    
+    # Create a simple timestamp if none provided
+    if timestamp is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    else:
+        # Clean up timestamp to ensure valid filename
+        timestamp = "".join(c for c in timestamp if c.isalnum() or c in "_-")[:50]  # Limit length
     
     # Extract metrics for plotting
     moves_per_second = [result.moves_per_second for result in metrics_data]
@@ -395,9 +402,9 @@ def generate_benchmark_plots(
     
     plt.tight_layout()
     
-    # Define filenames
-    timestamp_str = f"_{timestamp}" if timestamp else ""
-    performance_plot_path = results_dir / f"{platform_name}_{processor_name}{timestamp_str}.png"
+    # Define filenames with a simpler format
+    base_filename = f"{platform_name}_{processor_name}_{timestamp}"
+    performance_plot_path = results_dir / f"{base_filename}_perf.png"
     
     plt.savefig(performance_plot_path, dpi=120)
     plt.close()
@@ -433,7 +440,7 @@ def generate_benchmark_plots(
     plt.grid(True, alpha=0.3)
     plt.legend()
     
-    memory_plot_path = results_dir / f"{platform_name}_{processor_name}_memory{timestamp_str}.png"
+    memory_plot_path = results_dir / f"{base_filename}_mem.png"
     plt.savefig(memory_plot_path, dpi=120)
     plt.close()
     
@@ -670,6 +677,16 @@ class BaseBenchmark:
     
     def save_profile(self, results: List[BatchBenchResult], extra_info: Dict[str, Any] = None):
         """Save benchmark results to a profile."""
+        # Convert JAX arrays to Python types
+        def convert_to_python(value):
+            if isinstance(value, (jnp.ndarray, jax.Array)):
+                return float(value)  # Convert to Python float
+            if isinstance(value, (list, tuple)):
+                return [convert_to_python(v) for v in value]
+            if isinstance(value, dict):
+                return {k: convert_to_python(v) for k, v in value.items()}
+            return value
+
         profile_data = {
             # System info
             "platform": self.system_info["platform"],
@@ -686,14 +703,14 @@ class BaseBenchmark:
             
             # Results
             "batch_sizes": [r.batch_size for r in results],
-            "moves_per_second": [r.moves_per_second for r in results],
-            "games_per_second": [r.games_per_second for r in results],
-            "memory_usage_gb": [r.memory_usage_gb for r in results],
+            "moves_per_second": [float(r.moves_per_second) for r in results],
+            "games_per_second": [float(r.games_per_second) for r in results],
+            "memory_usage_gb": [float(r.memory_usage_gb) for r in results],
         }
         
         # Add any extra info
         if extra_info:
-            profile_data.update(extra_info)
+            profile_data.update({k: convert_to_python(v) for k, v in extra_info.items()})
         
         # Create filename
         filename = f"{self.system_info['platform'].lower()}_{self.name.lower()}.json"
