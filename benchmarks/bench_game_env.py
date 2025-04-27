@@ -74,6 +74,7 @@ class BatchBenchResult:
     batch_size: int
     moves_per_second: float = 0.0
     games_per_second: float = 0.0
+    moves_per_second_per_game: float = 0.0
     avg_game_length: float = 0.0
     median_game_length: float = 0.0
     min_game_length: float = float('inf')
@@ -131,13 +132,25 @@ def benchmark_batch_size(batch_size: int, max_duration: int = 120) -> 'BatchBenc
 
     # Initialize environment
     print("Initializing environment...", flush=True)
-    env = bg.Backgammon(simple_doubles=True) # Defined globally now
-    num_stochastic_outcomes = len(env.stochastic_action_probs) # Assuming stochastic_action_probs exists
+    env = bg.Backgammon(simple_doubles=True)
+    num_stochastic_outcomes = len(env.stochastic_action_probs)
+
+    # Memory profiling
+    def print_memory_usage(stage: str):
+        """Print current memory usage for a given stage."""
+        if jax.default_backend() == 'gpu':
+            memory = jax.devices()[0].memory_stats()
+            used_gb = memory['bytes_in_use'] / (1024**3)
+            print(f"Memory usage at {stage}: {used_gb:.2f} GB", flush=True)
+        else:
+            print(f"Memory profiling not available for {jax.default_backend()} backend", flush=True)
+
+    print_memory_usage("after env init")
 
     # Check if the environment has a 'reset' method, otherwise alias 'init'
     if not hasattr(env, 'reset'):
         print("Warning: Environment does not have a 'reset' method. Using 'init' as 'reset'.", flush=True)
-        env.reset = env.init # Alias init to reset if reset doesn't exist
+        env.reset = env.init
 
     # ---- Define step functions ----
     print("Defining step functions (with integrated reset)...", flush=True)
@@ -146,21 +159,19 @@ def benchmark_batch_size(batch_size: int, max_duration: int = 120) -> 'BatchBenc
     def step_single_state(key, state):
         """Step a single state (original logic)."""
         key1, key2 = jax.random.split(key, 2)
-        is_stochastic = jnp.bool_(state.is_stochastic) # Assuming is_stochastic exists
+        is_stochastic = jnp.bool_(state.is_stochastic)
         legal_actions_mask = state.legal_action_mask
 
-        # Use a dummy key for the unused branch in cond
-        dummy_key = jax.random.PRNGKey(0)
-
-        # Sample random action ONLY if needed (non-stochastic branch)
         action = random_action_from_mask(key2, legal_actions_mask)
 
         return jax.lax.cond(
             is_stochastic,
             lambda _: env.stochastic_step(state, jax.random.randint(key1, (), 0, num_stochastic_outcomes)),
-            lambda act_key: env.step(state, act_key[0], act_key[1]), # Pass action and key
-            operand=(action, key2) # Pass action and key as operand
+            lambda act_key: env.step(state, act_key[0], act_key[1]),
+            operand=(action, key2)
         )
+
+    print_memory_usage("after step_single_state definition")
 
     # Define the batch step with reset function
     def step_batch_with_reset(key, states):
@@ -169,27 +180,22 @@ def benchmark_batch_size(batch_size: int, max_duration: int = 120) -> 'BatchBenc
         batch_step_keys = jax.random.split(step_keys, batch_size)
         batch_reset_keys = jax.random.split(reset_keys, batch_size)
 
-        # Vmap the single state step function across the batch
         vectorized_step = jax.vmap(step_single_state, in_axes=(0, 0))
         next_states = vectorized_step(batch_step_keys, states)
 
-        # Check termination status *after* the step
-        terminated = next_states.terminated # Assuming terminated is a boolean array [B]
+        terminated = next_states.terminated
 
-        # Get newly initialized states for those that terminated
-        # vmap the environment's reset function
         vectorized_reset = jax.vmap(env.reset, in_axes=(0,))
         reset_states = vectorized_reset(batch_reset_keys)
 
-        # Conditionally select: if terminated, use reset_state, otherwise use next_state
-        # We need to apply this selection across the entire state PyTree
         final_states = jax.tree_util.tree_map(
             lambda next_s, reset_s: jnp.where(terminated.reshape(-1, *([1]*(next_s.ndim-1))), reset_s, next_s),
             next_states,
             reset_states
         )
-        # Also return the termination mask for stats tracking outside JIT
         return final_states, terminated
+
+    print_memory_usage("after step_batch_with_reset definition")
 
     # Initialize batch of states using vmap
     print(f"Initializing {batch_size} states...", flush=True)
@@ -198,35 +204,29 @@ def benchmark_batch_size(batch_size: int, max_duration: int = 120) -> 'BatchBenc
     init_keys = jax.random.split(init_key, batch_size)
     state = jax.vmap(env.init)(init_keys)
 
+    print_memory_usage("after state initialization")
+
     # Compile step function
-    step_fn = jax.jit(step_batch_with_reset)  # type: ignore[assignment]
+    step_fn = jax.jit(step_batch_with_reset)
     
     # Warmup compilation
     print("Compiling and warming up...", flush=True)
     try:
         print("First compilation pass...", flush=True)
         key, subkey = jax.random.split(key)
-        # step_fn now returns (new_state, terminated_mask)
-        # pylint: disable=not-callable
         new_state, _ = step_fn(subkey, state)
-        jax.block_until_ready(new_state) # Wait for compilation/execution
-        print("Initial compilation successful", flush=True)
+        jax.block_until_ready(new_state)
+        print_memory_usage("after first compilation")
         
         print("Running warm-up iterations...", flush=True)
-        for i in range(4): # Fewer iterations might suffice now
+        for i in range(4):
             key, subkey = jax.random.split(key)
-            new_state, _ = step_fn(subkey, new_state)  # pylint: disable=not-callable
+            new_state, _ = step_fn(subkey, new_state)
         jax.block_until_ready(new_state)
-        print("Warm-up complete", flush=True)
-        state = new_state # Start benchmark with the state after warm-up
-        # pylint: enable=not-callable
+        print_memory_usage("after warm-up")
+        state = new_state
     except Exception as e:
         print(f"Error during compilation/warm-up: {e}", flush=True)
-        # If the error is AttributeError: 'Backgammon' object has no attribute 'reset'
-        # it means the alias logic didn't work or reset is truly needed but missing.
-        if "has no attribute 'reset'" in str(e):
-             print("ERROR: The environment object does not have a 'reset' method, and aliasing 'init' failed or is insufficient.", flush=True)
-             print("       Please ensure the environment provides a 'reset' method with the signature `reset(self, key)`.", flush=True)
         raise
 
     # ---- Benchmark ----
@@ -353,7 +353,7 @@ def benchmark_batch_size(batch_size: int, max_duration: int = 120) -> 'BatchBenc
 
     moves_per_second = total_moves / final_elapsed_time if final_elapsed_time > 0 else 0
     games_per_second = completed_games / final_elapsed_time if final_elapsed_time > 0 else 0
-    moves_per_sec_per_game = moves_per_second / batch_size if batch_size > 0 else 0
+    moves_per_second_per_game = moves_per_second / games_per_second if games_per_second > 0 else 0
     efficiency = moves_per_second / peak_memory_gb if peak_memory_gb > 0 else 0
     avg_game_length = total_moves_in_completed_games / completed_games if completed_games > 0 else 0
     median_game_length = np.median(game_lengths) if game_lengths else 0
@@ -372,12 +372,12 @@ def benchmark_batch_size(batch_size: int, max_duration: int = 120) -> 'BatchBenc
     try:
         print(f"Moves per second: {format_human_readable(moves_per_second)}/s", flush=True)
         print(f"Games per second (completed): {format_human_readable(games_per_second)}/s", flush=True)
-        print(f"Moves per second per game: {format_human_readable(moves_per_sec_per_game)}/s/game", flush=True)
+        print(f"Moves per second per game: {format_human_readable(moves_per_second_per_game)}/s/game", flush=True)
         print(f"Efficiency (Moves/s/GB): {format_human_readable(efficiency)}/GB", flush=True)
     except NameError:
         print(f"Moves per second: {moves_per_second:.2f}/s", flush=True)
         print(f"Games per second (completed): {games_per_second:.2f}/s", flush=True)
-        print(f"Moves per second per game: {moves_per_sec_per_game:.2f}/s/game", flush=True)
+        print(f"Moves per second per game: {moves_per_second_per_game:.2f}/s/game", flush=True)
         print(f"Efficiency (Moves/s/GB): {efficiency:.2f}/GB", flush=True)
     print(f"Peak Memory Usage: {peak_memory_gb:.2f}GB", flush=True)
 
@@ -392,6 +392,7 @@ def benchmark_batch_size(batch_size: int, max_duration: int = 120) -> 'BatchBenc
             batch_size=batch_size,
             moves_per_second=moves_per_second,
             games_per_second=games_per_second,
+            moves_per_second_per_game=moves_per_second_per_game,
             avg_game_length=avg_game_length,
             median_game_length=median_game_length,
             min_game_length=min_game_length,
@@ -404,7 +405,7 @@ def benchmark_batch_size(batch_size: int, max_duration: int = 120) -> 'BatchBenc
         print("Warning: BatchBenchResult class not found. Returning results as a dictionary.", flush=True)
         result = { # Fallback to dictionary
              'batch_size': batch_size, 'moves_per_second': moves_per_second, 'memory_usage_gb': peak_memory_gb,
-             'games_per_second': games_per_second, 'moves_per_second_per_game': moves_per_sec_per_game,
+             'games_per_second': games_per_second, 'moves_per_second_per_game': moves_per_second_per_game,
              'avg_game_length': avg_game_length, 'median_game_length': median_game_length,
              'min_game_length': min_game_length if game_lengths else 0, 'max_game_length': max_game_length,
              'total_moves': total_moves, 'completed_games': completed_games, 'elapsed_time': final_elapsed_time,
@@ -611,7 +612,7 @@ def validate_against_profile(profile: BenchmarkProfile, max_duration: int = 120)
             
             # Immediate feedback after each batch size validation
             print(f"COMPLETED validation for batch size {batch_size}: {format_human_readable(result.moves_per_second)} moves/s, "
-                  f"{format_human_readable(result.moves_per_second_per_game)} moves/s/game, "
+                  f"{format_human_readable(result.moves_per_second / result.games_per_second)} moves/s/game, "
                   f"{format_human_readable(result.games_per_second)} games/s, "
                   f"{result.memory_usage_gb:.2f}GB", flush=True)
     
