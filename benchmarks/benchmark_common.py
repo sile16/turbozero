@@ -40,7 +40,7 @@ class BatchBenchResult(NamedTuple):
     median_game_length: float
     min_game_length: float
     max_game_length: float
-    memory_gb: float
+    memory_usage_gb: float
     efficiency: float
     valid: bool = True
 
@@ -344,7 +344,7 @@ def generate_benchmark_plots(
     # Extract metrics for plotting
     moves_per_second = [result.moves_per_second for result in metrics_data]
     games_per_second = [result.games_per_second for result in metrics_data]
-    memory_usage = [result.memory_gb for result in metrics_data]
+    memory_usage = [result.memory_usage_gb for result in metrics_data]
     efficiency = [result.efficiency for result in metrics_data]
     
     # Create performance plot
@@ -555,7 +555,7 @@ def print_benchmark_summary(results: List[BatchBenchResult]) -> None:
     
     for result in valid_results:
         print(f"{result.batch_size:>7} | {result.moves_per_second:>12,.2f} | {result.games_per_second:>12,.2f} | "
-              f"{result.moves_per_second / result.batch_size:>10,.2f} | {result.memory_gb:>10,.2f} | "
+              f"{result.moves_per_second / result.batch_size:>10,.2f} | {result.memory_usage_gb:>10,.2f} | "
               f"{result.efficiency:>12,.2f}/GB | {result.avg_game_length:>10,.1f} | {result.median_game_length:>10,.1f} | "
               f"{result.min_game_length:>10} | {result.max_game_length:>10}")
     
@@ -608,3 +608,140 @@ def select_batch_sizes_for_profile(results: List[BatchBenchResult], num_sizes: i
             selected.extend(additional)
     
     return sorted(selected[:num_sizes])  # Return sorted list, capped at num_sizes 
+
+
+class BaseBenchmark:
+    """Base class for all benchmarks providing common functionality."""
+    
+    def __init__(self, name: str, description: str):
+        self.name = name
+        self.description = description
+        self.system_info = get_system_info()
+    
+    def warmup_compilation(self, step_fn, states, num_warmup=4):
+        """Common warmup and compilation logic."""
+        print("Compiling and warming up...", flush=True)
+        key = jax.random.PRNGKey(0)
+        
+        try:
+            print("First compilation pass...", flush=True)
+            key, subkey = jax.random.split(key)
+            # Pass states as a tuple
+            new_states = step_fn(subkey, states[0], states[1])
+            jax.block_until_ready(new_states)
+            print("Initial compilation successful", flush=True)
+            
+            print("Running warm-up iterations...", flush=True)
+            for _ in range(num_warmup):
+                key, subkey = jax.random.split(key)
+                # Pass states as a tuple
+                new_states = step_fn(subkey, new_states[0], new_states[1])
+            jax.block_until_ready(new_states)
+            print("Warm-up complete", flush=True)
+            return new_states
+            
+        except Exception as e:
+            print(f"Error during compilation/warm-up: {e}", flush=True)
+            raise
+    
+    def run_benchmark_iteration(self, step_fn, states, pbar, start_time, max_duration):
+        """Run a single benchmark iteration with progress tracking."""
+        current_time = time.time()
+        if current_time - start_time >= max_duration:
+            return None
+            
+        try:
+            # Execute step
+            key = jax.random.PRNGKey(0)
+            key, step_key = jax.random.split(key)
+            new_states = step_fn(step_key, *states)
+            jax.block_until_ready(new_states)
+            
+            # Update progress
+            elapsed = current_time - start_time
+            pbar.n = round(elapsed)
+            pbar.refresh()
+            
+            return new_states
+            
+        except Exception as e:
+            print(f"Error during benchmark iteration: {e}", flush=True)
+            return None
+    
+    def save_profile(self, results: List[BatchBenchResult], extra_info: Dict[str, Any] = None):
+        """Save benchmark results to a profile."""
+        profile_data = {
+            # System info
+            "platform": self.system_info["platform"],
+            "processor": self.system_info["processor"],
+            "jaxlib_type": self.system_info["jaxlib_type"],
+            "device_info": self.system_info["device_info"],
+            "python_version": self.system_info["python_version"],
+            "jax_version": self.system_info["jax_version"],
+            
+            # Benchmark info
+            "name": self.name,
+            "description": self.description,
+            "timestamp": datetime.now().isoformat(),
+            
+            # Results
+            "batch_sizes": [r.batch_size for r in results],
+            "moves_per_second": [r.moves_per_second for r in results],
+            "games_per_second": [r.games_per_second for r in results],
+            "memory_usage_gb": [r.memory_usage_gb for r in results],
+        }
+        
+        # Add any extra info
+        if extra_info:
+            profile_data.update(extra_info)
+        
+        # Create filename
+        filename = f"{self.system_info['platform'].lower()}_{self.name.lower()}.json"
+        filepath = PROFILE_DIR / filename
+        
+        # Save
+        PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(filepath, 'w') as f:
+            json.dump(profile_data, f, indent=2)
+        
+        print(f"Profile saved to {filepath}")
+        return filepath
+    
+    def load_profile(self) -> Optional[Dict[str, Any]]:
+        """Load a matching profile for this benchmark."""
+        filename = f"{self.system_info['platform'].lower()}_{self.name.lower()}.json"
+        filepath = PROFILE_DIR / filename
+        
+        if filepath.exists():
+            print(f"Found matching profile: {filepath}", flush=True)
+            with open(filepath, 'r') as f:
+                return json.load(f)
+        
+        print(f"No matching profile found for {self.name}", flush=True)
+        return None 
+
+def print_summary_table(results: List[BatchBenchResult], title: str = None) -> None:
+    """Print a formatted summary table of benchmark results."""
+    if not results:
+        print("No results to display")
+        return
+        
+    if title:
+        print(f"\n=== {title} ===")
+    
+    header = (
+        f"{'Batch':>7} | {'Moves/s':>12} | {'Games/s':>12} | {'Mem (GB)':>10} | "
+        f"{'Efficiency':>12} | {'Avg Moves':>10}"
+    )
+    print(header)
+    print("-" * len(header))
+    
+    for result in results:
+        print(
+            f"{result.batch_size:>7} | "
+            f"{format_human_readable(result.moves_per_second):>12} | "
+            f"{format_human_readable(result.games_per_second):>12} | "
+            f"{result.memory_usage_gb:>10.2f} | "
+            f"{result.efficiency:>12.2f} | "
+            f"{result.avg_game_length:>10.1f}"
+        ) 

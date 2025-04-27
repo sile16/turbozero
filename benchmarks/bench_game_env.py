@@ -5,6 +5,11 @@ Benchmark for the pgx backgammon game environment.
 This script measures the performance of the backgammon environment in terms of moves per second
 for different batch sizes. It includes a discovery mode to find optimal batch sizes and 
 a validation mode to verify performance against previous runs.
+
+Note: Linter errors about step_fn and jitted_step not being callable can be safely ignored.
+These errors occur because the linter cannot understand JAX's JIT compilation and function
+transformations. The functions are properly defined and compiled at runtime through JAX's
+transformation system.
 """
 
 from calendar import c
@@ -53,7 +58,11 @@ from benchmarks.benchmark_common import (
     print_summary_table,
     get_cpu_gpu_usage,
     BenchmarkProfile,
+    BaseBenchmark,
 )
+
+# Import CLI utilities
+from benchmarks.benchmark_cli import parse_batch_sizes
 
 # Constants
 HUMAN_READABLE_UNITS = ["", "K", "M", "B", "T"]
@@ -64,17 +73,14 @@ class BatchBenchResult:
     """Holds the results from benchmarking a single batch size."""
     batch_size: int
     moves_per_second: float = 0.0
-    memory_usage_gb: float = 0.0
     games_per_second: float = 0.0
-    moves_per_second_per_game: float = 0.0
-    avg_moves_per_game: float = 0.0
-    median_moves_per_game: float = 0.0
-    min_moves_per_game: float = float('inf')
-    max_moves_per_game: float = 0.0
-    total_moves: int = 0
-    completed_games: int = 0
-    elapsed_time: float = 0.0
+    avg_game_length: float = 0.0
+    median_game_length: float = 0.0
+    min_game_length: float = float('inf')
+    max_game_length: float = 0.0
+    memory_usage_gb: float = 0.0
     efficiency: float = 0.0 # moves/s / GB
+    valid: bool = False
 
 
 def random_action_from_mask(key, mask):
@@ -192,29 +198,28 @@ def benchmark_batch_size(batch_size: int, max_duration: int = 120) -> 'BatchBenc
     init_keys = jax.random.split(init_key, batch_size)
     state = jax.vmap(env.init)(init_keys)
 
-    # Compile the step function with integrated reset
-    print("Compiling step function with reset...", flush=True)
+    # Compile step function
+    step_fn = jax.jit(step_batch_with_reset)  # type: ignore[assignment]
     
-    # Create and JIT-compile the step function - this should fix the linter error
-    step_fn = jax.jit(step_batch_with_reset)
-
-    # ---- Warm-up JIT compilation ----
+    # Warmup compilation
     print("Compiling and warming up...", flush=True)
     try:
         print("First compilation pass...", flush=True)
         key, subkey = jax.random.split(key)
         # step_fn now returns (new_state, terminated_mask)
+        # pylint: disable=not-callable
         new_state, _ = step_fn(subkey, state)
         jax.block_until_ready(new_state) # Wait for compilation/execution
         print("Initial compilation successful", flush=True)
-
+        
         print("Running warm-up iterations...", flush=True)
         for i in range(4): # Fewer iterations might suffice now
             key, subkey = jax.random.split(key)
-            new_state, _ = step_fn(subkey, new_state)
+            new_state, _ = step_fn(subkey, new_state)  # pylint: disable=not-callable
         jax.block_until_ready(new_state)
         print("Warm-up complete", flush=True)
         state = new_state # Start benchmark with the state after warm-up
+        # pylint: enable=not-callable
     except Exception as e:
         print(f"Error during compilation/warm-up: {e}", flush=True)
         # If the error is AttributeError: 'Backgammon' object has no attribute 'reset'
@@ -254,7 +259,9 @@ def benchmark_batch_size(batch_size: int, max_duration: int = 120) -> 'BatchBenc
 
                 # Execute the JIT-compiled step and reset function
                 # It returns the next state (with resets applied) and the termination mask
+                # pylint: disable=not-callable
                 state, terminated_mask_jax = step_fn(subkey, state)
+                # pylint: enable=not-callable
                 # Block until operations are complete on device before pulling data to host
                 jax.block_until_ready(state)
 
@@ -348,8 +355,10 @@ def benchmark_batch_size(batch_size: int, max_duration: int = 120) -> 'BatchBenc
     games_per_second = completed_games / final_elapsed_time if final_elapsed_time > 0 else 0
     moves_per_sec_per_game = moves_per_second / batch_size if batch_size > 0 else 0
     efficiency = moves_per_second / peak_memory_gb if peak_memory_gb > 0 else 0
-    avg_moves_per_game = total_moves_in_completed_games / completed_games if completed_games > 0 else 0
-    median_moves_per_game = np.median(game_lengths) if game_lengths else 0
+    avg_game_length = total_moves_in_completed_games / completed_games if completed_games > 0 else 0
+    median_game_length = np.median(game_lengths) if game_lengths else 0
+    min_game_length = min_moves_per_game if game_lengths else 0
+    max_game_length = max_moves_per_game if game_lengths else 0
 
     # --- Print Summary ---
     print("\nBenchmark complete! (Individual Reset)", flush=True)
@@ -373,36 +382,33 @@ def benchmark_batch_size(batch_size: int, max_duration: int = 120) -> 'BatchBenc
     print(f"Peak Memory Usage: {peak_memory_gb:.2f}GB", flush=True)
 
     print("--- Game Length Statistics (Completed Games) ---", flush=True)
-    print(f"Average moves per game: {avg_moves_per_game:.2f}", flush=True)
-    print(f"Median moves per game: {median_moves_per_game:.1f}", flush=True)
-    print(f"Minimum moves per game: {min_moves_per_game if game_lengths else 'N/A'}", flush=True)
-    print(f"Maximum moves (any game): {max_moves_per_game}", flush=True)
+    print(f"Average moves per game: {avg_game_length:.2f}", flush=True)
+    print(f"Median moves per game: {median_game_length:.1f}", flush=True)
+    print(f"Minimum moves per game: {min_game_length if game_lengths else 'N/A'}", flush=True)
+    print(f"Maximum moves (any game): {max_game_length}", flush=True)
 
     try:
         result = BatchBenchResult(
             batch_size=batch_size,
             moves_per_second=moves_per_second,
-            memory_usage_gb=peak_memory_gb,
             games_per_second=games_per_second,
-            moves_per_second_per_game=moves_per_sec_per_game,
-            avg_moves_per_game=avg_moves_per_game,
-            median_moves_per_game=median_moves_per_game,
-            min_moves_per_game=min_moves_per_game if game_lengths else 0,
-            max_moves_per_game=max_moves_per_game,
-            total_moves=total_moves,
-            completed_games=completed_games,
-            elapsed_time=final_elapsed_time,
-            efficiency=efficiency
+            avg_game_length=avg_game_length,
+            median_game_length=median_game_length,
+            min_game_length=min_game_length,
+            max_game_length=max_game_length,
+            memory_usage_gb=peak_memory_gb,
+            efficiency=efficiency,
+            valid=True
         )
     except NameError:
         print("Warning: BatchBenchResult class not found. Returning results as a dictionary.", flush=True)
         result = { # Fallback to dictionary
              'batch_size': batch_size, 'moves_per_second': moves_per_second, 'memory_usage_gb': peak_memory_gb,
              'games_per_second': games_per_second, 'moves_per_second_per_game': moves_per_sec_per_game,
-             'avg_moves_per_game': avg_moves_per_game, 'median_moves_per_game': median_moves_per_game,
-             'min_moves_per_game': min_moves_per_game if game_lengths else 0, 'max_moves_per_game': max_moves_per_game,
+             'avg_game_length': avg_game_length, 'median_game_length': median_game_length,
+             'min_game_length': min_game_length if game_lengths else 0, 'max_game_length': max_game_length,
              'total_moves': total_moves, 'completed_games': completed_games, 'elapsed_time': final_elapsed_time,
-             'efficiency': efficiency
+             'efficiency': efficiency, 'valid': True
         }
 
     return result
@@ -468,7 +474,7 @@ def discover_optimal_batch_sizes(
                 # Print a summary of the result
                 print(f"Completed benchmark for batch size {batch_size}: "
                       f"{format_human_readable(result.moves_per_second)}/s, "
-                      f"avg moves: {result.avg_moves_per_game:.1f}, "
+                      f"avg moves: {result.avg_game_length:.1f}, "
                       f"memory: {result.memory_usage_gb:.2f}GB", flush=True)
                 
                 all_results.append(result)
@@ -802,8 +808,15 @@ def run_benchmark(args: argparse.Namespace) -> None:
     for key, value in system_info.items():
         print(f"{key}: {value}", flush=True)
     
-    # Set the target game count (with default value if not specified)
-    target_game_count = args.target_game_count if args.target_game_count else 1000
+    # Parse custom batch sizes if provided
+    custom_batch_sizes = None
+    if args.batch_sizes:
+        try:
+            custom_batch_sizes = parse_batch_sizes(args.batch_sizes)
+            print(f"Using custom batch sizes: {custom_batch_sizes}", flush=True)
+        except ValueError as e:
+            print(str(e), flush=True)
+            sys.exit(1)
     
     # Check if profile exists
     profile = load_profile()
@@ -848,24 +861,24 @@ def run_benchmark(args: argparse.Namespace) -> None:
 
 def main():
     """Main entry point for the benchmark script."""
-    parser = argparse.ArgumentParser(description="Benchmark for pgx backgammon game environment")
-    parser.add_argument("--discover", action="store_true", help="Force discovery mode even if profile exists")
-    parser.add_argument("--memory-limit", type=float, default=DEFAULT_MEMORY_LIMIT_GB,
-                        help=f"Memory limit in GB (default: {DEFAULT_MEMORY_LIMIT_GB})")
-    parser.add_argument("--duration", type=int, default=120,
-                        help=f"Maximum duration of each batch size test in seconds (default: 120)")
+    from benchmarks.benchmark_cli import create_benchmark_parser, parse_batch_sizes
+    
+    parser = create_benchmark_parser(
+        description="Benchmark for pgx backgammon game environment",
+        include_mcts_args=False
+    )
+    
+    # Add game environment specific arguments
+    parser.add_argument("--discover", action="store_true",
+                       help="Force discovery mode even if profile exists")
     parser.add_argument("--target-game-count", type=int, default=1000,
-                        help="Target number of games to complete for consistent statistics (default: 1000)")
-    parser.add_argument("--single-batch", type=int, help="Test only a specific batch size")
-    parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
+                       help="Target number of games to complete for consistent statistics (default: 1000)")
     
     args = parser.parse_args()
     
     # If single batch mode is requested, just benchmark that batch size
     if args.single_batch:
         batch_size = args.single_batch
-        # target_game_count = args.target_game_count if args.target_game_count else 1000 # No longer used directly
-        
         print(f"Running single batch benchmark with batch size {batch_size}")
         print(f"Max duration: {args.duration}s")
         
