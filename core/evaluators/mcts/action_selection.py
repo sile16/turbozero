@@ -122,6 +122,7 @@ class PUCTSelector(MCTSActionSelector):
         # select action with highest PUCT value (from legal actions)
         return masked_puct_values.argmax()
     
+    
 
 class MuZeroPUCTSelector(MCTSActionSelector):
     """Implements the variant of PUCT used in MuZero."""

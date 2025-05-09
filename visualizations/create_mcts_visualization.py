@@ -67,6 +67,22 @@ def tree_to_graph(eval_state, output_dir, boards_dir):
         q_value = float(node_data.q)
         visit_count = int(node_data.n)
         
+        # Get parent and calculate discounted Q value
+        parent_idx = tree.parents[node_idx]
+        discounted_q = q_value
+        
+        # Add discounted Q value if parent exists
+        if parent_idx != tree.NULL_INDEX:
+            current_player = node_data.embedding.current_player
+            parent_player = tree.data_at(parent_idx).embedding.current_player
+            
+            # Calculate discount factor
+            player_diff = abs(current_player - parent_player)
+            discount_factor = 1.0 - 2.0 * player_diff
+            
+            # Apply discount
+            discounted_q = q_value * discount_factor
+        
         # Debug for each node
         if node_idx < 10:  # Limit to first 10 nodes to avoid spam
             print(f"DEBUG - Node {node_idx}: visits={visit_count}, q_value={q_value:.4f}")
@@ -87,7 +103,7 @@ def tree_to_graph(eval_state, output_dir, boards_dir):
         
         # Create node label
         player_id = node_data.embedding.current_player if hasattr(node_data.embedding, 'current_player') else 'N/A'
-        label = f"Node {node_idx}\\nPlayer: {player_id} (0=W, 1=B)\\nVisits: {visit_count}\\nQ: {q_value:.4f}"
+        label = f"Node {node_idx}\\nPlayer: {player_id} (0=W, 1=B)\\nVisits: {visit_count}\\nQ: {q_value:.4f}\\nDisc Q: {discounted_q:.4f}"
         # Add policy visualization (top 3 actions for brevity)
         if hasattr(node_data, 'p') and node_data.p is not None and visit_count > 0: # Only show for visited nodes with policy
             try:
@@ -191,30 +207,35 @@ def tree_to_graph(eval_state, output_dir, boards_dir):
 # Function to create backgammon evaluation function
 @jax.jit
 def backgammon_eval_fn(state, params, key):
-    """Simple evaluation function for backgammon."""
-    # Generate random policy logits for testing
-    policy_key, value_key = jax.random.split(key)
-    num_actions = len(state.legal_action_mask)
-    policy_logits = jax.random.normal(policy_key, shape=(num_actions,))
-    
-    # Calculate a simple value based on pip count difference
+    """Calculates value based on pip count difference. Ignores params/key.
+    The board is always from the current players perspective, 
+    current player is positive numbers opponent is negative."""
     board = state._board
-    p0_pips = jnp.sum(jnp.maximum(0, board[1:25]) * jnp.arange(1, 25)) + jnp.maximum(0, board[0]) * 25
-    p1_pips = jnp.sum(jnp.maximum(0, -board[1:25]) * (25 - jnp.arange(1, 25))) + jnp.maximum(0, -board[25]) * 25
+    pips = state._board[1:25]
     
-    total_pips = p0_pips + p1_pips + 1e-6
-    value = (p1_pips - p0_pips) / total_pips
+    # Calculate pip counts for current player and opponent
+    current_pips = jnp.sum(jnp.maximum(0, pips) * jnp.arange(1, 25, dtype=jnp.int32))
+    opponent_pips = jnp.sum(jnp.maximum(0, -pips) * jnp.arange(1, 25, dtype=jnp.int32))
     
-    # Adjust value for player perspective
-    value = jnp.where(state.current_player == 0, value, -value)
+    # Add born-off checkers with appropriate weights
+    # Using 25 points for born-off checkers (standard backgammon pip count)
+    current_born_off = board[26] * 25  # Current player's born-off checkers
+    opponent_born_off = board[27] * 25  # Opponent's born-off checkers
+    
+    # Calculate total pips for normalization
+    total_pips = current_pips + opponent_pips + current_born_off + opponent_born_off + 1e-6
+    
+    # Calculate normalized value between -1 and 1
+    # Positive value means current player is ahead
+    value = (opponent_pips + opponent_born_off - current_pips - current_born_off) / total_pips
     
     # Ensure stochastic states are not evaluated directly
     value = jnp.where(state.is_stochastic, jnp.nan, value)
-    policy_logits = jnp.where(state.is_stochastic, 
-                              jnp.ones_like(policy_logits) * jnp.nan,
-                              policy_logits)
     
-    return policy_logits, value
+    # Uniform policy over legal actions for greedy baseline
+    policy_logits = jnp.where(state.legal_action_mask, 0.5, -1.0)
+    
+    return policy_logits, jnp.array(value)
 
 # Function to create a step function for backgammon
 def backgammon_step_fn(env, state, action, key):

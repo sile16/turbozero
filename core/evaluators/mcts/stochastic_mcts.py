@@ -48,8 +48,8 @@ class StochasticMCTS(MCTS):
         self.stochastic_action_probs = stochastic_action_probs
         self.noise_scale = noise_scale
 
-    def stochastic_action_selector(self, key: chex.PRNGKey, tree, node_idx, discount):
-        """Select an action from the node, no use in exploring at this point so we just use the stochastic action probs.
+    def stochastic_action_sample(self, key: chex.PRNGKey, tree, node_idx, discount):
+        """Select an action from the node, not use in exploring at this point so we just use the stochastic action probs.
         i.e. we are rolling the dice to get the next deterministic state.
         
         Args:
@@ -63,20 +63,44 @@ class StochasticMCTS(MCTS):
         return jnp.array(action, dtype=jnp.int32)
     
     
-    def deterministic_action_selector(self, key: chex.PRNGKey, tree: MCTSTree, node_idx: int, discount: float) -> int:
-        """Just a wrapper function to call the action selector removing the key argument.
+    def deterministic_action_selector(self, key: chex.PRNGKey, tree: MCTSTree, node_idx: int) -> int:
+        """called when traversing the tree and exploring possibilities, a wrapper to remove the key
         
         Args:
         - `tree`: MCTSTree to evaluate
         - `node_idx`: index of the node to select an action from
         """
+
+        current_player = tree.data_at(node_idx).embedding.current_player
+            
+        # Get child players
+        child_indices = tree.edge_map[node_idx]
+        
+        # Safe access to child players
+        safe_indices = jnp.maximum(child_indices, 0)
+        child_players = tree.data.embedding.current_player[safe_indices]
+        
+        # Create a discount mask for each child based on player difference
+        # We want discount = -1.0 when players differ, 1.0 when same
+        # The PUCT selector will use this to adjust Q-values
+        discount = 1.0  # Default: use raw values (same player)
+        
+        # Check if ANY child has a different player (simple approach)
+        # If so, we need to tell PUCT to apply discount
+        # this will hold true for backgammon but isn't generalizable for all games, 
+        # would need to have the PUCT selector take a discount arrays for each child.
+
+        has_diff_player = jnp.any(jnp.abs(child_players - current_player))
+        discount = jnp.where(has_diff_player, -1.0, 1.0)
+
         return self.action_selector(tree, node_idx, discount)
     
-    def explore_stochastic_action_selector(self, key: chex.PRNGKey, tree, node_idx, discount):
+    def stochastic_action_selector(self, key: chex.PRNGKey, tree, node_idx):
         """Called when traversing the tree and exploring possibilities.
         
         Selects the action with the largest discrepancy between the child's observed
-        visit frequency and its theoretical stochastic probability.
+        visit frequency and its theoretical stochastic probability.  This works when probabilities
+        are fairly similar and there isn't some very unlikely action that results in a large reward. 
         
         Args:
         - `key`: rng
@@ -132,7 +156,7 @@ class StochasticMCTS(MCTS):
     
     
 
-    def cond_action_selector(self, key: chex.PRNGKey, tree: MCTSTree, node_idx: int, discount: float) -> int:
+    def cond_action_selector(self, key: chex.PRNGKey, tree: MCTSTree, node_idx: int) -> int:
         """Select an action from the node, picks the right action selector based on the node type.
         
         Args:
@@ -143,18 +167,34 @@ class StochasticMCTS(MCTS):
         # Create lambda functions that capture all required parameters
         return jax.lax.cond(
             StochasticMCTS.is_node_idx_stochastic(tree, node_idx), 
-            lambda k, t, n, d: self.explore_stochastic_action_selector(k, t, n, d),
-            lambda k, t, n, d: self.deterministic_action_selector(k, t, n, d),
-            key, tree, node_idx, discount
+            lambda k, t, n: self.stochastic_action_selector(k, t, n),
+            lambda k, t, n: self.deterministic_action_selector(k, t, n),
+            key, tree, node_idx
         )
         
     
     def det_value_policy(self, embedding, params, eval_key, metadata, player_reward) -> Tuple[float, chex.Array]:
         """Get value and policy for deterministic nodes."""
+        # For stochastic states, use the same approach as stochastic_value_policy
+        is_stochastic = embedding.is_stochastic
+        
+        # Get policy and value from eval_fn for deterministic states
         policy_logits, value = self.eval_fn(embedding, params, eval_key)
         policy_logits = jnp.where(metadata.action_mask, policy_logits, jnp.finfo(policy_logits).min)
         policy = jax.nn.softmax(policy_logits)
         value = jnp.where(metadata.terminated, player_reward, value)
+        
+        # For stochastic states, use uniform policy over legal actions
+        legal_actions = metadata.action_mask
+        num_legal_actions = jnp.sum(legal_actions)
+        uniform_prob = jnp.where(num_legal_actions > 0, 
+                                 1.0 / num_legal_actions, 
+                                 0.0)
+        
+        # Use uniform policy and 0.0 value for stochastic states
+        policy = jnp.where(is_stochastic, uniform_prob, policy)
+        value = jnp.where(is_stochastic, 0.0, value)
+        
         return value, policy
 
     def stochastic_value_policy(self, tree, parent_idx, embedding, params, eval_key, metadata, player_reward) -> Tuple[float, chex.Array]:
@@ -219,10 +259,12 @@ class StochasticMCTS(MCTS):
         
         # Evaluate leaf node - use different evaluation based on stochastic vs deterministic
         value, policy = jax.lax.cond(
-            is_stochastic,
-            lambda: self.stochastic_value_policy(tree, parent, new_embedding, params, eval_key, metadata, player_reward),
-            lambda: self.det_value_policy(new_embedding, params, eval_key, metadata, player_reward)
+           is_stochastic,
+           lambda: self.stochastic_value_policy(tree, parent, new_embedding, params, eval_key, metadata, player_reward),
+           lambda: self.det_value_policy(new_embedding, params, eval_key, metadata, player_reward)
         )
+        # Lets still eval, as a deterministic action was taken to arrive here.
+        #value, policy = self.det_value_policy(new_embedding, params, eval_key, metadata, player_reward)
         
         # add leaf node to tree
         node_exists = tree.is_edge(parent, action)
@@ -244,7 +286,7 @@ class StochasticMCTS(MCTS):
 
 
     def traverse(self, key: chex.PRNGKey, tree: MCTSTree) -> TraversalState:
-        """ Traverse from the root node until an unvisited leaf node is reached.
+        """Traverse from the root node until an unvisited leaf node is reached.
         
         Args:
         - `tree`: MCTSTree to evaluate
@@ -254,30 +296,23 @@ class StochasticMCTS(MCTS):
             - `parent`: index of the parent node
             - `action`: action to take from the parent node
         """
-
-        # continue while:
-        # - there is an existing edge corresponding to the chosen action
-        # - AND the child node connected to that edge is not terminal
-        def cond_fn(state: TraversalState) -> bool:
-            return jnp.logical_and(
-                tree.is_edge(state.parent, state.action),
-                ~(tree.data_at(tree.edge_map[state.parent, state.action]).terminated)
-                # TODO: maximum depth
-            )
-        
-        # each iterration:
-        # - get the index of the child node connected to the chosen action
-        # - choose the action to take from the child node
         def body_fn(state: TraversalState) -> TraversalState:
             node_idx = tree.edge_map[state.parent, state.action]
-            action = self.cond_action_selector(key, tree, node_idx, self.discount)
+            
+            # Get current node's player
+            
+            # Call action selector with calculated discount
+            action = self.cond_action_selector(key, tree, node_idx)
             return TraversalState(parent=node_idx, action=action)
         
-        # choose the action to take from the root
-        root_action = self.cond_action_selector(key, tree, tree.ROOT_INDEX, self.discount)
-        # traverse from root to leaf
+        root_action = self.cond_action_selector(key, tree, tree.ROOT_INDEX)
+        
         return jax.lax.while_loop(
-            cond_fn, body_fn, 
+            lambda s: jnp.logical_and(
+                tree.is_edge(s.parent, s.action),
+                ~(tree.data_at(tree.edge_map[s.parent, s.action]).terminated)
+            ),
+            body_fn,
             TraversalState(parent=tree.ROOT_INDEX, action=root_action)
         )
 
@@ -328,72 +363,113 @@ class StochasticMCTS(MCTS):
         env_step_fn: EnvStepFn,
         **kwargs
     ) -> MCTSOutput:
-        """Performs `self.num_iterations` MCTS iterations on an `MCTSTree`.
-        Samples an action to take from the root node after search is completed.
+        """.
+        Samples an action to take from the root based on it's stochastic actions.
         
         Args:
         - `eval_state`: `MCTSTree` to evaluate, could be empty or partially complete
 
         """
         # Get the action using stochastic_action_selector
-        action = self.stochastic_action_selector(key, eval_state, eval_state.ROOT_INDEX, self.discount)
+        action = self.stochastic_action_sample(key, eval_state, eval_state.ROOT_INDEX, self.discount)
         
         # return root node policy weights
         ## sum the policy weights of the node
         policy_weights = eval_state.data_at(eval_state.ROOT_INDEX).p
-        policy_weights_sum = jnp.sum(policy_weights)
+
+        ## I don't think we need to handle the case of where policy_weights_sum is 0
+        # policy_weights_sum = jnp.sum(policy_weights)
 
         # if policy_weights_sum is 0 lets call the eval function to get the policy weights
         # using lax.cond to avoid conditional branches in the graph
-        eval_key, key = jax.random.split(key)
+        # eval_key, key = jax.random.split(key)
         
         # Create a function to generate policy from eval_fn
-        def generate_policy(_):
-            policy_logits, _ = self.eval_fn(env_state, params, eval_key)
-            return jax.nn.softmax(policy_logits)
+        #def generate_policy(_):
+        #     policy_logits, _ = self.eval_fn(env_state, params, eval_key)
+        #    return jax.nn.softmax(policy_logits)
         
-        policy_weights = jax.lax.cond(
-            policy_weights_sum == 0,
-            generate_policy,
-            lambda _: policy_weights,
-            None  # Dummy operand, not used directly by either branch
-        )
+        # policy_weights = jax.lax.cond(
+        #     policy_weights_sum == 0,
+        #     generate_policy,
+        #     lambda _: policy_weights,
+        #     None  # Dummy operand, not used directly by either branch
+        # )
 
         return MCTSOutput(
             eval_state=eval_state,
             action=action,
             policy_weights=policy_weights
         )
+    
+    def calculate_discount_factor(self, tree: MCTSTree, node_idx: int, other_idx: int = None) -> float:
+        """Calculate discount factor to convert values between player perspectives.
+        
+        Args:
+            - `tree`: MCTSTree containing the nodes
+            - `node_idx`: Index of the current node
+            - `other_idx`: Index of the node to compare with
+                        
+        Returns:
+            - float: 1.0 if players are same, -1.0 if different
+        """
+        current_player = tree.data_at(node_idx).embedding.current_player
+        
+        # If other_idx is not provided or invalid, return 1.0 (no discount)
+        if other_idx is None or other_idx == tree.NULL_INDEX:
+            return 1.0
+        
+        # Get other player
+        other_player = tree.data_at(other_idx).embedding.current_player
+        
+        # Calculate discount factor
+        player_diff = jnp.abs(current_player - other_player)
+        return 1.0 - 2.0 * player_diff
 
-    def backpropagate(self, key: chex.PRNGKey, tree: MCTSTree, parent: int, value: float) -> MCTSTree: #pylint: disable=unused-argument
+    def backpropagate(self, key: chex.PRNGKey, tree: MCTSTree, parent: int, value: float) -> MCTSTree:
         """Backpropagate the value estimate from the leaf node to the root node and update visit counts.
         
         Args:
         - `key`: rng
         - `tree`: MCTSTree to evaluate
-        - `parent`: index of the parent node (in most cases, this is the new node added to the tree this iteration)
+        - `parent`: index of the parent node
         - `value`: value estimate of the leaf node
 
         Returns:
         - (MCTSTree): updated search tree
         """
-
-        def body_fn(state: BackpropState) -> Tuple[int, MCTSTree]:
+        def body_fn(state: BackpropState) -> BackpropState:
             node_idx, value, tree = state.node_idx, state.value, state.tree
-            # apply discount to value estimate
-            value *= self.discount
             node = tree.data_at(node_idx)
-            # increment visit count and update value estimate
+            
+            # Store raw value in current node (from node's own perspective)
             new_node = self.visit_node(node, value)
             tree = tree.update_node(node_idx, new_node)
-            # go to parent 
-            return BackpropState(node_idx=tree.parents[node_idx], value=value, tree=tree)
+            
+            # Apply discount ONLY for passing value to parent
+            # This adjusts the value to the parent's perspective
+            parent_idx = tree.parents[node_idx]
+            
+            # Get parent player safely (parent might be NULL_INDEX)
+            safe_parent_idx = jnp.maximum(parent_idx, 0)  # Use 0 as safe index if parent is NULL
+            is_valid_parent = parent_idx != tree.NULL_INDEX
+            
+            # Get player info
+            current_player = node.embedding.current_player
+            parent_player = tree.data_at(safe_parent_idx).embedding.current_player
+            
+            # Apply discount when players differ and parent is valid
+            player_diff = jnp.abs(current_player - parent_player)
+            discount_factor = 1.0 - 2.0 * player_diff
+            
+            # Only apply discount if parent is valid
+            value = jnp.where(is_valid_parent, value * discount_factor, value)
+            
+            return BackpropState(node_idx=parent_idx, value=value, tree=tree)
         
-        # backpropagate while the node is a valid node
-        # the root has no parent, so the loop will terminate 
-        # when the parent of the root is visited
         state = jax.lax.while_loop(
-            lambda s: s.node_idx != s.tree.NULL_INDEX, body_fn, 
+            lambda s: s.node_idx != s.tree.NULL_INDEX, 
+            body_fn, 
             BackpropState(node_idx=parent, value=value, tree=tree)
         )
         return state.tree
