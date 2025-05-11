@@ -65,19 +65,25 @@ def bg_step_fn(env: Env, state: bg.State, action: int, key: chex.PRNGKey) -> Tup
 
 
 # --- Pip Count Eval Fn (for test evaluator) ---
-@jax.jit
+
 def bg_pip_count_eval(state: chex.ArrayTree, params: chex.ArrayTree, key: chex.PRNGKey):
     """Calculates value based on pip count difference. Ignores params/key.
     The board is always from the current players perspective, 
     current player is positive numbers opponent is negative."""
     board = state._board
-    pips = state._board[1:25]
+    pips = state._board[0:24]
+    opponent_pips = -pips[::-1]
+
 
     jax.debug.print(f"[DEBUG-BG_PIP_COUNT_EVAL] Board: {board}")
     
     # Calculate pip counts for current player and opponent
-    current_pips = jnp.sum(jnp.maximum(0, pips) * jnp.arange(1, 25, dtype=jnp.int32))
-    opponent_pips = jnp.sum(jnp.maximum(0, -pips) * jnp.arange(1, 25, dtype=jnp.int32))
+    # make an array of 1, 2.2, 3.3, 4.4, 5.5, 6.6, 7.7, 8.8, 9.9, 10.10, 11.11, 12.12, 13.13, 14.14, 15.15, 16.16, 17.17, 18.18, 19.19, 20.20, 21.21, 22.22, 23.23
+    pip_weights = jnp.arange(0, 24, dtype=jnp.float32) + jnp.arange(0, 24, dtype=jnp.float32) / 10.0
+
+    # Calculate pip counts for current player and opponent
+    current_pips = jnp.sum(jnp.maximum(0, pips) * pip_weights)
+    opponent_pips = jnp.sum(jnp.maximum(0, opponent_pips) * pip_weights)
 
     jax.debug.print(f"[DEBUG-BG_PIP_COUNT_EVAL] Current pips: {current_pips}, Opponent pips: {opponent_pips}")
     jax.debug.print(f"[DEBUG-BG_PIP_COUNT_EVAL] Current born-off: {board[26]}, Opponent born-off: {board[27]}")
@@ -87,20 +93,12 @@ def bg_pip_count_eval(state: chex.ArrayTree, params: chex.ArrayTree, key: chex.P
     current_born_off = board[26] * 25  # Current player's born-off checkers
     opponent_born_off = board[27] * 25  # Opponent's born-off checkers
 
-    #jax.debug.print(f"[DEBUG-BG_PIP_COUNT_EVAL] Current born-off: {current_born_off}, Opponent born-off: {opponent_born_off}")
-    #jax.debug.print(f"[DEBUG-BG_PIP_COUNT_EVAL] Total pips: {total_pips}")
-    
-    # Calculate total pips for normalization
-    total_pips = current_pips + opponent_pips + current_born_off + opponent_born_off + 1e-6
-
-    #jax.debug.print(f"[DEBUG-BG_PIP_COUNT_EVAL] Total pips: {total_pips}")
-    
+    jax.debug.print(f"[DEBUG-BG_PIP_COUNT_EVAL] Current born-off: {current_born_off}, Opponent born-off: {opponent_born_off}")
     # Calculate normalized value between -1 and 1
     # Positive value means current player is ahead
-    value = (opponent_pips + opponent_born_off - current_pips - current_born_off) / total_pips
+    value = (current_pips + current_born_off - opponent_pips - opponent_born_off ) / 400
 
-    #jax.debug.print(f"[DEBUG-BG_PIP_COUNT_EVAL] Value: {value}")
-    #jax.debug.print(f"[DEBUG-BG_PIP_COUNT_EVAL] State: {state}")
+    jax.debug.print(f"[DEBUG-BG_PIP_COUNT_EVAL] Value: {value}")
     
     # Uniform policy over legal actions for greedy baseline
     policy_logits = jnp.where(state.legal_action_mask, 0.0, -jnp.inf)

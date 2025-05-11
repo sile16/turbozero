@@ -234,7 +234,7 @@ def create_real_mcts_visualization(output_dir):
         num_iterations=1,  # Use 1 iteration per step for step-by-step visualization
         stochastic_action_probs=backgammon_env.stochastic_action_probs,
         discount=-1.0,
-        temperature=0.0,
+        temperature=0.2,
         persist_tree=True,  # Critical to preserve tree between steps
     )
     
@@ -262,7 +262,7 @@ def create_real_mcts_visualization(output_dir):
     visualization_frames = []
     frame_idx = 0
     total_turns = 3 # Reduced to 2 turns for faster testing
-    iterations_per_deterministic_turn = 20 # Reduced to 5 iterations for faster visualization
+    iterations_per_deterministic_turn = 50 # Reduced to 5 iterations for faster visualization
 
     # Keep track of the latest board SVG paths relative to output_dir
     last_saved_curr_board_path = None

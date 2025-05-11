@@ -564,6 +564,28 @@ def test_get_value(stochastic_mcts, backgammon_env, key, mock_params):
     
     print("test_get_value PASSED")
 
+def test_bg_pip_count_eval():
+    env = bg.Backgammon()
+    state = env.init(jax.random.PRNGKey(0))
+    key = jax.random.PRNGKey(1)
+    
+    for x in range(6):
+        action_key, eval_key, key = jax.random.split(key, 3)
+        #jax.debug.print(f"")
+        policy, value = backgammon_eval_fn(state, None, eval_key)
+        
+        #assert jnp.isfinite(value), "Value should be finite"
+        #assert jnp.isclose(jnp.sum(policy), 1.0), "Policy should sum to 1"
+
+        if state.is_stochastic:
+            state = env.stochastic_step(state, 4)
+        else:
+            action_key, key = jax.random.split(key)
+            action = jnp.where(state.legal_action_mask)[0][0]
+            state = env.step(state, action, action_key)
+    print("test_bg_pip_count_eval PASSED")
+
+
 def test_evaluate_deterministic_root(stochastic_mcts, backgammon_env, key, mock_params):
     """Test the evaluate method with a deterministic root node."""
     key, init_key, eval_key = jax.random.split(key, 3)
@@ -716,7 +738,7 @@ def test_vmap_step_fn():
     key = jax.random.PRNGKey(0)
     key, subkey = jax.random.split(key)
     keys = jax.random.split(subkey, batch_size)
-    state = init_fn(keys)
+    state = init_fn(keys) # pylint: disable=not-callable
 
     # Run random simulation
     while not (state.terminated | state.truncated).all():
@@ -730,7 +752,7 @@ def test_vmap_step_fn():
         step_keys = jax.random.split(step_key_base, batch_size) # Shape: (batch_size, 2)
 
         # Call step_fn with batched state, batched action, and BATCHED keys
-        state = step_fn(state, action, step_keys)
+        state = step_fn(state, action, step_keys) # pylint: disable=not-callable
 
         # Optional: print something to see progress or state info
         # print(f"Step done. Terminated: {state.terminated.sum()}")
