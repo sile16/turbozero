@@ -1,10 +1,11 @@
-import os
+"""MCTS tests for backgammon."""
 import jax
 import jax.numpy as jnp
 import numpy as np
-import time
+
 import pytest
 import chex
+
 from typing import Tuple, Dict, Optional, Any
 from functools import partial
 
@@ -18,90 +19,17 @@ from core.evaluators.mcts.action_selection import PUCTSelector
 from core.trees.tree import Tree, init_tree
 from core.types import StepMetadata
 
+from bg.bgcommon import bg_step_fn, bg_pip_count_eval
+
 # Define the backgammon step function factory
 def backgammon_step_fn(env: bg.Backgammon):
     """Returns a step function closure for the backgammon environment."""
-    
-    def step_fn(state: State, action: int, key: chex.PRNGKey) -> Tuple[State, StepMetadata]:
-        """Combined step function for backgammon environment that handles both deterministic and stochastic actions."""
-        print(f"[DEBUG-BG_STEP-{time.time()}] Called with state (stochastic={state.is_stochastic}), action={action}")
-        
-        # Print action string outside JAX tracing context
-        if hasattr(state, 'is_stochastic') and isinstance(state.is_stochastic, bool):
-            if state.is_stochastic:
-                try:
-                    action_str = stochastic_action_to_str(action)
-                    print(f"[DEBUG-BG_STEP-{time.time()}] Stochastic action: {action_str}")
-                except Exception as e:
-                    print(f"[DEBUG-BG_STEP-{time.time()}] Could not convert stochastic action to string: {e}")
-            else:
-                try:
-                    action_str = action_to_str(action)
-                    print(f"[DEBUG-BG_STEP-{time.time()}] Deterministic action: {action_str}")
-                except Exception as e:
-                    print(f"[DEBUG-BG_STEP-{time.time()}] Could not convert deterministic action to string: {e}")
-        
-        # Handle stochastic vs deterministic branches
-        def stochastic_branch(s, a, k):
-            # Use env instance captured by closure
-            return env.stochastic_step(s, a)
-        
-        def deterministic_branch(s, a, k):
-            # Use env instance captured by closure
-            return env.step(s, a, k)
-        
-        # Use conditional to route to the appropriate branch
-        new_state = jax.lax.cond(
-            state.is_stochastic,
-            stochastic_branch,
-            deterministic_branch,
-            state, action, key
-        )
-        
-        # Create standard metadata
-        metadata = StepMetadata(
-            rewards=new_state.rewards,
-            action_mask=new_state.legal_action_mask,
-            terminated=new_state.terminated,
-            cur_player_id=new_state.current_player,
-            step=new_state._step_count
-        )
-        
-        return new_state, metadata
-    return step_fn
+    return partial(bg_step_fn, env)
 
 # Define an evaluation function that uses pip count heuristic for the value
 @jax.jit
 def backgammon_eval_fn(state: State, params: chex.ArrayTree, key: chex.PRNGKey) -> Tuple[chex.Array, float]:
-    """Simple evaluation function for backgammon based on pip count."""
-    print(f"[DEBUG-BG_EVAL_FN-{time.time()}] Evaluating state (stochastic={state.is_stochastic})")
-    
-    # Generate random policy logits for testing
-    policy_key, value_key = jax.random.split(key)
-    # Get num_actions from the legal_action_mask length
-    num_actions = len(state.legal_action_mask)
-    policy_logits = jax.random.normal(policy_key, shape=(num_actions,))
-    
-    # Calculate value based on pip count difference
-    board = state._board
-    p0_pips = jnp.sum(jnp.maximum(0, board[1:25]) * jnp.arange(1, 25)) + jnp.maximum(0, board[0]) * 25
-    p1_pips = jnp.sum(jnp.maximum(0, -board[1:25]) * (25 - jnp.arange(1, 25))) + jnp.maximum(0, -board[25]) * 25
-    
-    # Add epsilon to prevent division by zero
-    total_pips = p0_pips + p1_pips + 1e-6
-    value = (p1_pips - p0_pips) / total_pips
-    
-    # Adjust value for player perspective
-    value = jnp.where(state.current_player == 0, value, -value)
-    
-    # Ensure stochastic states are not evaluated directly
-    value = jnp.where(state.is_stochastic, jnp.nan, value)
-    policy_logits = jnp.where(state.is_stochastic, 
-                              jnp.ones_like(policy_logits) * jnp.nan,
-                              policy_logits)
-    
-    print(f"[DEBUG-BG_EVAL_FN-{time.time()}] Returning value={value}")
-    return policy_logits, value
+    return bg_pip_count_eval(state, params, key)
 
 
 # --- Fixtures ---
@@ -637,7 +565,7 @@ def test_persist_tree_false_stochastic_root(non_persistent_mcts, backgammon_env,
 def test_sequence_stoch_det_det_det_det_stoch(stochastic_mcts, backgammon_env, mock_params, key):
     """Test a sequence of game states in Backgammon.
     This tests the state transitions during play."""
-    import pdb
+    
     key, init_key = jax.random.split(key, 2)
     
     # Create the step function closure with the env instance

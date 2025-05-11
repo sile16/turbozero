@@ -10,6 +10,7 @@ from typing import Tuple
 import time
 import pytest
 import jax.tree_util
+import traceback
 
 from core.types import StepMetadata
 from core.evaluators.evaluation_fns import make_nn_eval_fn
@@ -32,6 +33,8 @@ from functools import partial
 from core.testing.utils import render_pgx_2p
 render_fn = partial(render_pgx_2p, p1_label='Black', p2_label='White', duration=900)
 
+from bg.bgcommon import bg_step_fn, bg_pip_count_eval, BGRandomEvaluator
+
 # --- Environment Setup ---
 env = bg.Backgammon(simple_doubles=True)
 NUM_ACTIONS = env.num_actions
@@ -45,41 +48,6 @@ print(f"Detected Observation Shape: {OBSERVATION_SHAPE}")
 STOCHASTIC_PROBS = env.stochastic_action_probs
 print(f"STOCHASTIC_PROBS: {STOCHASTIC_PROBS}")
 
-# --- Environment Interface Functions ---
-def stochastic_bg_step_fn(state: bg.State, action: int, key: chex.PRNGKey) -> Tuple[bg.State, StepMetadata]:
-    """Combined step function for backgammon environment that handles both deterministic and stochastic actions."""
-    # print(f"[DEBUG-BG_STEP-{time.time()}] Called with state (stochastic={state.is_stochastic}), action={action}") # Optional debug
-
-    # Handle stochastic vs deterministic branches
-    def stochastic_branch(operand):
-        s, a, _ = operand # state, action, key (key ignored for stochastic step)
-        # Use env instance captured by closure (assuming env is accessible in this scope)
-        return env.stochastic_step(s, a)
-
-    def deterministic_branch(operand):
-        s, a, k = operand # state, action, key
-        # Use env instance captured by closure
-        return env.step(s, a, k)
-
-    # Use conditional to route to the appropriate branch
-    # The key is only needed for the deterministic branch
-    new_state = jax.lax.cond(
-        state.is_stochastic,
-        stochastic_branch,
-        deterministic_branch,
-        (state, action, key) # Pass all required operands
-    )
-
-    # Create standard metadata
-    metadata = StepMetadata(
-        rewards=new_state.rewards,
-        action_mask=new_state.legal_action_mask,
-        terminated=new_state.terminated,
-        cur_player_id=new_state.current_player,
-        step=new_state._step_count
-    )
-
-    return new_state, metadata
 
 def init_fn(key):
     """Initializes a new environment state."""
@@ -118,77 +86,13 @@ class SimpleMLP(nn.Module):
         
         return policy_logits, jnp.squeeze(value, axis=-1)
 
-# --- Pip Count Eval Fn (for test evaluator) ---
-@jax.jit
-def backgammon_pip_count_eval(state: chex.ArrayTree, params: chex.ArrayTree, key: chex.PRNGKey):
-    """Calculates value based on pip count difference. Ignores params/key."""
-    board = state._board
-    pips = state._board[1:25]
-    
-    born_off_current = board[26] * 30
-    born_off_opponent = board[27] * 30
-    
-    #ignore bar, basically 0 points per pip on bar
-    
-    point_map = jnp.arange(1, 25, dtype=jnp.int32)
-    
-    value = jnp.sum(pips * point_map) + born_off_current + born_off_opponent
-    
-    # Uniform policy over legal actions for greedy baseline
-    policy_logits = jnp.where(state.legal_action_mask, 0.0, -jnp.inf)
-    
-    return policy_logits, jnp.array(value)
-
-
 # --- Neural Network ---
 mlp_policy_value_net = SimpleMLP(num_actions=NUM_ACTIONS, hidden_dim=32)
 
-# --- Random Evaluator ---
-class RandomEvaluator(Evaluator):
-    """An evaluator that selects actions randomly from legal moves."""
 
-    def __init__(self, discount: float = -1.0):
-        """Initializes the RandomEvaluator."""
-        super().__init__(discount=discount)
-
-    def evaluate(self, key: chex.PRNGKey, eval_state: chex.ArrayTree, env_state: chex.ArrayTree,
-                 root_metadata: StepMetadata, params: chex.ArrayTree, env_step_fn: EnvStepFn, **kwargs) -> EvalOutput:
-        """Chooses a random legal action."""
-        action_mask = root_metadata.action_mask
-        num_actions = action_mask.shape[-1]
-        
-        # Create uniform policy over legal actions
-        legal_actions_count = jnp.sum(action_mask)
-        uniform_prob = jnp.where(legal_actions_count > 0, 1.0 / legal_actions_count, 0.0)
-        policy_weights = jnp.where(action_mask, uniform_prob, 0.0)
-        
-        # Sample a random action from the legal ones
-        action = jax.random.choice(key, jnp.arange(num_actions), p=policy_weights)
-        
-        return EvalOutput(
-            eval_state=eval_state, 
-            action=action,
-            policy_weights=policy_weights
-        )
-
-    def get_value(self, state: chex.ArrayTree) -> chex.Array:
-        """Returns a zero value estimate."""
-        return jnp.array(0.0)
-
-    def init(self, template_embedding: chex.ArrayTree, *args, **kwargs) -> chex.ArrayTree:
-        """Initializes the dummy state (can be empty)."""
-        return jnp.array(0) # Return a minimal placeholder state
-
-    def reset(self, state: chex.ArrayTree) -> chex.ArrayTree:
-        """Resets the dummy state."""
-        return state # Stateless, nothing to reset
-
-    def step(self, state: chex.ArrayTree, action: int) -> chex.ArrayTree:
-        """Updates the dummy state (no change needed)."""
-        return state # Stateless, nothing to update based on action
 
 # Instantiate the Random Evaluator
-random_evaluator = RandomEvaluator()
+random_evaluator = BGRandomEvaluator()
 
 # --- Evaluators ---
 # Training evaluator: StochasticMCTS using NN
@@ -214,7 +118,7 @@ evaluator_test = StochasticMCTS(   #Use optimized moves, temperature=0.0
 
 # Test evaluator: Regular MCTS using pip count
 pip_count_mcts_evaluator_test = StochasticMCTS(  # optimizes for moves
-    eval_fn=backgammon_pip_count_eval, # Use pip count eval fn
+    eval_fn=bg_pip_count_eval, # Use pip count eval fn
     stochastic_action_probs=STOCHASTIC_PROBS,
     num_iterations=20, # Give it slightly more iterations maybe
     max_nodes=100,
@@ -241,7 +145,7 @@ trainer = StochasticTrainer(
     evaluator=evaluator, 
     memory_buffer=replay_memory,
     max_episode_steps=500,  
-    env_step_fn=stochastic_bg_step_fn,
+    env_step_fn=partial(bg_step_fn, env),
     env_init_fn=init_fn,
     state_to_nn_input_fn=state_to_nn_input,
     testers=[
@@ -280,7 +184,7 @@ def test_backgammon_training_loop():
         assert output is not None # Basic check to ensure it ran
     except Exception as e:
         print(f"An error occurred during training: {e}")
-        import traceback
+        
         traceback.print_exc()
         pytest.fail(f"Training loop failed with exception: {e}")
 

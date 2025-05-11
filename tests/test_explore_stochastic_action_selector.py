@@ -1,13 +1,13 @@
-import pytest
 import jax
 import jax.numpy as jnp
-import chex
 from flax.struct import dataclass
+
 
 from core.evaluators.mcts.stochastic_mcts import StochasticMCTS
 from core.evaluators.mcts.state import MCTSNode, MCTSTree
 from core.evaluators.mcts.action_selection import PUCTSelector
 from core.trees.tree import init_tree
+
 
 
 def dummy_eval_fn(state, params, key):
@@ -28,7 +28,6 @@ def test_explore_stochastic_action_selector_manual():
     relative to their expected probabilities.
     """
     # Set up parameters
-    branching_factor = 3
     stochastic_probs = jnp.array([0.2, 0.5, 0.3])
     
     # Create visit counts for children
@@ -129,7 +128,7 @@ def test_explore_stochastic_action_selector():
             tree = tree.add_node(parent_index=tree.ROOT_INDEX, edge_index=i, data=child_node)
     
     # Now call explore_stochastic_action_selector
-    action = evaluator.explore_stochastic_action_selector(key, tree, tree.ROOT_INDEX, -1.0)
+    action = evaluator.stochastic_action_selector(key, tree, tree.ROOT_INDEX)
     
     # Calculate expected deltas for verification
     child_visit_percents = jnp.array([0.1, 0.1, 0.4, 0.1, 0.3, 0.0])
@@ -205,7 +204,7 @@ def test_explore_stochastic_action_selector_with_missing_children():
         tree = tree.add_node(parent_index=tree.ROOT_INDEX, edge_index=edge_idx, data=child_node)
     
     # Now call explore_stochastic_action_selector
-    action = evaluator.explore_stochastic_action_selector(key, tree, tree.ROOT_INDEX, -1.0)
+    action = evaluator.stochastic_action_selector(key, tree, tree.ROOT_INDEX)
     
     # Calculate expected visit percentages, treating missing children as 0 visits
     total_visits = 15  # Sum of all visit counts (5 + 0 + 10 + 0 + 0 + 0)

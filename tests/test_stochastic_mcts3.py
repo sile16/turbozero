@@ -1,69 +1,19 @@
+"""MCTS tests for backgammon."""
+from functools import partial
 import jax
 import jax.numpy as jnp
-from functools import partial
+
 
 import pgx.backgammon as bg
 from core.evaluators.mcts.stochastic_mcts import StochasticMCTS
 from core.evaluators.mcts.action_selection import PUCTSelector
 from core.types import StepMetadata
-import chex
-from chex import ArrayTree, PRNGKey
 
 env = bg.Backgammon(simple_doubles=True)
 
-@jax.jit
-def backgammon_eval_fn(state: chex.ArrayTree, params: chex.ArrayTree, key: chex.PRNGKey):
-    """Calculates value based on pip count difference. Ignores params/key."""
-    board = state._board
-    pips = state._board[1:25]
-    
-    born_off_current = board[26] * 30
-    born_off_opponent = board[27] * 30
-    
-    #ignore bar, basically 0 points per pip on bar
-    
-    point_map = jnp.arange(1, 25, dtype=jnp.int32)
-    
-    value = jnp.sum(pips * point_map) + born_off_current + born_off_opponent
-    
-    # Uniform policy over legal actions for greedy baseline
-    policy_logits = jnp.where(state.legal_action_mask, 0.0, -jnp.inf)
-    
-    return policy_logits, jnp.array(value)
+from bg.bgcommon import bg_step_fn 
+from bg.bgcommon import bg_pip_count_eval
 
-
-
-def backgammon_step_fn(state: bg.State, action: int, key: chex.PRNGKey):
-    """Step function for backgammon that handles both deterministic and stochastic actions."""
-    # Handle stochastic vs deterministic branches
-    def stochastic_branch(s, a, k):
-        # Stochastic steps don't use a key in PGX v1
-        return env.stochastic_step(s, a)
-
-    def deterministic_branch(s, a, k):
-        # Deterministic steps require a key
-        return env.step(s, a, k)
-
-    # Use conditional to route to the appropriate branch
-    new_state = jax.lax.cond(
-        state.is_stochastic,
-        stochastic_branch,
-        deterministic_branch,
-        state, action, key # Pass key only needed by deterministic branch
-    )
-
-    # Create standard metadata
-    metadata = StepMetadata(
-        rewards=new_state.rewards,
-        action_mask=new_state.legal_action_mask,
-        terminated=new_state.terminated,
-        cur_player_id=new_state.current_player,
-        step=new_state._step_count # Assuming _step_count exists
-    )
-
-    return new_state, metadata
-
-# --- Test Case ---
 
 def test_stochastic_mcts_backgammon_simple_doubles_valid_actions():
     """
@@ -73,7 +23,9 @@ def test_stochastic_mcts_backgammon_simple_doubles_valid_actions():
     Player 1: num_iterations=6, persist_tree=False
     """
     key = jax.random.PRNGKey(44) # Use a different seed
-    env = bg.Backgammon(simple_doubles=True)
+    
+    backgammon_step_fn = partial(bg_step_fn, env)
+    backgammon_eval_fn = bg_pip_count_eval
 
     # --- MCTS setup for two players ---
     mcts_p0 = StochasticMCTS(
@@ -219,12 +171,13 @@ def test_traverse_through_stochastic_nodes():
     
 
     state = env.init(init_key)
+    backgammon_step_fn = partial(bg_step_fn, env)
     
     state, metadata = backgammon_step_fn(state, 3, step_key) # dice roll of 4-4
     
     # Set up MCTS with high iteration count for deep exploration
     mcts = StochasticMCTS(
-        eval_fn=backgammon_eval_fn,
+        eval_fn=bg_pip_count_eval,
         action_selector=PUCTSelector(),
         branching_factor=env.num_actions,
         max_nodes=500,  # Large enough to store many nodes

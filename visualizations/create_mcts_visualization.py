@@ -6,6 +6,7 @@ without relying on the actual MCTS implementation.
 """
 
 import os
+from pathlib import Path
 from functools import partial
 import json
 import graphviz
@@ -26,6 +27,7 @@ import pgx.backgammon as bg
 from core.evaluators.mcts.stochastic_mcts import StochasticMCTS
 from core.evaluators.mcts.action_selection import PUCTSelector
 from core.types import StepMetadata
+from bg.bgcommon import bg_pip_count_eval, bg_step_fn
 
 # Create a sample Backgammon environment for action labels and SVG generation
 backgammon_env = bg.Backgammon(simple_doubles=True)
@@ -116,21 +118,21 @@ def tree_to_graph(eval_state, output_dir, boards_dir):
                 for idx in top_indices:
                     prob = policy_array[idx]
                     if prob > 0.001: # Threshold to avoid tiny noise
-                         # Attempt to get action string, fallback to index
-                         try:
-                             # Determine if the node itself is stochastic to hint at action type
-                             is_stochastic_node = StochasticMCTS.is_node_idx_stochastic(tree, node_idx)
-                             if is_stochastic_node:
-                                 action_label = bg.stochastic_action_to_str(idx)
-                             else:
-                                 action_label = bg.action_to_str(idx)
-                         except:
-                             action_label = f"A:{idx}" # Fallback label
-                         policy_str_parts.append(f"{action_label}={prob:.2f}")
+                        # Attempt to get action string, fallback to index
+                        try:
+                            # Determine if the node itself is stochastic to hint at action type
+                            is_stochastic_node = StochasticMCTS.is_node_idx_stochastic(tree, node_idx)
+                            if is_stochastic_node:
+                                action_label = bg.stochastic_action_to_str(idx)
+                            else:
+                                action_label = bg.action_to_str(idx)
+                        except:
+                            action_label = f"A:{idx}" # Fallback label
+                        policy_str_parts.append(f"{action_label}={prob:.2f}")
                 if policy_str_parts:
                     label += "\\nPolicy: " + ", ".join(policy_str_parts)
             except Exception as e:
-                 label += "\\nPolicy: (Error)" # Indicate if policy parsing failed
+                label += "\\nPolicy: (Error)" # Indicate if policy parsing failed
         
         # Set node style - simplified to just deterministic vs stochastic
         is_stochastic = StochasticMCTS.is_node_idx_stochastic(tree, node_idx)
@@ -204,68 +206,6 @@ def tree_to_graph(eval_state, output_dir, boards_dir):
     
     return graph
 
-# Function to create backgammon evaluation function
-@jax.jit
-def backgammon_eval_fn(state, params, key):
-    """Calculates value based on pip count difference. Ignores params/key.
-    The board is always from the current players perspective, 
-    current player is positive numbers opponent is negative."""
-    board = state._board
-    pips = state._board[1:25]
-    
-    # Calculate pip counts for current player and opponent
-    current_pips = jnp.sum(jnp.maximum(0, pips) * jnp.arange(1, 25, dtype=jnp.int32))
-    opponent_pips = jnp.sum(jnp.maximum(0, -pips) * jnp.arange(1, 25, dtype=jnp.int32))
-    
-    # Add born-off checkers with appropriate weights
-    # Using 25 points for born-off checkers (standard backgammon pip count)
-    current_born_off = board[26] * 25  # Current player's born-off checkers
-    opponent_born_off = board[27] * 25  # Opponent's born-off checkers
-    
-    # Calculate total pips for normalization
-    total_pips = current_pips + opponent_pips + current_born_off + opponent_born_off + 1e-6
-    
-    # Calculate normalized value between -1 and 1
-    # Positive value means current player is ahead
-    value = (opponent_pips + opponent_born_off - current_pips - current_born_off) / total_pips
-    
-    # Ensure stochastic states are not evaluated directly
-    value = jnp.where(state.is_stochastic, jnp.nan, value)
-    
-    # Uniform policy over legal actions for greedy baseline
-    policy_logits = jnp.where(state.legal_action_mask, 0.5, -1.0)
-    
-    return policy_logits, jnp.array(value)
-
-# Function to create a step function for backgammon
-def backgammon_step_fn(env, state, action, key):
-    """Step function for backgammon that handles both deterministic and stochastic actions."""
-    # Handle stochastic vs deterministic branches
-    def stochastic_branch(s, a, k):
-        return env.stochastic_step(s, a)
-    
-    def deterministic_branch(s, a, k):
-        return env.step(s, a, k)
-    
-    # Use conditional to route to the appropriate branch
-    new_state = jax.lax.cond(
-        state.is_stochastic,
-        stochastic_branch,
-        deterministic_branch,
-        state, action, key
-    )
-    
-    # Create standard metadata
-    metadata = StepMetadata(
-        rewards=new_state.rewards,
-        action_mask=new_state.legal_action_mask,
-        terminated=new_state.terminated,
-        cur_player_id=new_state.current_player,
-        step=new_state._step_count
-    )
-    
-    return new_state, metadata
-
 def save_svg_string(svg_string, filepath):
     """Saves an SVG string to a file."""
     try:
@@ -283,18 +223,18 @@ def create_real_mcts_visualization(output_dir):
     os.makedirs(boards_dir, exist_ok=True)
     
     # Set up environment
-    key = jax.random.PRNGKey(42)
+    key = jax.random.PRNGKey(48)
     
     # Set up MCTS with minimal iterations for visualization
     mcts = StochasticMCTS(
-        eval_fn=backgammon_eval_fn,
+        eval_fn=bg_pip_count_eval,
         action_selector=PUCTSelector(),
         branching_factor=backgammon_env.num_actions,
         max_nodes=500,
         num_iterations=1,  # Use 1 iteration per step for step-by-step visualization
         stochastic_action_probs=backgammon_env.stochastic_action_probs,
         discount=-1.0,
-        temperature=1.0,
+        temperature=0.0,
         persist_tree=True,  # Critical to preserve tree between steps
     )
     
@@ -357,7 +297,7 @@ def create_real_mcts_visualization(output_dir):
                 env_state=state,
                 root_metadata=metadata,
                 params={},
-                env_step_fn=partial(backgammon_step_fn, backgammon_env)
+                env_step_fn=partial(bg_step_fn, backgammon_env)
             )
             # Important: For stochastic nodes, the tree stays the same
             eval_state = mcts_output.eval_state
@@ -393,7 +333,7 @@ def create_real_mcts_visualization(output_dir):
             last_saved_prev_board_path = last_saved_curr_board_path # Current becomes previous
             
             # Step environment with the chosen stochastic action
-            state, metadata = backgammon_step_fn(backgammon_env, state, action, step_key)
+            state, metadata = bg_step_fn(backgammon_env, state, action, step_key)
             # Step MCTS tree - always step after environment steps with stochastic actions
             print(f"DEBUG - Before mcts.step (stochastic) - Tree node count: {eval_state.next_free_idx}")
             eval_state = mcts.step(eval_state, action)
@@ -444,7 +384,7 @@ def create_real_mcts_visualization(output_dir):
                     env_state=state,
                     root_metadata=metadata,
                     params={},
-                    env_step_fn=partial(backgammon_step_fn, backgammon_env)
+                    env_step_fn=partial(bg_step_fn, backgammon_env)
                 )
                 eval_state = mcts_output.eval_state
                 current_iter_action = mcts_output.action # Action MCTS would choose *if stopped now*
@@ -531,7 +471,7 @@ def create_real_mcts_visualization(output_dir):
             key, step_key = jax.random.split(key)
 
             # Step environment based on the chosen action 
-            state, metadata = backgammon_step_fn(backgammon_env, state, action, step_key)
+            state, metadata = bg_step_fn(backgammon_env, state, action, step_key)
 
             # Step MCTS tree - always step after a deterministic action
             print(f"DEBUG - Before mcts.step - Tree node count: {eval_state.next_free_idx}")
@@ -1087,7 +1027,6 @@ def main():
         print(f"\nVisualization complete. Open the following file in your browser:")
         # Try to provide a file URI for easier clicking
         try:
-            from pathlib import Path
             file_uri = Path(os.path.abspath(html_path)).as_uri()
             print(file_uri)
         except ImportError:

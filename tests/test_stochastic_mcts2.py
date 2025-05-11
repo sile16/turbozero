@@ -1,91 +1,25 @@
+"""MCTS tests for backgammon."""
+
+from functools import partial
+import time
+from typing import Tuple
+
 import pytest
 import jax
 import jax.numpy as jnp
 import chex
-from flax.struct import dataclass
-from functools import partial
-import time
-from typing import Tuple, Dict, Optional, Any, Sequence
-import os # Added for directory creation
+
 import pgx.backgammon as bg # Added for Backgammon env
-from core.evaluators.mcts.state import tree_to_graph # Added for visualization
-
-
-
-# Imports from your project (adjust paths as necessary)
-from core.evaluators.mcts.stochastic_mcts import StochasticMCTS, MCTSNode, MCTSOutput
-from core.evaluators.mcts.action_selection import MCTSActionSelector, PUCTSelector
-from core.types import StepMetadata, EvalFn, EnvStepFn
-from core.evaluators.evaluator import EvalOutput
-from core.trees.tree import init_tree
 from pgx.backgammon import State
 
-# Define the backgammon step function
-def backgammon_step_fn(env: bg.Backgammon, state: State, action: int, key: chex.PRNGKey) -> Tuple[State, StepMetadata]:
-    """Combined step function for backgammon environment that handles both deterministic and stochastic actions."""
-    print(f"[DEBUG-BG_STEP-{time.time()}] Called with state (stochastic={state.is_stochastic}), action={action}")
-    
-    # Handle stochastic vs deterministic branches
-    def stochastic_branch(env_instance, s, a, k):
-        # Use the passed environment instance
-        return env_instance.stochastic_step(s, a)
-    
-    def deterministic_branch(env_instance, s, a, k):
-        # Use the passed environment instance
-        return env_instance.step(s, a, k)
-    
-    # Use conditional to route to the appropriate branch
-    new_state = jax.lax.cond(
-        state.is_stochastic,
-        partial(stochastic_branch, env), # Pass env to the branch
-        partial(deterministic_branch, env), # Pass env to the branch
-        state, action, key
-    )
-    
-    # Create standard metadata
-    metadata = StepMetadata(
-        rewards=new_state.rewards,
-        action_mask=new_state.legal_action_mask,
-        terminated=new_state.terminated,
-        cur_player_id=new_state.current_player,
-        step=new_state._step_count
-    )
-    
-    return new_state, metadata
+# Imports from your project (adjust paths as necessary)
+from core.evaluators.mcts.stochastic_mcts import StochasticMCTS
+from core.evaluators.mcts.action_selection import PUCTSelector
+from core.types import StepMetadata
 
-# Define an evaluation function that uses pip count heuristic for the value
-def backgammon_eval_fn(state: State, params: chex.ArrayTree, key: chex.PRNGKey) -> Tuple[chex.Array, float]:
-    """Simple evaluation function for backgammon based on pip count."""
-    print(f"[DEBUG-BG_EVAL_FN-{time.time()}] Evaluating state (stochastic={state.is_stochastic})")
-    
-    # Generate random policy logits for testing
-    policy_key, value_key = jax.random.split(key)
-    # Get num_actions from the state's legal_action_mask shape if possible, or pass env
-    # Assuming state has legal_action_mask with the correct length
-    num_actions = state.legal_action_mask.shape[0]
-    policy_logits = jax.random.normal(policy_key, shape=(num_actions,))
-    
-    # Calculate value based on pip count difference
-    board = state._board
-    p0_pips = jnp.sum(jnp.maximum(0, board[1:25]) * jnp.arange(1, 25)) + jnp.maximum(0, board[0]) * 25
-    p1_pips = jnp.sum(jnp.maximum(0, -board[1:25]) * (25 - jnp.arange(1, 25))) + jnp.maximum(0, -board[25]) * 25
-    
-    # Add epsilon to prevent division by zero
-    total_pips = p0_pips + p1_pips + 1e-6
-    value = (p1_pips - p0_pips) / total_pips
-    
-    # Adjust value for player perspective
-    value = jnp.where(state.current_player == 0, value, -value)
-    
-    # Ensure stochastic states are not evaluated directly
-    value = jnp.where(state.is_stochastic, jnp.nan, value)
-    policy_logits = jnp.where(state.is_stochastic, 
-                              jnp.ones_like(policy_logits) * jnp.nan,
-                              policy_logits)
-    
-    print(f"[DEBUG-BG_EVAL_FN-{time.time()}] Returning value={value}")
-    return policy_logits, value
 
+from bg.bgcommon import bg_step_fn as backgammon_step_fn
+from bg.bgcommon import bg_pip_count_eval as backgammon_eval_fn
 
 
 # --- Fixtures ---
@@ -559,13 +493,13 @@ def test_get_value(stochastic_mcts, backgammon_env, key, mock_params):
     """Test the get_value method returns the correct value from the tree."""
     key, init_key, eval_key = jax.random.split(key, 3)
     
-    # Create a deterministic state
+    # Create a stochastic  state
     state = backgammon_env.init(init_key)
-    if state.is_stochastic:
-        state = backgammon_env.stochastic_step(state, 0)
     
     # Initialize tree and metadata
     eval_state = stochastic_mcts.init(template_embedding=state)
+
+    # get a deterministic state
     metadata = StepMetadata(
         rewards=state.rewards,
         action_mask=state.legal_action_mask,
@@ -587,6 +521,33 @@ def test_get_value(stochastic_mcts, backgammon_env, key, mock_params):
     # Get value from root node
     root_value = stochastic_mcts.get_value(mcts_output.eval_state)
     is_stochastic = StochasticMCTS.is_node_idx_stochastic(mcts_output.eval_state, mcts_output.eval_state.ROOT_INDEX)
+
+    value, policy = stochastic_mcts.det_value_policy(state, None, None, metadata, 0)
+    # make sure the value is finite
+    assert jnp.isfinite(value), "Value should be finite"
+    
+    
+    state = backgammon_env.stochastic_step(state, 0)
+    metadata = StepMetadata(
+        rewards=state.rewards,
+        action_mask=state.legal_action_mask,
+        terminated=state.terminated,
+        cur_player_id=state.current_player,
+        step=state._step_count
+    )
+    mcts_output = stochastic_mcts.evaluate(
+        key=eval_key,
+        eval_state=eval_state,
+        env_state=state,
+        root_metadata=metadata,
+        params=mock_params,
+        env_step_fn=partial(backgammon_step_fn, backgammon_env)
+    )
+    
+    # Get value from root node
+    root_value = stochastic_mcts.get_value(mcts_output.eval_state)
+    is_stochastic = StochasticMCTS.is_node_idx_stochastic(mcts_output.eval_state, mcts_output.eval_state.ROOT_INDEX)
+
     
     # Print value and stochastic status for debugging
     print(f"Root value: {root_value}, Root stochastic: {is_stochastic}")

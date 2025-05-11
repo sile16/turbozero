@@ -1,17 +1,18 @@
+"""
+Test the basic functionality of the Backgammon environment and evaluator.
+"""
+
+from functools import partial
 import jax
 import jax.numpy as jnp
 import pgx.backgammon as bg
-import chex
-import optax
-from functools import partial
-import flax.linen as nn
-from typing import Tuple
-import pytest
+
+from bg.bgcommon import  bg_simple_step_fn, bg_pip_count_eval
 
 from core.types import StepMetadata
-from core.evaluators.evaluation_fns import make_nn_eval_fn
 from core.evaluators.mcts.action_selection import PUCTSelector
 from core.evaluators.mcts.mcts import MCTS
+
 
 def test_backgammon_basics():
     """Test basic functionality of Backgammon environment."""
@@ -52,14 +53,6 @@ def test_backgammon_basics():
     legal_actions = jnp.where(after_roll_state.legal_action_mask)[0]
     assert len(legal_actions) > 0, "No legal actions available after dice roll"
     
-    move_key = jax.random.PRNGKey(1)
-    action = int(legal_actions[0])
-    after_move_state = env.step(after_roll_state, action, move_key)
-    
-    # After a move, we should be back to stochastic for the next dice roll
-    # or game might be terminated
-    # Assertion removed since it depends on the specific action taken
-    
     print("Basic environment operations tested successfully!")
 
 def test_backgammon_evaluator():
@@ -74,16 +67,11 @@ def test_backgammon_evaluator():
     key = jax.random.PRNGKey(0)
     init_state = env.init(key)
     
-    # --- Basic eval function ---
-    def simple_eval_fn(state, params, key):
-        """Simple evaluation function for testing. Returns uniform policy and zero value."""
-        policy_logits = jnp.zeros(num_actions)
-        value = jnp.array(0.0)
-        return policy_logits, value
+   
     
     # --- Basic MCTS setup ---
     mcts = MCTS(
-        eval_fn=simple_eval_fn,
+        eval_fn=bg_pip_count_eval,
         num_iterations=2,  # Just 2 iterations for testing
         max_nodes=10,
         branching_factor=num_actions,
@@ -111,19 +99,8 @@ def test_backgammon_evaluator():
     
     # --- Test evaluator on deterministic state ---
     eval_key = jax.random.PRNGKey(1)
-    
-    def simple_step_fn(state, action):
-        """Simple step function for testing."""
-        # MCTS step_fn doesn't take a key parameter
-        step_key = jax.random.PRNGKey(0)  # Use a fixed key for determinism
-        new_state = env.step(state, action, step_key)
-        return new_state, StepMetadata(
-            rewards=new_state.rewards,
-            action_mask=new_state.legal_action_mask,
-            terminated=new_state.terminated,
-            cur_player_id=new_state.current_player,
-            step=new_state._step_count
-        )
+
+    step_fn = partial(bg_simple_step_fn, env)
     
     # Use empty params dict
     params = {}
@@ -135,7 +112,7 @@ def test_backgammon_evaluator():
         env_state=after_roll_state,
         root_metadata=metadata,
         params=params,
-        env_step_fn=simple_step_fn
+        env_step_fn=step_fn
     )
     
     # Verify we get valid outputs
