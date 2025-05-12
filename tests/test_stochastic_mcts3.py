@@ -280,3 +280,51 @@ def test_traverse_through_stochastic_nodes():
     assert num_transitions >= 1, "Expected at least one transition between stochastic and deterministic nodes"
     
     print("Successfully verified that MCTS can traverse through stochastic nodes") 
+
+
+def test_backpropagate_through_turn():
+    env = bg.Backgammon(simple_doubles=True)
+
+    key = jax.random.PRNGKey(42)
+    key, init_key, eval_key, step_key = jax.random.split(key, 4)
+    step_fn = partial(bg_step_fn, env)
+
+    state = env.init(init_key)
+
+    state, metadata = step_fn(state, 3, step_key) #roll 4-4
+    policy, value = bg_pip_count_eval(state, params={}, key=eval_key)
+    print(f"Initial value: {value}")
+    state, metadata = step_fn(state, 15, step_key) #die 4, 1 -> 5
+    policy, value = bg_pip_count_eval(state, params={}, key=eval_key)
+    print(f"After die 4, 1: {value}")   
+    state, metadata = step_fn(state, 15, step_key) #die 4, 1 -> 5
+    policy, value = bg_pip_count_eval(state, params={}, key=eval_key)
+    print(f"After die 4, 1: {value}")
+    state, metadata = step_fn(state, 39, step_key) #die 4 5 -> 9
+    policy, value = bg_pip_count_eval(state, params={}, key=eval_key)
+    print(f"After die 4 5: {value}")
+    #state, metadata = step_fn(state, 39, step_key) #die 4 5 -> 9
+
+    mcts = StochasticMCTS(
+        eval_fn=bg_pip_count_eval,
+        action_selector=PUCTSelector(),
+        branching_factor=env.num_actions,
+        max_nodes=500,  # Large enough to store many nodes
+        num_iterations=3,  
+        stochastic_action_probs=env.stochastic_action_probs,
+        discount=1.0,
+        temperature=0.1,  # Some exploration temperature
+        persist_tree=True # Enable some debugging output
+    )
+
+    eval_state = mcts.init(template_embedding=state)
+
+    # do an initial eval.
+    mcts_output = mcts.evaluate(
+        key=eval_key,
+        eval_state=eval_state,
+        env_state=state,
+        root_metadata=metadata,
+        params={},
+        env_step_fn=step_fn
+    )
