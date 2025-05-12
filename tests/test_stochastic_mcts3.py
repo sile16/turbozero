@@ -1,7 +1,8 @@
 """MCTS tests for backgammon."""
 from functools import partial
 import jax
-import jax.numpy as jnp
+
+
 
 
 import pgx.backgammon as bg
@@ -328,3 +329,61 @@ def test_backpropagate_through_turn():
         params={},
         env_step_fn=step_fn
     )
+
+
+def test_stochastic_action_sample():
+
+    key = jax.random.PRNGKey(42)
+    key, init_key, eval_key, step_key = jax.random.split(key, 4)
+
+    env = bg.Backgammon(simple_doubles=True)
+    state = env.init(init_key)
+    
+    mcts = StochasticMCTS(
+        eval_fn=bg_pip_count_eval,
+        action_selector=PUCTSelector(),
+        branching_factor=env.num_actions,
+        max_nodes=4,  # Large enough to store many nodes
+        num_iterations=2,  
+        stochastic_action_probs=env.stochastic_action_probs,
+        discount=1.0,
+        temperature=0.1,  # Some exploration temperature
+        persist_tree=True # Enable some debugging output
+    )
+
+    metadata = StepMetadata(
+        rewards=state.rewards,
+        action_mask=state.legal_action_mask,
+        terminated=state.terminated,
+        cur_player_id=state.current_player,
+        step=state._step_count)
+    
+    eval_state = mcts.init(template_embedding=state)
+
+    # do an initial eval.
+    actions = []
+    for i in range(2):
+        key, eval_key, step_key = jax.random.split(key, 3)
+        mcts_output = mcts.evaluate(key=eval_key,
+            eval_state=eval_state,
+            env_state=state,
+            root_metadata=metadata,
+            params={},
+            env_step_fn=partial(bg_step_fn, env)
+        )
+        actions.append(mcts_output.action)
+    print(actions)
+    action_values = [int(a.item()) for a in actions]
+
+    # Find the set of unique action values
+    unique_actions_set = set(action_values)
+
+    # Get the count of unique actions
+    num_unique_actions = len(unique_actions_set)
+
+    print(f"Unique actions found ({num_unique_actions}): {unique_actions_set}")
+
+    # Assert that we found at least 3 unique actions
+    assert num_unique_actions >= 2, \
+        f"Expected at least 3 unique actions over 100 evaluations, but found only {num_unique_actions}. Unique actions: {unique_actions_set}"
+

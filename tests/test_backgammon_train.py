@@ -33,7 +33,7 @@ from functools import partial
 from core.testing.utils import render_pgx_2p
 render_fn = partial(render_pgx_2p, p1_label='Black', p2_label='White', duration=900)
 
-from bg.bgcommon import bg_step_fn, bg_pip_count_eval, BGRandomEvaluator
+from bg.bgcommon import bg_step_fn, bg_pip_count_eval, BGRandomEvaluator, bg_hit2_eval
 
 # --- Environment Setup ---
 env = bg.Backgammon(simple_doubles=True)
@@ -160,7 +160,7 @@ trainer = StochasticTrainer(
         # Add another tester using the RandomEvaluator
         TwoPlayerBaseline(
             num_episodes=2, 
-            baseline_evaluator=random_evaluator, # Use the random evaluator here
+            baseline_evaluator=bg_hit2_eval, # Use the random evaluator here
             # Optionally add rendering for this baseline too
             #render_fn=render_fn, 
             #render_dir='training_eval/random_baseline',

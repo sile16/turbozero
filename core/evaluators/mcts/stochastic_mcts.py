@@ -256,7 +256,7 @@ class StochasticMCTS(MCTS):
         )
     
     
-    def det_value_policy(self, embedding, params, eval_key, metadata, player_reward) -> Tuple[float, chex.Array]:
+    def value_policy(self, embedding, params, eval_key, metadata, player_reward) -> Tuple[float, chex.Array]:
         """Get value and policy for deterministic nodes."""
         # Get policy and value from eval_fn for deterministic states
         policy_logits, value = self.eval_fn(embedding, params, eval_key)
@@ -294,22 +294,13 @@ class StochasticMCTS(MCTS):
         new_embedding, metadata = env_step_fn(embedding, action, step_key)
         player_reward = metadata.rewards[metadata.cur_player_id] # we need to check this, is correct.
         
-        # Check if the new state is stochastic
-        #is_stochastic = new_embedding.is_stochastic
-        
-        # Evaluate leaf node - use different evaluation based on stochastic vs deterministic
-        # value, policy = jax.lax.cond(
-        #   is_stochastic,
-        #   lambda: self.stochastic_value_policy(tree, parent, new_embedding, params, eval_key, metadata, player_reward),
-        #   lambda: self.det_value_policy(new_embedding, params, eval_key, metadata, player_reward)
-        #)
-        # Lets still eval, as a deterministic action was taken to arrive here.
-        value, policy = self.det_value_policy(new_embedding, params, eval_key, metadata, player_reward)
+        value, policy = self.value_policy(new_embedding, params, eval_key, metadata, player_reward)
         
         # add leaf node to tree
         node_exists = tree.is_edge(parent, action)
         node_idx = tree.edge_map[parent, action]
 
+        # todo: combine these three branches
         node_data = jax.lax.cond(
             node_exists,
             lambda: self.visit_node(node=tree.data_at(node_idx), value=value, p=policy, terminated=metadata.terminated, embedding=new_embedding),
@@ -321,6 +312,14 @@ class StochasticMCTS(MCTS):
             lambda: tree.update_node(index=node_idx, data = node_data),
             lambda: tree.add_node(parent_index=parent, edge_index=action, data=node_data)
         )
+        
+        # Get the correct node index after adding/updating
+        node_idx = jax.lax.cond(
+            node_exists,
+            lambda: node_idx,
+            lambda: tree.next_free_idx - 1  # After adding a node, the new node is at next_free_idx - 1
+        )
+        
         # backpropagate
         return self.backpropagate(key, tree, parent, node_idx, value) 
 
@@ -388,13 +387,14 @@ class StochasticMCTS(MCTS):
         player_diff = jnp.abs(current_player - other_player)
         return 1.0 - 2.0 * player_diff
 
-    def backpropagate(self, key: chex.PRNGKey, tree: MCTSTree, parent: int, child: int,value: float) -> MCTSTree:
+    def backpropagate(self, key: chex.PRNGKey, tree: MCTSTree, parent: int, child: int, value: float) -> MCTSTree:
         """Backpropagate the value estimate from the leaf node to the root node and update visit counts.
         
         Args:
         - `key`: rng
         - `tree`: MCTSTree to evaluate
         - `parent`: index of the parent node
+        - `child`: index of the child node
         - `value`: value estimate of the leaf node
 
         Returns:
@@ -403,8 +403,7 @@ class StochasticMCTS(MCTS):
 
         def body_fn(state: BackpropState) -> BackpropState:
             node_idx, value, tree = state.node_idx, state.value, state.tree
-            # calculate discount, if this node has a child of a different player
-            # then the discount is -1.0, otherwise it is 1.0
+            
             
             node = tree.data_at(node_idx)
             # increment visit count and update value estimate
@@ -412,25 +411,71 @@ class StochasticMCTS(MCTS):
             tree = tree.update_node(node_idx, new_node)
             # go to parent 
             parent_idx = tree.parents[node_idx]
+            
+            # Get player values for debugging
+            current_player = node.embedding.current_player
+            parent_player = tree.data_at(parent_idx).embedding.current_player
+            
             child_and_parent_value_discount = self.calculate_discount_factor(tree, parent_idx, node_idx)
+            
+            # Debug prints with concrete values
+            jax.debug.print("""
+                [DEBUG-BACKPROPAGATE] 
+                node_idx: {}
+                parent_idx: {}
+                current_player: {}
+                parent_player: {}
+                value before discount: {}
+                discount: {}
+                value after discount: {}
+                visit count: {}
+            """, node_idx, parent_idx, current_player, parent_player, value, child_and_parent_value_discount, value * child_and_parent_value_discount, new_node.n)
+            
             value *= child_and_parent_value_discount
 
-            return BackpropState(node_idx=tree.parents[node_idx], value=value, tree=tree)
+            return BackpropState(node_idx=parent_idx, value=value, tree=tree)
         
+        # Initial debug print for the first step
+        current_player = tree.data_at(child).embedding.current_player
+        parent_player = tree.data_at(parent).embedding.current_player
         child_and_parent_value_discount = self.calculate_discount_factor(tree, parent, child)
+        
+        jax.debug.print("""
+            [DEBUG-BACKPROPAGATE - initial] 
+            child: {}
+            parent: {}
+            child_player: {}
+            parent_player: {}
+            value before discount: {}
+            discount: {}
+            value after discount: {}
+            visit count: {}
+        """, child, parent, current_player, parent_player, value, child_and_parent_value_discount, value * child_and_parent_value_discount, tree.data_at(child).n)
+        
         value *= child_and_parent_value_discount
-
         state = BackpropState(node_idx=parent, value=value, tree=tree)
         
+        # Backpropagate until we reach the root
         state = jax.lax.while_loop(
             lambda s: s.node_idx != s.tree.ROOT_INDEX, 
             body_fn, 
             state
         )
-        # now update the root node
-        state =body_fn(state)
 
-        return state.tree
+        # this will update the root node (discount already applied)
+        node = state.tree.data_at(state.node_idx)
+        new_node = self.visit_node(node, state.value)
+        tree = state.tree.update_node(state.node_idx, new_node)
+        
+        # Debug print for root node update
+        jax.debug.print("""
+            [DEBUG-BACKPROPAGATE - root] 
+            node_idx: {}
+            value: {}
+            visit count: {}
+        """, state.node_idx, state.value, new_node.n)
+
+        return tree
 
     @staticmethod
     def is_child_different_player(tree: MCTSTree, node_idx: int) -> float:

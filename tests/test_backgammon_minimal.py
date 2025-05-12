@@ -7,7 +7,7 @@ import jax
 import jax.numpy as jnp
 import pgx.backgammon as bg
 
-from bg.bgcommon import  bg_simple_step_fn, bg_pip_count_eval
+from bg.bgcommon import  bg_simple_step_fn, bg_pip_count_eval, bg_hit2_eval
 
 from core.types import StepMetadata
 from core.evaluators.mcts.action_selection import PUCTSelector
@@ -71,7 +71,7 @@ def test_backgammon_evaluator():
     
     # --- Basic MCTS setup ---
     mcts = MCTS(
-        eval_fn=bg_pip_count_eval,
+        eval_fn=bg_hit2_eval,
         num_iterations=2,  # Just 2 iterations for testing
         max_nodes=10,
         branching_factor=num_actions,

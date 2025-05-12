@@ -13,6 +13,7 @@ from pgx.core import Env
 from core.types import StepMetadata
 from core.evaluators.evaluator import Evaluator, EvalOutput
 from core.types import EnvStepFn
+from pgx._src.types import Array
 
 
 def bg_simple_step_fn(env: Env, state, action):
@@ -92,12 +93,14 @@ def bg_pip_count_eval(state: chex.ArrayTree, params: chex.ArrayTree, key: chex.P
     # Using 25 points for born-off checkers (standard backgammon pip count)
     current_born_off = board[26] * 25  # Current player's born-off checkers
     opponent_born_off = board[27] * 25  # Opponent's born-off checkers
+    current_bar = board[bg._bar_idx()] * -5
+    opponent_bar = board[bg._bar_idx() + 1] * -5
 
     #jax.debug.print(f"[DEBUG-BG_PIP_COUNT_EVAL] Current born-off: {current_born_off}, Opponent born-off: {opponent_born_off}")
     # Calculate normalized value between -1 and 1
     # Positive value means current player is ahead
-    value = (current_pips + current_born_off - opponent_pips - opponent_born_off ) / 400
-
+    value = (current_pips + current_born_off + current_bar- opponent_pips - opponent_born_off - opponent_bar) / 400
+    value = jnp.clip(value, -1.0, 1.0) # Clip to [-1, 1]
     #jax.debug.print(f"[DEBUG-BG_PIP_COUNT_EVAL] Value: {value}")
     
     # Uniform policy over legal actions for greedy baseline
@@ -149,3 +152,74 @@ class BGRandomEvaluator(Evaluator):
     def step(self, state: chex.ArrayTree, action: int) -> chex.ArrayTree:
         """Updates the dummy state (no change needed)."""
         return state # Stateless, nothing to update based on action
+    
+
+def bg_hit2_eval(state: bg.State, params: chex.ArrayTree, key: chex.PRNGKey) -> Tuple[Array, Array]:
+    """
+    Implements the Hit2 strategy evaluator for Backgammon.
+
+    Value: Based on the difference between opponent's checkers on the bar
+           and the player's checkers on the bar.
+           e(s) = 0.055 * (opponent_bar_checkers - own_bar_checkers)
+
+    Policy: Prioritizes actions that hit opponent's blots.
+            Hitting moves get a logit of 1.0, other legal moves get 0.0.
+            Illegal moves get -inf.
+    
+    Args:
+        state: The current backgammon State object.
+        params: Network parameters (ignored for this evaluator).
+        key: PRNGKey (ignored for this evaluator).
+
+    Returns:
+        A tuple containing:
+        - policy_logits: An array of logits for each possible action.
+        - value: A scalar value estimate for the current state.
+    """
+    board = state._board
+    legal_action_mask = state.legal_action_mask
+
+    # --- Calculate Value ---
+    # Board is from current player's perspective.
+    own_bar_checkers = board[bg._bar_idx()] # Player's checkers on bar (>= 0)
+    # Opponent's checkers are negative on their bar (index bar+1)
+    opponent_bar_checkers = -board[bg._bar_idx() + 1] # Count of opponent's checkers on bar (>= 0)
+
+    value = 0.055 * (opponent_bar_checkers - own_bar_checkers)
+    # Ensure value stays within the documented range [-0.825, 0.825], although calculation should guarantee this.
+    value = jnp.clip(value, -0.825, 0.825)
+
+    # --- Calculate Policy Logits ---
+
+    # Define a function to check if a single action is a hitting move
+    def is_hitting_move(action: Array, current_board: Array) -> bool:
+        _, _, tgt = bg._decompose_action(action)
+        
+        # Check if target is a valid board point (0-23)
+        is_board_target = (tgt >= 0) & (tgt <= 23)
+        
+        # Check if the target point has exactly one opponent checker (-1)
+        is_hit = is_board_target & (current_board[tgt] == -1)
+        
+        return is_hit
+
+    # Vectorize the check over all possible actions (0 to 26*6 - 1)
+    all_actions = jnp.arange(26 * 6, dtype=jnp.int32)
+    # Check which actions *would* result in a hit, regardless of legality for now
+    potential_hits = jax.vmap(is_hitting_move, in_axes=(0, None))(all_actions, board)
+
+    # Assign scores: 1.0 for potential hits, 0.0 otherwise
+    hit_scores = potential_hits.astype(jnp.float32) # 1.0 if hit, 0.0 otherwise
+
+    # Combine scores with the legal action mask
+    # - Legal hitting moves get logit 1.0
+    # - Legal non-hitting moves get logit 0.0
+    # - Illegal moves get logit -inf
+    policy_logits = jnp.where(legal_action_mask, hit_scores, -jnp.inf)
+
+    # Final check: if ONLY no-op actions are legal, ensure they have logit 0.0
+    # This should already be handled correctly by the jnp.where above, as no-op
+    # cannot be a hit (hit_score=0.0) and will be selected if legal_action_mask allows it.
+    # If no moves are legal at all, all logits will be -inf, which is also correct.
+
+    return policy_logits, value
