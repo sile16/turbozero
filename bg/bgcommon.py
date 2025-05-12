@@ -178,17 +178,6 @@ def bg_hit2_eval(state: bg.State, params: chex.ArrayTree, key: chex.PRNGKey) -> 
     """
     board = state._board
     legal_action_mask = state.legal_action_mask
-
-    # --- Calculate Value ---
-    # Board is from current player's perspective.
-    own_bar_checkers = board[bg._bar_idx()] # Player's checkers on bar (>= 0)
-    # Opponent's checkers are negative on their bar (index bar+1)
-    opponent_bar_checkers = -board[bg._bar_idx() + 1] # Count of opponent's checkers on bar (>= 0)
-
-    value = 0.055 * (opponent_bar_checkers - own_bar_checkers)
-    # Ensure value stays within the documented range [-0.825, 0.825], although calculation should guarantee this.
-    value = jnp.clip(value, -0.825, 0.825)
-
     # --- Calculate Policy Logits ---
 
     # Define a function to check if a single action is a hitting move
@@ -221,5 +210,7 @@ def bg_hit2_eval(state: bg.State, params: chex.ArrayTree, key: chex.PRNGKey) -> 
     # This should already be handled correctly by the jnp.where above, as no-op
     # cannot be a hit (hit_score=0.0) and will be selected if legal_action_mask allows it.
     # If no moves are legal at all, all logits will be -inf, which is also correct.
+
+    _, value = bg_pip_count_eval(state, params, key)
 
     return policy_logits, value
