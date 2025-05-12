@@ -67,7 +67,7 @@ def bg_step_fn(env: Env, state: bg.State, action: int, key: chex.PRNGKey) -> Tup
 
 # --- Pip Count Eval Fn (for test evaluator) ---
 
-def bg_pip_count_eval(state: chex.ArrayTree, params: chex.ArrayTree, key: chex.PRNGKey):
+def bg_pip_count_eval(state: chex.ArrayTree, params: chex.ArrayTree, key: chex.PRNGKey) -> Tuple[Array, Array]:
     """Calculates value based on pip count difference. Ignores params/key.
     The board is always from the current players perspective, 
     current player is positive numbers opponent is negative."""

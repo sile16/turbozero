@@ -18,7 +18,7 @@ from core.evaluators.mcts.action_selection import PUCTSelector
 from core.types import StepMetadata
 
 
-from bg.bgcommon import bg_step_fn as backgammon_step_fn
+from bg.bgcommon import bg_hit2_eval, bg_step_fn as backgammon_step_fn
 from bg.bgcommon import bg_pip_count_eval as backgammon_eval_fn
 
 
@@ -585,6 +585,34 @@ def test_bg_pip_count_eval():
             state = env.step(state, action, action_key)
     print("test_bg_pip_count_eval PASSED")
 
+def test_bg_hit2_eval():
+    env = bg.Backgammon()
+    state = env.init(jax.random.PRNGKey(0))
+    key = jax.random.PRNGKey(1)
+
+    board = jnp.zeros(28, dtype=jnp.int32)
+    
+    # Make blots at 4 off
+    board = board.at[0].set(15)
+    board = board.at[4].set(-1)
+    board = board.at[8].set(-1)
+    board = board.at[10].set(-13)
+    state = state.replace(_board=board)
+
+    state = env.stochastic_step(state, 3) # roll 4 4
+
+    hit_found = False
+    for x in range(3):
+        action_key, eval_key, key = jax.random.split(key, 3)
+        #jax.debug.print(f"")
+        policy, value = bg_hit2_eval(state, None, eval_key)
+
+        action = jnp.argmax(policy)
+        if policy[action] > 0:
+            hit_found = True
+        state = env.step(state, action, action_key)
+    assert hit_found, "Hit should be found"
+    print("test_bg_hit2_eval PASSED")
 
 def test_evaluate_deterministic_root(stochastic_mcts, backgammon_env, key, mock_params):
     """Test the evaluate method with a deterministic root node."""
