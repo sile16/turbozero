@@ -419,17 +419,17 @@ class StochasticMCTS(MCTS):
             child_and_parent_value_discount = self.calculate_discount_factor(tree, parent_idx, node_idx)
             
             # Debug prints with concrete values
-            jax.debug.print("""
-                [DEBUG-BACKPROPAGATE] 
-                node_idx: {}
-                parent_idx: {}
-                current_player: {}
-                parent_player: {}
-                value before discount: {}
-                discount: {}
-                value after discount: {}
-                visit count: {}
-            """, node_idx, parent_idx, current_player, parent_player, value, child_and_parent_value_discount, value * child_and_parent_value_discount, new_node.n)
+            # jax.debug.print("""
+            #    [DEBUG-BACKPROPAGATE] 
+            #    node_idx: {}
+            #    parent_idx: {}
+            #    current_player: {}
+            #    parent_player: {}
+            #    value before discount: {}
+            #    discount: {}
+            #    value after discount: {}
+            #    visit count: {}
+            #""", node_idx, parent_idx, current_player, parent_player, value, child_and_parent_value_discount, value * child_and_parent_value_discount, new_node.n)
             
             value *= child_and_parent_value_discount
 
@@ -440,17 +440,17 @@ class StochasticMCTS(MCTS):
         parent_player = tree.data_at(parent).embedding.current_player
         child_and_parent_value_discount = self.calculate_discount_factor(tree, parent, child)
         
-        jax.debug.print("""
-            [DEBUG-BACKPROPAGATE - initial] 
-            child: {}
-            parent: {}
-            child_player: {}
-            parent_player: {}
-            value before discount: {}
-            discount: {}
-            value after discount: {}
-            visit count: {}
-        """, child, parent, current_player, parent_player, value, child_and_parent_value_discount, value * child_and_parent_value_discount, tree.data_at(child).n)
+        #jax.debug.print("""
+        #    [DEBUG-BACKPROPAGATE - initial] 
+        #    child: {}
+        #    parent: {}
+        #    child_player: {}
+        #    parent_player: {}
+        #    value before discount: {}
+        #    discount: {}
+        #    value after discount: {}
+        #    visit count: {}
+        #""", child, parent, current_player, parent_player, value, child_and_parent_value_discount, value * child_and_parent_value_discount, tree.data_at(child).n)
         
         value *= child_and_parent_value_discount
         state = BackpropState(node_idx=parent, value=value, tree=tree)
@@ -468,12 +468,12 @@ class StochasticMCTS(MCTS):
         tree = state.tree.update_node(state.node_idx, new_node)
         
         # Debug print for root node update
-        jax.debug.print("""
-            [DEBUG-BACKPROPAGATE - root] 
-            node_idx: {}
-            value: {}
-            visit count: {}
-        """, state.node_idx, state.value, new_node.n)
+        #jax.debug.print("""
+        #    [DEBUG-BACKPROPAGATE - root] 
+        #    node_idx: {}
+        #    value: {}
+        #    visit count: {}
+        #""", state.node_idx, state.value, new_node.n)
 
         return tree
 
