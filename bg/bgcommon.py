@@ -14,7 +14,7 @@ from core.types import StepMetadata
 from core.evaluators.evaluator import Evaluator, EvalOutput
 from core.types import EnvStepFn
 from pgx._src.types import Array
-
+import flax.linen as nn
 
 def bg_simple_step_fn(env: Env, state, action):
     """Simple step function for testing does not know about stochastic nodes."""
@@ -214,3 +214,45 @@ def bg_hit2_eval(state: bg.State, params: chex.ArrayTree, key: chex.PRNGKey) -> 
     _, value = bg_pip_count_eval(state, params, key)
 
     return policy_logits, value
+
+
+# Pre‑activation ResNet‑V2 block
+class ResBlockV2(nn.Module):
+    features: int
+
+    @nn.compact
+    def __call__(self, x):
+        r = x
+        x = nn.LayerNorm()(x)
+        x = nn.relu(x)
+        x = nn.Dense(self.features, use_bias=False)(x)
+        x = nn.LayerNorm()(x)
+        x = nn.relu(x)
+        x = nn.Dense(self.features, use_bias=False)(x)
+        return x + r
+
+class ResNetTurboZero(nn.Module):
+    num_actions: int            # 156 here
+    hidden_dim: int = 256
+    num_blocks: int = 10
+
+    @nn.compact
+    def __call__(self, x, train: bool = False):
+        # 1) ResNet tower
+        x = nn.Dense(self.hidden_dim, use_bias=False)(x)
+        x = nn.LayerNorm()(x)
+        x = nn.relu(x)
+        for _ in range(self.num_blocks):
+            x = ResBlockV2(self.hidden_dim)(x)
+
+        # 2) Policy head: single Dense into 156 logits
+        policy_logits = nn.Dense(self.num_actions)(x)
+
+        # 3) Value head
+        v = nn.LayerNorm()(x)
+        v = nn.relu(v)
+        v = nn.Dense(1)(v)
+        v = jnp.squeeze(v, -1)
+
+        return policy_logits, v
+    

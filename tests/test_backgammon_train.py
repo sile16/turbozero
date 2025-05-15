@@ -34,7 +34,7 @@ from functools import partial
 from core.testing.utils import render_pgx_2p
 render_fn = partial(render_pgx_2p, p1_label='Black', p2_label='White', duration=900)
 
-from bg.bgcommon import bg_step_fn, bg_pip_count_eval, BGRandomEvaluator, bg_hit2_eval
+from bg.bgcommon import bg_step_fn, bg_pip_count_eval, BGRandomEvaluator, bg_hit2_eval, ResNetTurboZero
 
 # --- Environment Setup ---
 env = bg.Backgammon(simple_doubles=True, short_game=True)
@@ -142,49 +142,51 @@ hit2_mcts_test = StochasticMCTS(  # optimizes for moves
 replay_memory = EpisodeReplayBuffer(capacity=500)
 
 
-# --- Trainer ---
-trainer = StochasticTrainer(
-    batch_size=2,      # Minimal batch size
-    train_batch_size=2,
-    warmup_steps=0,
-    collection_steps_per_epoch=300,  # needs to be higher than average game length, or better, 10x
-    train_steps_per_epoch=2,       
-    nn=mlp_policy_value_net,
-    loss_fn=partial(az_default_loss_fn, l2_reg_lambda=0.0),
-    optimizer=optax.adam(1e-4),
-    # Use the stochastic evaluator for training
-    evaluator=evaluator, 
-    memory_buffer=replay_memory,
-    max_episode_steps=1000,  
-    env_step_fn=partial(bg_step_fn, env),
-    env_init_fn=init_fn,
-    state_to_nn_input_fn=state_to_nn_input,
-    testers=[
-        # Use our custom BackgammonTwoPlayerBaseline
-        TwoPlayerBaseline(
-            num_episodes=2,
-            baseline_evaluator=pip_count_mcts_evaluator_test,
-            #render_fn=render_fn,
-            #render_dir='training_eval/pip_count_baseline',
-            name='pip_count_baseline'
-        ),
-        # Add another tester using the RandomEvaluator
-        TwoPlayerBaseline(
-            num_episodes=2, 
-            baseline_evaluator=hit2_mcts_test, # Use the random evaluator here
-            # Optionally add rendering for this baseline too
-            #render_fn=render_fn, 
-            #render_dir='training_eval/random_baseline',
-            name='hit2_baseline'
-        )
-    ],
-    
-    evaluator_test=evaluator_test, 
-    wandb_project_name="turbozero_test_backgammon_train"
-)
+
 
 # --- Main Execution ---
 def test_backgammon_training_loop():
+
+    # --- Trainer ---
+    trainer = StochasticTrainer(
+        batch_size=2,      # Minimal batch size
+        train_batch_size=2,
+        warmup_steps=0,
+        collection_steps_per_epoch=300,  # needs to be higher than average game length, or better, 10x
+        train_steps_per_epoch=2,       
+        nn=mlp_policy_value_net,
+        loss_fn=partial(az_default_loss_fn, l2_reg_lambda=0.0),
+        optimizer=optax.adam(1e-4),
+        # Use the stochastic evaluator for training
+        evaluator=evaluator, 
+        memory_buffer=replay_memory,
+        max_episode_steps=1000,  
+        env_step_fn=partial(bg_step_fn, env),
+        env_init_fn=init_fn,
+        state_to_nn_input_fn=state_to_nn_input,
+        testers=[
+            # Use our custom BackgammonTwoPlayerBaseline
+            TwoPlayerBaseline(
+                num_episodes=1,
+                baseline_evaluator=pip_count_mcts_evaluator_test,
+                #render_fn=render_fn,
+                #render_dir='training_eval/pip_count_baseline',
+                name='pip_count_baseline'
+            ),
+            # Add another tester using the RandomEvaluator
+            TwoPlayerBaseline(
+                num_episodes=2, 
+                baseline_evaluator=hit2_mcts_test, # Use the random evaluator here
+                # Optionally add rendering for this baseline too
+                render_fn=render_fn, 
+                #render_dir='training_eval/random_baseline',
+                name='hit2_baseline'
+            )
+        ],
+        
+        evaluator_test=evaluator_test, 
+        wandb_project_name="turbozero_test_backgammon_train"
+    )
     """Runs a minimal training loop for Backgammon with StochasticMCTS."""
     print("Starting minimal Backgammon training test with StochasticMCTS...")
     
@@ -194,4 +196,40 @@ def test_backgammon_training_loop():
     print("Training loop completed successfully.")
     assert output is not None # Basic check to ensure it ran
 
-    print("Test finished.") 
+    print("Test finished.")
+
+
+def test_train_step_test():
+    resnet_model = ResNetTurboZero(
+        num_actions=env.num_actions,  # i.e. micro_steps*(micro_src + micro_die)
+        hidden_dim=256,
+        num_blocks=10
+    )
+
+    trainer2 = StochasticTrainer(
+        batch_size=2,      # Minimal batch size
+        train_batch_size=2,
+        warmup_steps=0,
+        collection_steps_per_epoch=10,  # needs to be higher than average game length, or better, 10x
+        train_steps_per_epoch=2,       
+        nn=resnet_model,
+        loss_fn=partial(az_default_loss_fn, l2_reg_lambda=0.0),
+        optimizer=optax.adam(1e-4),
+        testers=[],
+        # Use the stochastic evaluator for training
+        evaluator=BGRandomEvaluator(), 
+        memory_buffer=replay_memory,
+        max_episode_steps=1000,  
+        env_step_fn=partial(bg_step_fn, env),
+        env_init_fn=init_fn,
+        state_to_nn_input_fn=state_to_nn_input,
+        wandb_project_name="turbozero_test_backgammon_train_large_nn"
+    )
+    
+
+    trainer2.train_loop(seed=42, num_epochs=1)
+
+    
+
+
+
