@@ -84,7 +84,7 @@ class TwoPlayerTester(BaseTester):
         )
 
         results, frames, p_ids = jax.vmap(game_fn)(keys)
-        frames = jax.tree_map(lambda x: x[0], frames)
+        frames = jax.tree.map(lambda x: x[0], frames)
         p_ids = p_ids[0]
         
         avg = results[:, 0].mean()

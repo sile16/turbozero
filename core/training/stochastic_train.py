@@ -1,11 +1,14 @@
+"""
+StochasticTrainer is a variant of the Trainer for stochastic environments.
+during self-play data collection, by not adding stochastnic nodes to replay buffer.
+"""
 import jax
 import jax.numpy as jnp
 import chex
-from typing import Tuple
 
-from core.training.train import Trainer, CollectionState
-from core.types import StepMetadata, BaseExperience
-from core.evaluators.mcts.stochastic_mcts import StochasticMCTS
+
+from core.training.train import Trainer, CollectionState, ReplayBufferState
+from core.types import BaseExperience
 
 class StochasticTrainer(Trainer):
     """Trainer variant that explicitly handles stochastic environment steps 
@@ -39,12 +42,13 @@ class StochasticTrainer(Trainer):
                 eval_state=state.eval_state,
                 params=params
             )
-        
+
         # Define functions for handling deterministic vs stochastic states
-        def handle_deterministic_state(buffer_state):
+        def handle_deterministic_state(state: CollectionState) -> ReplayBufferState:
+            
             # Store experience in replay buffer for deterministic states
             updated_buffer = self.memory_buffer.add_experience(
-                state=buffer_state,
+                state=state.buffer_state,
                 experience=BaseExperience(
                     observation_nn=self.state_to_nn_input_fn(state.env_state),
                     policy_mask=state.metadata.action_mask,
@@ -53,59 +57,53 @@ class StochasticTrainer(Trainer):
                     cur_player_id=state.metadata.cur_player_id
                 )
             )
-            
-            # We can't use a for loop with transforms in JIT compiled code,
-            # so we need to handle any transforms separately
-            if len(self.transform_fns) > 0:
-                # For simplicity in this example, just handle the first transform if any exists
-                transform_fn = self.transform_fns[0]
-                t_policy_mask, t_policy_weights, t_env_state = transform_fn(
-                    state.metadata.action_mask,
-                    eval_output.policy_weights,
-                    state.env_state
-                )
-                updated_buffer = self.memory_buffer.add_experience(
-                    state=updated_buffer,
-                    experience=BaseExperience(
-                        observation_nn=self.state_to_nn_input_fn(t_env_state),
-                        policy_mask=t_policy_mask,
-                        policy_weights=t_policy_weights,
-                        reward=jnp.empty_like(state.metadata.rewards),
-                        cur_player_id=state.metadata.cur_player_id
-                    )
-                )
             return updated_buffer
-            
-        def handle_stochastic_state(buffer_state):
+
+        def handle_stochastic_state(state: CollectionState) -> ReplayBufferState:
+            #jax.debug.print('stochastic step: {step}', step=new_metadata.step)
             # For stochastic states, don't add to replay buffer
-            return buffer_state
-        
+            # these states are waiting for the dice roll, 
+            # and after the stochastic action, the next state will be added to the buffer
+            return state.buffer_state
+
         # Use jax.lax.cond to choose between handling deterministic or stochastic state
         # We need to check if the state has is_stochastic attribute and what its value is
-        is_stochastic = getattr(state.env_state, 'is_stochastic', jnp.array(False))
+        is_stochastic = state.env_state.is_stochastic
         buffer_state = jax.lax.cond(
             is_stochastic,
             handle_stochastic_state,
             handle_deterministic_state,
-            state.buffer_state
+            state
         )
+
+        def terminated_fn(s: ReplayBufferState) -> ReplayBufferState:
+            return self.memory_buffer.assign_rewards(s, rewards)
         
+        def not_terminated_fn(s: ReplayBufferState) -> ReplayBufferState:
+            return s
+
         # Assign rewards to buffer if episode is terminated
         buffer_state = jax.lax.cond(
             terminated,
-            lambda s: self.memory_buffer.assign_rewards(s, rewards),
-            lambda s: s,
+            terminated_fn,
+            not_terminated_fn,
             buffer_state
         )
-        
+
+        def truncated_fn(s: ReplayBufferState) -> ReplayBufferState:
+            return self.memory_buffer.truncate(s)
+    
+        def not_truncated_fn(s: ReplayBufferState) -> ReplayBufferState:
+            return s
+
         # Truncate episode experiences in buffer if episode is too long
         buffer_state = jax.lax.cond(
             truncated,
-            self.memory_buffer.truncate,
-            lambda s: s,
+            truncated_fn,
+            not_truncated_fn,
             buffer_state
         )
-        
+
         # Return new collection state
         return state.replace(
             eval_state=eval_output.eval_state,

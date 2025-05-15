@@ -33,7 +33,7 @@ def test_backgammon_basics():
     
     stochastic_probs = env.stochastic_action_probs
     print(f"STOCHASTIC_PROBS: {stochastic_probs}")
-    assert len(stochastic_probs) == 6  # should be 6 for simple_doubles=True
+    assert len(stochastic_probs) == 21  # should be 21 no matter what
     
     # --- Test basic environment operations ---
     # 1. Initial state should be stochastic (need to roll dice)

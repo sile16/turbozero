@@ -13,7 +13,7 @@ from core.types import StepMetadata
 env = bg.Backgammon(simple_doubles=True)
 
 from bg.bgcommon import bg_step_fn 
-from bg.bgcommon import bg_pip_count_eval
+from bg.bgcommon import bg_pip_count_eval, bg_hit2_eval
 
 
 def test_stochastic_mcts_backgammon_simple_doubles_valid_actions():
@@ -26,7 +26,8 @@ def test_stochastic_mcts_backgammon_simple_doubles_valid_actions():
     key = jax.random.PRNGKey(44) # Use a different seed
     
     backgammon_step_fn = partial(bg_step_fn, env)
-    backgammon_eval_fn = bg_pip_count_eval
+   #backgammon_eval_fn = bg_pip_count_eval
+    backgammon_eval_fn = bg_hit2_eval
 
     # --- MCTS setup for two players ---
     mcts_p0 = StochasticMCTS(

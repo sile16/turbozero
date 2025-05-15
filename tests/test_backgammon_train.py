@@ -20,6 +20,7 @@ from core.evaluators.mcts.stochastic_mcts import StochasticMCTS
 from core.evaluators.mcts.mcts import MCTS
 from core.memory.replay_memory import EpisodeReplayBuffer
 from core.training.loss_fns import az_default_loss_fn
+from core.training.train import Trainer
 from core.training.stochastic_train import StochasticTrainer
 from core.training.train import Trainer
 from core.testing.two_player_baseline import TwoPlayerBaseline
@@ -36,7 +37,7 @@ render_fn = partial(render_pgx_2p, p1_label='Black', p2_label='White', duration=
 from bg.bgcommon import bg_step_fn, bg_pip_count_eval, BGRandomEvaluator, bg_hit2_eval
 
 # --- Environment Setup ---
-env = bg.Backgammon(simple_doubles=True)
+env = bg.Backgammon(simple_doubles=True, short_game=True)
 NUM_ACTIONS = env.num_actions
 print(f"NUM_ACTIONS: {NUM_ACTIONS}")
 
@@ -127,24 +128,34 @@ pip_count_mcts_evaluator_test = StochasticMCTS(  # optimizes for moves
     temperature=0.0 # Deterministic action selection for testing
 )
 
+hit2_mcts_test = StochasticMCTS(  # optimizes for moves
+    eval_fn=bg_hit2_eval, # Use pip count eval fn
+    stochastic_action_probs=STOCHASTIC_PROBS,
+    num_iterations=20, # Give it slightly more iterations maybe
+    max_nodes=100,
+    branching_factor=NUM_ACTIONS,
+    action_selector=PUCTSelector(),
+    temperature=0.0 # Deterministic action selection for testing
+)
+
 # --- Replay Memory ---
-replay_memory = EpisodeReplayBuffer(capacity=100)
+replay_memory = EpisodeReplayBuffer(capacity=500)
 
 
 # --- Trainer ---
 trainer = StochasticTrainer(
-    batch_size=8,      # Minimal batch size
-    train_batch_size=8,
+    batch_size=2,      # Minimal batch size
+    train_batch_size=2,
     warmup_steps=0,
-    collection_steps_per_epoch=300,  # Just 2 collection step
-    train_steps_per_epoch=10,       # Just 2 training step
+    collection_steps_per_epoch=300,  # needs to be higher than average game length, or better, 10x
+    train_steps_per_epoch=2,       
     nn=mlp_policy_value_net,
     loss_fn=partial(az_default_loss_fn, l2_reg_lambda=0.0),
     optimizer=optax.adam(1e-4),
     # Use the stochastic evaluator for training
     evaluator=evaluator, 
     memory_buffer=replay_memory,
-    max_episode_steps=500,  
+    max_episode_steps=1000,  
     env_step_fn=partial(bg_step_fn, env),
     env_init_fn=init_fn,
     state_to_nn_input_fn=state_to_nn_input,
@@ -160,32 +171,27 @@ trainer = StochasticTrainer(
         # Add another tester using the RandomEvaluator
         TwoPlayerBaseline(
             num_episodes=2, 
-            baseline_evaluator=bg_hit2_eval, # Use the random evaluator here
+            baseline_evaluator=hit2_mcts_test, # Use the random evaluator here
             # Optionally add rendering for this baseline too
             #render_fn=render_fn, 
             #render_dir='training_eval/random_baseline',
-            name='random_baseline'
+            name='hit2_baseline'
         )
     ],
     
     evaluator_test=evaluator_test, 
-    wandb_project_name=None
+    wandb_project_name="turbozero_test_backgammon_train"
 )
 
 # --- Main Execution ---
 def test_backgammon_training_loop():
     """Runs a minimal training loop for Backgammon with StochasticMCTS."""
     print("Starting minimal Backgammon training test with StochasticMCTS...")
-    try:
-        print("Using minimal configuration with StochasticMCTS and Pip Count Test Evaluator")
-        # Pass the trainer instance created in the global scope
-        output = trainer.train_loop(seed=42, num_epochs=6, eval_every=3)
-        print("Training loop completed successfully.")
-        assert output is not None # Basic check to ensure it ran
-    except Exception as e:
-        print(f"An error occurred during training: {e}")
-        
-        traceback.print_exc()
-        pytest.fail(f"Training loop failed with exception: {e}")
+    
+    print("Using minimal configuration with StochasticMCTS and Pip Count Test Evaluator")
+    # Pass the trainer instance created in the global scope
+    output = trainer.train_loop(seed=42, num_epochs=6, eval_every=3)
+    print("Training loop completed successfully.")
+    assert output is not None # Basic check to ensure it ran
 
     print("Test finished.") 

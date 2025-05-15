@@ -466,7 +466,7 @@ def test_stochastic_action_probs_propagation(stochastic_mcts, backgammon_env):
     assert stochastic_mcts.stochastic_action_probs is backgammon_env.stochastic_action_probs, "Evaluator should use env's stochastic_action_probs"
     
     # Check properties of the probabilities
-    assert len(stochastic_mcts.stochastic_action_probs) == (6 if backgammon_env.simple_doubles else 21), "Should have correct number of stochastic actions"
+    assert len(stochastic_mcts.stochastic_action_probs) == 21, "Should have correct number of stochastic actions"
     assert jnp.isclose(jnp.sum(stochastic_mcts.stochastic_action_probs), 1.0), "Stochastic action probs should sum to 1"
     
     print("test_stochastic_action_probs_propagation PASSED")

@@ -433,9 +433,8 @@ class Trainer:
         buffer_state = collection_state.buffer_state
         
         batch_metrics = []
-        train_start_time = jax.numpy.asarray(time.time())
         
-        for step_idx in range(num_steps):
+        for _ in range(num_steps):
             step_key, key = jax.random.split(key)
             # sample from replay memory
             batch = self.memory_buffer.sample(buffer_state, step_key, self.train_batch_size)
@@ -453,15 +452,6 @@ class Trainer:
         else:
             metrics = {}
         
-        # Add replay buffer statistics
-        metrics["buffer/size"] = jnp.sum(buffer_state.populated)
-        metrics["buffer/valid_samples"] = jnp.sum(buffer_state.has_reward)
-        metrics["buffer/fullness_pct"] = 100.0 * jnp.sum(buffer_state.populated) / buffer_state.populated.size
-        
-        # Performance metrics
-        train_duration = jax.numpy.asarray(time.time()) - train_start_time
-        metrics["perf/train_steps_per_sec"] = num_steps / jnp.maximum(train_duration, 1e-6)
-        metrics["perf/samples_per_sec"] = (num_steps * self.train_batch_size) / jnp.maximum(train_duration, 1e-6)
         
         # return updated collection state, train state, and metrics
         return collection_state, train_state, metrics
@@ -691,6 +681,9 @@ class Trainer:
         # warmup
         # populate replay buffer with initial self-play games
         # Only do warmup if warmup_steps > 0
+        # I think this is why inside of collect_steps, we have a conditional for num_steps > 0
+        # However, I think it's probably better to do this in the training loop, 
+        # Rather than inside of collect_steps, todo: Performance improvement
         if self.warmup_steps > 0:
             collect_key, key = jax.random.split(key)
             collect_keys = partition(jax.random.split(collect_key, self.batch_size), self.num_devices)
@@ -707,46 +700,39 @@ class Trainer:
             collect_keys = partition(jax.random.split(collect_key, self.batch_size), self.num_devices)
             collection_state = collect(collect_keys, collection_state, params, self.collection_steps_per_epoch)
             collect_duration = time.time() - collect_start_time
-            
+
             # Train
             train_start_time = time.time()
             train_key, key = jax.random.split(key)
             collection_state, train_state, metrics = self.train_steps(train_key, collection_state, train_state, self.train_steps_per_epoch)
-            train_duration = time.time() - train_start_time
             
-            # Add performance metrics
+            train_duration = time.time() - train_start_time
+            metrics["perf/train_time_sec"] = train_duration
+            metrics["perf/train_steps_per_sec"] = self.train_steps_per_epoch * self.train_batch_size / jnp.maximum(train_duration, 1e-6)
+            
+           # Add performance metrics
             collection_steps = self.batch_size * (cur_epoch+1) * self.collection_steps_per_epoch
             metrics["perf/collect_time_sec"] = collect_duration
-            metrics["perf/train_time_sec"] = train_duration
             metrics["perf/collect_steps_per_sec"] = self.collection_steps_per_epoch / max(collect_duration, 1e-6)
-            metrics["perf/collect_game_steps_per_sec"] = (self.collection_steps_per_epoch * self.batch_size) / max(collect_duration, 1e-6)
+            # we don't know how many games, 
+            #metrics["perf/collect_game_steps_per_sec"] = (self.collection_steps_per_epoch * self.batch_size) / max(collect_duration, 1e-6)
+
             
-            # Add replay buffer metrics
+           # Add replay buffer statistics
             buffer_state = collection_state.buffer_state
-            metrics["buffer/size"] = jnp.sum(jax.device_get(buffer_state.populated))
-            metrics["buffer/valid_samples"] = jnp.sum(jax.device_get(buffer_state.has_reward))
-            metrics["buffer/fullness_pct"] = 100.0 * jnp.sum(jax.device_get(buffer_state.populated)) / jax.device_get(buffer_state.populated).size
-            
-            # Add MCTS statistics if the evaluator has the method
-            # This is outside of JAX compilation, so if statements are fine
-            # Skip MCTS stats for now since there's a bug with get_tree_stats
-            """if hasattr(self.evaluator_train, "get_tree_stats"):
-                # Get first device's stats as a sample
-                eval_state_sample = jax.device_get(jax.tree_util.tree_map(lambda x: x[0], collection_state.eval_state))
-                tree_stats = self.evaluator_train.get_tree_stats(eval_state_sample)
-                metrics.update(tree_stats)"""
-            
-            # Track game completion statistics
-            metadata = jax.device_get(collection_state.metadata)
-            metrics["game/terminated_count"] = jnp.sum(metadata.terminated)
-            metrics["game/terminated_pct"] = 100.0 * jnp.sum(metadata.terminated) / metadata.terminated.size
+            populated = jnp.sum(buffer_state.populated)
+            metrics["buffer/populated"] = populated
+            metrics["buffer/has_reward"] = jnp.sum(buffer_state.has_reward)
+            metrics["buffer/fullness_pct"] = 100.0 * populated / buffer_state.populated.size
             
             # Log metrics
             self.log_metrics(metrics, cur_epoch, step=collection_steps)
+            
 
             # test 
             if cur_epoch % eval_every == 0:
                 params = self.extract_model_params_fn(train_state)
+                test_start_time = time.time()
                 for i, test_state in enumerate(tester_states):
                     run_key, key = jax.random.split(key)
                     new_test_state, metrics, rendered = self.testers[i].run(
@@ -759,12 +745,17 @@ class Trainer:
                     if rendered and self.run is not None:
                         self.run.log({f'{self.testers[i].name}_game': wandb.Video(rendered)}, step=collection_steps)
                     tester_states[i] = new_test_state
+                    metrics[f"perf/test_{self.testers[i].name}_time_sec"] = time.time() - test_start_time
             # save checkpoint
             # make sure previous save task has finished 
             self.checkpoint_manager.wait_until_finished()
             self.save_checkpoint(train_state, cur_epoch)
             # next epoch
             cur_epoch += 1
+
+             # Log metrics
+            metrics["perf/epoch_time_sec"] = time.time() - epoch_start_time
+            self.log_metrics(metrics, cur_epoch, step=collection_steps)
             
         # make sure last save task has finished
         self.checkpoint_manager.wait_until_finished() #
