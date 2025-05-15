@@ -42,6 +42,8 @@ poetry source add jax https://storage.googleapis.com/jax-releases/jax_cuda_relea
 to point poetry towards JAX cuda releases, then use
 ```
 poetry add jax[cuda12_pip]==0.4.35
+For jax >= 6 Use:
+poetry add jax[cuda12]
 ```
 to install the CUDA 12 release for JAX. See https://jax.readthedocs.io/en/latest/installation.html for other devices/cuda versions.
 

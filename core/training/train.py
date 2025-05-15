@@ -695,6 +695,7 @@ class Trainer:
             epoch_start_time = time.time()
             
             # Collect self-play games
+            print("Collecting self-play games")
             collect_start_time = time.time()
             collect_key, key = jax.random.split(key)
             collect_keys = partition(jax.random.split(collect_key, self.batch_size), self.num_devices)
@@ -702,6 +703,7 @@ class Trainer:
             collect_duration = time.time() - collect_start_time
 
             # Train
+            print("Training")
             train_start_time = time.time()
             train_key, key = jax.random.split(key)
             collection_state, train_state, metrics = self.train_steps(train_key, collection_state, train_state, self.train_steps_per_epoch)
@@ -730,6 +732,7 @@ class Trainer:
             
 
             # test 
+            print("Testing")
             if cur_epoch % eval_every == 0:
                 params = self.extract_model_params_fn(train_state)
                 test_start_time = time.time()
