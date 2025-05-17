@@ -95,6 +95,22 @@ mlp_policy_value_net = SimpleMLP(num_actions=NUM_ACTIONS, hidden_dim=32)
 # Instantiate the Random Evaluator
 random_evaluator = BGRandomEvaluator()
 
+def get_temperature(epoch: int, num_epochs: int, start_temp: float = 1.0, end_temp: float = 0.0) -> float:
+    """Calculate temperature based on current epoch.
+    
+    Args:
+        epoch: Current epoch number
+        num_epochs: Total number of epochs
+        start_temp: Starting temperature (default: 1.0)
+        end_temp: Final temperature (default: 0.0)
+        
+    Returns:
+        float: Temperature value for the current epoch
+    """
+    # Linear decay from start_temp to end_temp
+    progress = epoch / (num_epochs - 1) if num_epochs > 1 else 1.0
+    return start_temp - (start_temp - end_temp) * progress
+
 # --- Evaluators ---
 # Training evaluator: StochasticMCTS using NN
 evaluator = StochasticMCTS(   #Explores new moves
@@ -104,7 +120,7 @@ evaluator = StochasticMCTS(   #Explores new moves
     max_nodes=300,      
     branching_factor=NUM_ACTIONS,
     action_selector=PUCTSelector(),
-    temperature=1.0,
+    temperature=1.0,  # Initial temperature, will be updated during training
 )
 
 evaluator_test = StochasticMCTS(   #Use optimized moves, temperature=0.0
@@ -146,7 +162,6 @@ replay_memory = EpisodeReplayBuffer(capacity=500)
 
 # --- Main Execution ---
 def test_backgammon_training_loop():
-
     # --- Trainer ---
     trainer = StochasticTrainer(
         batch_size=2,      # Minimal batch size
@@ -178,7 +193,7 @@ def test_backgammon_training_loop():
                 num_episodes=2, 
                 baseline_evaluator=hit2_mcts_test, # Use the random evaluator here
                 # Optionally add rendering for this baseline too
-                render_fn=render_fn, 
+                #render_fn=render_fn,  # renddering takes way tooo long
                 #render_dir='training_eval/random_baseline',
                 name='hit2_baseline'
             )
@@ -191,15 +206,23 @@ def test_backgammon_training_loop():
     print("Starting minimal Backgammon training test with StochasticMCTS...")
     
     print("Using minimal configuration with StochasticMCTS and Pip Count Test Evaluator")
-    # Pass the trainer instance created in the global scope
-    output = trainer.train_loop(seed=42, num_epochs=6, eval_every=3)
+    
+    num_epochs = 6
+    # Update temperature for each epoch
+    for epoch in range(num_epochs):
+        current_temp = get_temperature(epoch, num_epochs)
+        evaluator.temperature = current_temp
+        print(f"Epoch {epoch + 1}/{num_epochs}, Temperature: {current_temp:.2f}")
+        
+        # Run one epoch of training
+        output = trainer.train_loop(seed=42, num_epochs=1, eval_every=1)
+        assert output is not None # Basic check to ensure it ran
+    
     print("Training loop completed successfully.")
-    assert output is not None # Basic check to ensure it ran
-
     print("Test finished.")
 
 
-def test_train_step_test():
+def test_train_step_test_large_nn():
     resnet_model = ResNetTurboZero(
         num_actions=env.num_actions,  # i.e. micro_steps*(micro_src + micro_die)
         hidden_dim=256,
