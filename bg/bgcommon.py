@@ -10,9 +10,9 @@ import chex
 from pgx import backgammon as bg
 from pgx.core import Env
 
-from core.types import StepMetadata
-from core.evaluators.evaluator import Evaluator, EvalOutput
-from core.types import EnvStepFn
+from ..core.types import StepMetadata
+from ..core.evaluators.evaluator import Evaluator, EvalOutput
+from ..core.types import EnvStepFn
 from pgx._src.types import Array
 import flax.linen as nn
 
