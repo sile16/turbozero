@@ -198,9 +198,7 @@ def test_backgammon_training_loop():
                 name='hit2_baseline'
             )
         ],
-        
-        evaluator_test=evaluator_test, 
-        wandb_project_name="turbozero_test_backgammon_train"
+        evaluator_test=evaluator_test
     )
     """Runs a minimal training loop for Backgammon with StochasticMCTS."""
     print("Starting minimal Backgammon training test with StochasticMCTS...")
@@ -208,6 +206,7 @@ def test_backgammon_training_loop():
     print("Using minimal configuration with StochasticMCTS and Pip Count Test Evaluator")
     
     num_epochs = 6
+    output = None
     # Update temperature for each epoch
     for epoch in range(num_epochs):
         current_temp = get_temperature(epoch, num_epochs)
@@ -215,7 +214,7 @@ def test_backgammon_training_loop():
         print(f"Epoch {epoch + 1}/{num_epochs}, Temperature: {current_temp:.2f}")
         
         # Run one epoch of training
-        output = trainer.train_loop(seed=42, num_epochs=1, eval_every=1)
+        output = trainer.train_loop(seed=42, num_epochs=1, eval_every=1, initial_state=output)
         assert output is not None # Basic check to ensure it ran
     
     print("Training loop completed successfully.")
@@ -245,8 +244,7 @@ def test_train_step_test_large_nn():
         max_episode_steps=1000,  
         env_step_fn=partial(bg_step_fn, env),
         env_init_fn=init_fn,
-        state_to_nn_input_fn=state_to_nn_input,
-        wandb_project_name="turbozero_test_backgammon_train_large_nn"
+        state_to_nn_input_fn=state_to_nn_input
     )
     
 

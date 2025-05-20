@@ -707,7 +707,7 @@ class Trainer:
             train_start_time = time.time()
             train_key, key = jax.random.split(key)
             collection_state, train_state, metrics = self.train_steps(train_key, collection_state, train_state, self.train_steps_per_epoch)
-            
+            print("Training Done")
             train_duration = time.time() - train_start_time
             metrics["perf/train_time_sec"] = train_duration
             metrics["perf/train_steps_per_sec"] = self.train_steps_per_epoch * self.train_batch_size / jnp.maximum(train_duration, 1e-6)
