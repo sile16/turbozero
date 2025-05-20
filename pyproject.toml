@@ -20,8 +20,8 @@ wandb = ">=0.18.6"
 # Platform-specific JAX dependencies
 #jax = {version = ">=0.5.0", extras = ["cuda12"], platform = "linux", markers = "platform_system == 'Linux' and extra == 'cuda'"}
 
-jax = {version = ">=0.5.0"}
-jaxlib = ">=0.5.0"
+jax = {version = ">=0.4.35"}
+jaxlib = ">=0.4.35"
 flax = ">=0.10.5"
 optax = ">=0.1.8"
 orbax-checkpoint = ">=0.10.1"
