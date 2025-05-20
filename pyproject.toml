@@ -6,8 +6,7 @@ authors = ["lowrollr <92640744+lowrollr@users.noreply.github.com>"]
 license = "Apache-2.0"
 readme = "README.md"
 packages = [
-    { include = "core" },
-    { include = "bg" }
+    { include = "core" }
 ]
 
 [[tool.poetry.source]]

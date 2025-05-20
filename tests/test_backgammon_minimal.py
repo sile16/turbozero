@@ -7,7 +7,7 @@ import jax
 import jax.numpy as jnp
 import pgx.backgammon as bg
 
-from bg.bgcommon import  bg_simple_step_fn, bg_pip_count_eval, bg_hit2_eval
+from core.bgcommon import  bg_simple_step_fn, bg_pip_count_eval, bg_hit2_eval
 
 from core.types import StepMetadata
 from core.evaluators.mcts.action_selection import PUCTSelector

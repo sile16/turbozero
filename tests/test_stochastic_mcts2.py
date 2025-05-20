@@ -18,8 +18,8 @@ from core.evaluators.mcts.action_selection import PUCTSelector
 from core.types import StepMetadata
 
 
-from bg.bgcommon import bg_hit2_eval, bg_step_fn as backgammon_step_fn
-from bg.bgcommon import bg_pip_count_eval as backgammon_eval_fn
+from core.bgcommon import bg_hit2_eval, bg_step_fn as backgammon_step_fn
+from core.bgcommon import bg_pip_count_eval as backgammon_eval_fn
 
 
 # --- Fixtures ---

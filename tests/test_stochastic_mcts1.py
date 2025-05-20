@@ -19,7 +19,7 @@ from core.evaluators.mcts.action_selection import PUCTSelector
 from core.trees.tree import Tree, init_tree
 from core.types import StepMetadata
 
-from bg.bgcommon import bg_step_fn, bg_pip_count_eval
+from core.bgcommon import bg_step_fn, bg_pip_count_eval
 
 # Define the backgammon step function factory
 def backgammon_step_fn(env: bg.Backgammon):

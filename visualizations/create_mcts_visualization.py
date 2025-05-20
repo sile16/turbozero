@@ -27,7 +27,7 @@ import pgx.backgammon as bg
 from core.evaluators.mcts.stochastic_mcts import StochasticMCTS
 from core.evaluators.mcts.action_selection import PUCTSelector
 from core.types import StepMetadata
-from bg.bgcommon import bg_pip_count_eval, bg_step_fn
+from core.bgcommon import bg_pip_count_eval, bg_step_fn
 
 # Create a sample Backgammon environment for action labels and SVG generation
 backgammon_env = bg.Backgammon(simple_doubles=True)

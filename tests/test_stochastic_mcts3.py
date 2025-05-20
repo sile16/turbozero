@@ -12,8 +12,8 @@ from core.types import StepMetadata
 
 env = bg.Backgammon(simple_doubles=True)
 
-from bg.bgcommon import bg_step_fn 
-from bg.bgcommon import bg_pip_count_eval, bg_hit2_eval
+from core.bgcommon import bg_step_fn 
+from core.bgcommon import bg_pip_count_eval, bg_hit2_eval
 
 
 def test_stochastic_mcts_backgammon_simple_doubles_valid_actions():
