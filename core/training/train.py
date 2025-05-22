@@ -727,16 +727,19 @@ class Trainer:
             metrics["buffer/has_reward"] = jnp.sum(buffer_state.has_reward)
             metrics["buffer/fullness_pct"] = 100.0 * populated / buffer_state.populated.size
             
+            metrics["perf/epoch_time_sec"] = time.time() - epoch_start_time
             # Log metrics
             self.log_metrics(metrics, cur_epoch, step=collection_steps)
             
 
             # test 
-            print("Testing")
+            
             if cur_epoch % eval_every == 0:
+                print("Testing")
                 params = self.extract_model_params_fn(train_state)
-                test_start_time = time.time()
+                
                 for i, test_state in enumerate(tester_states):
+                    test_start_time = time.time()
                     run_key, key = jax.random.split(key)
                     new_test_state, metrics, rendered = self.testers[i].run(
                         key=run_key, epoch_num=cur_epoch, max_steps=self.max_episode_steps, num_devices=self.num_devices,
@@ -744,21 +747,20 @@ class Trainer:
                         state=test_state, params=params)
                         
                     metrics = {k: v.mean() for k, v in metrics.items()}
+                    metrics[f"perf/test_{self.testers[i].name}_time_sec"] = time.time() - test_start_time
                     self.log_metrics(metrics, cur_epoch, step=collection_steps)
+                    
                     if rendered and self.run is not None:
                         self.run.log({f'{self.testers[i].name}_game': wandb.Video(rendered)}, step=collection_steps)
                     tester_states[i] = new_test_state
-                    metrics[f"perf/test_{self.testers[i].name}_time_sec"] = time.time() - test_start_time
+
+                
             # save checkpoint
             # make sure previous save task has finished 
             self.checkpoint_manager.wait_until_finished()
             self.save_checkpoint(train_state, cur_epoch)
             # next epoch
             cur_epoch += 1
-
-             # Log metrics
-            metrics["perf/epoch_time_sec"] = time.time() - epoch_start_time
-            self.log_metrics(metrics, cur_epoch, step=collection_steps)
             
         # make sure last save task has finished
         self.checkpoint_manager.wait_until_finished() #
