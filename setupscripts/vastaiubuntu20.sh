@@ -22,5 +22,7 @@ pyenv global 3.12
 git clone https://github.com/sile16/turbozero.git
 pip install git+https://github.com/sile16/turbozero.git
 
+apt-get -y install libcairo2-dev
 
-
+# if necessary to avoid XLA errors
+export XLA_FLAGS="--xla_gpu_autotune_level=0"
