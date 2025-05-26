@@ -5,6 +5,13 @@ during self-play data collection, by not adding stochastnic nodes to replay buff
 import jax
 import jax.numpy as jnp
 import chex
+import time
+from typing import Optional, Tuple
+import wandb
+
+from flax.training.train_state import TrainState
+from core.training.train import Trainer, CollectionState, ReplayBufferState
+from core.types import BaseExperience
 
 
 from core.training.train import Trainer, CollectionState, ReplayBufferState
@@ -13,6 +20,10 @@ from core.types import BaseExperience
 class StochasticTrainer(Trainer):
     """Trainer variant that explicitly handles stochastic environment steps 
     during self-play data collection."""
+
+    def set_temp_fn(self, temp_func: Callable[int, float]) -> None:
+        self.temp_func = temp_func
+
 
     def collect(self,
         key: jax.random.PRNGKey,
@@ -110,4 +121,156 @@ class StochasticTrainer(Trainer):
             env_state=new_env_state,
             buffer_state=buffer_state,
             metadata=new_metadata
+        )
+    
+    def train_loop(self,
+        seed: int,
+        num_epochs: int,
+        eval_every: int = 1,
+        initial_state: Optional[TrainLoopOutput] = None
+        ) -> Tuple[CollectionState, TrainState]:
+        """Runs the training loop for `num_epochs` epochs. Mostly configured by the Trainer's attributes.
+        - Collects self-play episdoes across a batch of environments.
+        - Trains the neural network on the collected experiences.
+        - Tests the agent on a set of Testers, which evaluate the agent's performance.
+
+        Args:
+        - `seed`: rng seed (int)
+        - `num_epochs`: number of epochs to run the training loop for
+        - `eval_every`: number of epochs between evaluations
+        - `initial_state`: (optional) TrainLoopOutput, used to continue training from a previous state
+
+        Returns:
+        - (TrainLoopOutput): contains train_state, collection_state, test_states, cur_epoch after training loop
+        """
+        # init rng
+        key = jax.random.PRNGKey(seed)
+
+        # initialize states
+        if initial_state:
+            collection_state = initial_state.collection_state
+            train_state = initial_state.train_state
+            tester_states = initial_state.test_states
+            cur_epoch = initial_state.cur_epoch
+        else:
+            cur_epoch = 0
+            # initialize collection state
+            init_key, key = jax.random.split(key)
+            collection_state = partition(self.init_collection_state(init_key, self.batch_size), self.num_devices)
+            # initialize train state
+            init_key, key = jax.random.split(key)
+            init_keys = jnp.tile(init_key[None], (self.num_devices, 1))
+            train_state = self.init_train_state(init_keys)
+            params = self.extract_model_params_fn(train_state)
+            # initialize tester states
+            tester_states = []
+            for tester in self.testers:
+                state = jax.pmap(tester.init, axis_name='d')(params=params)
+                tester_states.append(state)
+        
+        # Define collect function before warmup
+
+        collect = jax.vmap(self.collect_steps, in_axes=(1, 1, None, None), out_axes=1)
+        params = self.extract_model_params_fn(train_state)
+        
+        # warmup
+        # populate replay buffer with initial self-play games
+        # Only do warmup if warmup_steps > 0
+        # I think this is why inside of collect_steps, we have a conditional for num_steps > 0
+        # However, I think it's probably better to do this in the training loop, 
+        # Rather than inside of collect_steps, todo: Performance improvement
+        if self.warmup_steps > 0:
+            collect_key, key = jax.random.split(key)
+            collect_keys = partition(jax.random.split(collect_key, self.batch_size), self.num_devices)
+            collection_state = collect(collect_keys, collection_state, params, self.warmup_steps)
+
+        # training loop
+        while cur_epoch < num_epochs:
+            # Track epoch start time for performance metrics
+
+            # get the temperature
+            current_temp = self.temp_func(cur_epoch * self.collection_steps_per_epoch)
+            metrics["collect/temperature"] = current_temp
+            self.evaluator_train.temperature = current_temp
+
+
+
+            epoch_start_time = time.time()
+            
+            # Collect self-play games
+            print("Collecting self-play games")
+            collect_start_time = time.time()
+            collect_key, key = jax.random.split(key)
+            collect_keys = partition(jax.random.split(collect_key, self.batch_size), self.num_devices)
+            collection_state = collect(collect_keys, collection_state, params, self.collection_steps_per_epoch)
+            collect_duration = time.time() - collect_start_time
+
+            # Train
+            print("Training")
+            train_start_time = time.time()
+            train_key, key = jax.random.split(key)
+            collection_state, train_state, metrics = self.train_steps(train_key, collection_state, train_state, self.train_steps_per_epoch)
+            print("Training Done")
+            train_duration = time.time() - train_start_time
+            metrics["perf/train_time_sec"] = train_duration
+            metrics["perf/train_steps_per_sec"] = self.train_steps_per_epoch * self.train_batch_size / jnp.maximum(train_duration, 1e-6)
+            
+           # Add performance metrics
+            collection_steps = self.batch_size * (cur_epoch+1) * self.collection_steps_per_epoch
+            metrics["perf/collect_time_sec"] = collect_duration
+            metrics["perf/collect_steps_per_sec"] = self.collection_steps_per_epoch / max(collect_duration, 1e-6)
+            # we don't know how many games, 
+            #metrics["perf/collect_game_steps_per_sec"] = (self.collection_steps_per_epoch * self.batch_size) / max(collect_duration, 1e-6)
+
+            
+           # Add replay buffer statistics
+            buffer_state = collection_state.buffer_state
+            populated = jnp.sum(buffer_state.populated)
+            metrics["buffer/populated"] = populated
+            metrics["buffer/has_reward"] = jnp.sum(buffer_state.has_reward)
+            metrics["buffer/fullness_pct"] = 100.0 * populated / buffer_state.populated.size
+            
+            metrics["perf/epoch_time_sec"] = time.time() - epoch_start_time
+            # Log metrics
+            self.log_metrics(metrics, cur_epoch, step=collection_steps)
+            
+
+            # test 
+            
+            if cur_epoch % eval_every == 0:
+                print("Testing")
+                params = self.extract_model_params_fn(train_state)
+                
+                for i, test_state in enumerate(tester_states):
+                    test_start_time = time.time()
+                    run_key, key = jax.random.split(key)
+                    new_test_state, metrics, rendered = self.testers[i].run(
+                        key=run_key, epoch_num=cur_epoch, max_steps=self.max_episode_steps, num_devices=self.num_devices,
+                        env_step_fn=self.env_step_fn, env_init_fn=self.env_init_fn, evaluator=self.evaluator_test,
+                        state=test_state, params=params)
+                        
+                    metrics = {k: v.mean() for k, v in metrics.items()}
+                    metrics[f"perf/test_{self.testers[i].name}_time_sec"] = time.time() - test_start_time
+                    self.log_metrics(metrics, cur_epoch, step=collection_steps)
+                    
+                    if rendered and self.run is not None:
+                        self.run.log({f'{self.testers[i].name}_game': wandb.Video(rendered)}, step=collection_steps)
+                    tester_states[i] = new_test_state
+
+                
+            # save checkpoint
+            # make sure previous save task has finished 
+            self.checkpoint_manager.wait_until_finished()
+            self.save_checkpoint(train_state, cur_epoch)
+            # next epoch
+            cur_epoch += 1
+            
+        # make sure last save task has finished
+        self.checkpoint_manager.wait_until_finished() #
+        # return state so that training can be continued!
+        return TrainLoopOutput(
+            collection_state=collection_state,
+            train_state=train_state,
+            test_states=tester_states,
+            cur_epoch=cur_epoch
         )
