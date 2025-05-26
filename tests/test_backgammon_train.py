@@ -182,7 +182,7 @@ def test_backgammon_training_loop():
         testers=[
             # Use our custom BackgammonTwoPlayerBaseline
             TwoPlayerBaseline(
-                num_episodes=5,
+                num_episodes=50,
                 baseline_evaluator=pip_count_mcts_evaluator_test,
                 #render_fn=render_fn,
                 #render_dir='training_eval/pip_count_baseline',
@@ -190,7 +190,7 @@ def test_backgammon_training_loop():
             ),
             # Add another tester using the RandomEvaluator
             TwoPlayerBaseline(
-                num_episodes=5, 
+                num_episodes=50, 
                 baseline_evaluator=hit2_mcts_test, # Use the random evaluator here
                 # Optionally add rendering for this baseline too
                 #render_fn=render_fn,  # renddering takes way tooo long
