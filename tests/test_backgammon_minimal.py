@@ -125,3 +125,38 @@ def test_backgammon_evaluator():
     assert after_roll_state.legal_action_mask[output.action]
     
     print("Evaluator test completed successfully!") 
+
+def test_bg_pip_count_eval():
+    """Test the pip count evaluator."""
+    print("\nTesting pip count evaluator...")
+    
+    # --- Environment Setup ---
+    env = bg.Backgammon(simple_doubles=True)
+    num_actions = env.num_actions
+    
+    # Initialize game with fixed seed for reproducibility
+    state = env.init(jax.random.PRNGKey(42))  # type: ignore
+
+    dice = jnp.array([2, 3], dtype=jnp.int32)
+    board = jnp.array([-1, 0, 0, -1, 0, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 1, 0, 0, 12, -12], dtype=jnp.int32)  # type: ignore
+    
+    state = state.replace(
+        _board=board,
+    )
+    state = env.set_dice(state, dice)
+
+    count0 = bg_pip_count_eval(state, None, None)
+    assert count0[1] == 0
+
+    new_state = env.step(state, 122, jax.random.PRNGKey(0))
+    count1 = bg_pip_count_eval(new_state, None, None)
+    assert count1[1] > 0
+    new_new_state = env.step(new_state, 135, jax.random.PRNGKey(0))
+
+    # this changes player perspective, so we want to mkae sure count2 
+    count2 = bg_pip_count_eval(new_new_state, None, None)
+    
+    print(f"Count1: {count1}, Count2: {count2}")
+    assert (-1 * count2[1]) > count1[1]
+
+    print("Pip count evaluator test completed successfully!")

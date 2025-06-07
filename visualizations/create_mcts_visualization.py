@@ -12,6 +12,8 @@ import json
 import graphviz
 import numpy as np
 import glob
+from typing import Any
+Array = Any
 
 # cairosvg might not be needed if we save SVGs directly
 # import cairosvg 
@@ -30,7 +32,7 @@ from core.types import StepMetadata
 from core.bgcommon import bg_pip_count_eval, bg_step_fn
 
 # Create a sample Backgammon environment for action labels and SVG generation
-backgammon_env = bg.Backgammon(simple_doubles=True)
+backgammon_env = bg.Backgammon(short_game=True)
 print("Backgammon environment initialized.")
 
 def tree_to_graph(eval_state, output_dir, boards_dir):
@@ -69,21 +71,9 @@ def tree_to_graph(eval_state, output_dir, boards_dir):
         q_value = float(node_data.q)
         visit_count = int(node_data.n)
         
-        # Get parent and calculate discounted Q value
-        parent_idx = tree.parents[node_idx]
-        discounted_q = q_value
         
-        # Add discounted Q value if parent exists
-        if parent_idx != tree.NULL_INDEX:
-            current_player = node_data.embedding.current_player
-            parent_player = tree.data_at(parent_idx).embedding.current_player
-            
-            # Calculate discount factor
-            player_diff = abs(current_player - parent_player)
-            discount_factor = 1.0 - 2.0 * player_diff
-            
-            # Apply discount
-            discounted_q = q_value * discount_factor
+        
+        
         
         # Debug for each node
         if node_idx < 10:  # Limit to first 10 nodes to avoid spam
@@ -105,32 +95,33 @@ def tree_to_graph(eval_state, output_dir, boards_dir):
         
         # Create node label
         player_id = node_data.embedding.current_player if hasattr(node_data.embedding, 'current_player') else 'N/A'
-        label = f"Node {node_idx}\\nPlayer: {player_id} (0=W, 1=B)\\nVisits: {visit_count}\\nQ: {q_value:.4f}\\nDisc Q: {discounted_q:.4f}"
-        # Add policy visualization (top 3 actions for brevity)
+        label = f"Node {node_idx}\\nPlayer: {player_id} (0=W, 1=B)\\nVisits: {visit_count}\\nQ: {q_value:.4f}"
+        # Add policy visualization (top 8 actions for brevity)
         if hasattr(node_data, 'p') and node_data.p is not None and visit_count > 0: # Only show for visited nodes with policy
             try:
                 # Ensure policy is numpy array for sorting
                 policy_array = np.array(node_data.p) 
                 # Get indices of top k probabilities
-                top_k = 3
+                top_k = 8
                 top_indices = np.argsort(policy_array)[-top_k:][::-1]
                 policy_str_parts = []
-                for idx in top_indices:
-                    prob = policy_array[idx]
-                    if prob > 0.001: # Threshold to avoid tiny noise
-                        # Attempt to get action string, fallback to index
-                        try:
-                            # Determine if the node itself is stochastic to hint at action type
-                            is_stochastic_node = StochasticMCTS.is_node_idx_stochastic(tree, node_idx)
-                            if is_stochastic_node:
-                                action_label = bg.stochastic_action_to_str(idx)
-                            else:
-                                action_label = bg.action_to_str(idx)
-                        except:
-                            action_label = f"A:{idx}" # Fallback label
-                        policy_str_parts.append(f"{action_label}={prob:.2f}")
-                if policy_str_parts:
+                no_op = True
+                is_stochastic_node = StochasticMCTS.is_node_idx_stochastic(tree, node_idx)
+                if not is_stochastic_node:
+                    for idx in top_indices:
+                        if idx > 5: 
+                            no_op = False
+                        prob = policy_array[idx]
+                        if prob > 0.001:
+                            action_label = bg.action_to_str(idx)
+                            policy_str_parts.append(f"{action_label}={prob:.2f}")
+                else:
+                    no_op = False
+                if no_op:
+                    label += "\\nNo-Op"
+                elif policy_str_parts:
                     label += "\\nPolicy: " + ", ".join(policy_str_parts)
+                
             except Exception as e:
                 label += "\\nPolicy: (Error)" # Indicate if policy parsing failed
         
@@ -248,6 +239,10 @@ def create_real_mcts_visualization(output_dir):
     # Initialize state
     key, init_key = jax.random.split(key)
     state = backgammon_env.init(init_key)
+
+    board: Array = jnp.array([-1, 0, 0, -1, 0, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 1, 0, 0, 12, -12], dtype=jnp.int32)  # type: ignore
+    state = state.replace(_board=board)
+
     
     # Initialize tree and metadata
     eval_state = mcts.init(template_embedding=state)
@@ -261,8 +256,8 @@ def create_real_mcts_visualization(output_dir):
 
     visualization_frames = []
     frame_idx = 0
-    total_turns = 3 # Reduced to 2 turns for faster testing
-    iterations_per_deterministic_turn = 50 # Reduced to 5 iterations for faster visualization
+    total_turns = 10 # Reduced to 2 turns for faster testing
+    iterations_per_deterministic_turn = 25 # Reduced to 5 iterations for faster visualization
 
     # Keep track of the latest board SVG paths relative to output_dir
     last_saved_curr_board_path = None
@@ -404,7 +399,7 @@ def create_real_mcts_visualization(output_dir):
                 if eval_state.next_free_idx > 1: # Check if node 1 exists
                     try:
                         node1_data = eval_state.data_at(1)
-                        node1_policy = np.array(node1_data.p) # Convert to numpy for printing
+                        node1_= np.array(node1_data.p) # Convert to numpy for printing
                         node1_mask = np.array(node1_data.embedding.legal_action_mask)
                         print(f"    DEBUG: Inspecting Node 1 (after iter {iteration+1}):")
                         print(f"      Node 1 Policy (Top 5): {np.argsort(node1_policy)[-5:][::-1]}") # Indices of top 5
@@ -418,16 +413,6 @@ def create_real_mcts_visualization(output_dir):
                 # Simple tree size check without JAX callbacks
                 print(f"    DEBUG: After iteration {iteration+1}, tree size: {eval_state.next_free_idx}")
                 
-                # Commented out verification check for now as it's causing tracer leaks
-                # if iteration == 5:
-                #     node_count = eval_state.next_free_idx
-                #     print(f"\n==== VERIFICATION CHECK - ITERATION 5 ====")
-                #     print(f"Tree node count: {node_count}")
-                #     if node_count > 1:
-                #         print(f"✅ SUCCESS: Tree has expanded beyond root node with {node_count} total nodes")
-                #     else:
-                #         print(f"❌ FAILURE: Tree has not expanded beyond root node ({node_count} node)")
-                #     print(f"============================================\n")
 
                 # Visualize tree after this iteration
                 graph = tree_to_graph(eval_state, output_dir, boards_dir)

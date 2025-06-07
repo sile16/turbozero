@@ -32,6 +32,7 @@ chex = ">=0.1.85"
 pgx = { git = "https://github.com/sile16/pgx.git", branch = "master" } # Git dependency remains unchanged
 pytest = "^8.3.5"
 cairosvg = "^2.8.2"
+svgwrite = "^1.4.3"
 
 
 [tool.poetry.group.dev.dependencies]
