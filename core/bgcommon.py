@@ -42,7 +42,15 @@ def bg_step_fn(env: Env, state: bg.State, action: int, key: chex.PRNGKey) -> Tup
     def deterministic_branch(operand):
         s, a, k = operand # state, action, key
         # Use env instance captured by closure
-        return env.step(s, a, k)
+        new_state = env.step(s, a, k)
+        # If the state becomes stochastic (player change), we want to keep it that way
+        # but prevent the automatic dice roll by setting playable_dice to -1
+        return jax.lax.cond(
+            new_state.is_stochastic,
+            lambda s: s.replace(_playable_dice=jnp.array([-1, -1, -1, -1])),
+            lambda s: s,
+            new_state
+        )
 
     # Use conditional to route to the appropriate branch
     # The key is only needed for the deterministic branch
