@@ -33,12 +33,16 @@ class ReplayBufferState:
     - `has_reward`: mask for buffer indices that have been assigned a reward
         - we store samples from in-progress episodes, but don't want to be able to sample them 
         until the episode is complete
+    - `games_completed_count`: total number of games completed in this buffer
+    - `total_completed_game_steps`: total steps across all completed games
     """
     next_idx: int
     episode_start_idx: int
     buffer: BaseExperience
     populated: chex.Array
     has_reward: chex.Array
+    games_completed_count: int
+    total_completed_game_steps: int
 
 
 class EpisodeReplayBuffer:
@@ -94,9 +98,19 @@ class EpisodeReplayBuffer:
         Returns:
         - (ReplayBufferState): updated replay buffer state
         """
+        # Calculate episode length (handle wraparound)
+        episode_length = state.next_idx - state.episode_start_idx
+        episode_length = jnp.where(
+            episode_length < 0,
+            episode_length + self.capacity,
+            episode_length
+        )
+        
         return state.replace(
             episode_start_idx = state.next_idx,
             has_reward = jnp.full_like(state.has_reward, True),
+            games_completed_count = state.games_completed_count + 1,
+            total_completed_game_steps = state.total_completed_game_steps + episode_length,
             buffer = state.buffer.replace(
                 reward = jnp.where(
                     ~state.has_reward[..., None],
@@ -203,4 +217,6 @@ class EpisodeReplayBuffer:
             ),
             populated = jnp.full((batch_size, self.capacity,), fill_value=False, dtype=jnp.bool_),
             has_reward = jnp.full((batch_size, self.capacity,), fill_value=True, dtype=jnp.bool_),
+            games_completed_count = jnp.zeros((batch_size,), dtype=jnp.int32),
+            total_completed_game_steps = jnp.zeros((batch_size,), dtype=jnp.int32),
         )

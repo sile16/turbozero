@@ -225,9 +225,24 @@ class StochasticTrainer(Trainer):
            # Add replay buffer statistics
             buffer_state = collection_state.buffer_state
             populated = jnp.sum(buffer_state.populated)
+            trainable_samples = jnp.sum(jnp.logical_and(buffer_state.populated, buffer_state.has_reward))
+            total_capacity = buffer_state.populated.size
+            
+            # Game completion statistics
+            total_games_completed = jnp.sum(buffer_state.games_completed_count)
+            total_game_steps = jnp.sum(buffer_state.total_completed_game_steps)
+            avg_game_length = jnp.where(
+                total_games_completed > 0,
+                total_game_steps / total_games_completed,
+                0.0
+            )
+            
             metrics["buffer/populated"] = populated
-            metrics["buffer/has_reward"] = jnp.sum(buffer_state.has_reward)
-            metrics["buffer/fullness_pct"] = 100.0 * populated / buffer_state.populated.size
+            metrics["buffer/trainable_samples"] = trainable_samples
+            metrics["buffer/fullness_pct"] = 100.0 * populated / total_capacity
+            metrics["buffer/trainable_pct"] = 100.0 * trainable_samples / total_capacity
+            metrics["buffer/games_completed"] = total_games_completed
+            metrics["buffer/avg_game_length"] = avg_game_length
             
             metrics["perf/epoch_time_sec"] = time.time() - epoch_start_time
             # Log metrics
