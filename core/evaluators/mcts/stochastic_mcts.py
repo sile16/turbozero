@@ -5,10 +5,11 @@ import chex
 from core.evaluators.mcts.action_selection import MCTSActionSelector
 from core.evaluators.mcts.state import BackpropState, MCTSNode, MCTSTree, TraversalState, MCTSOutput
 from core.evaluators.mcts.mcts import MCTS
+from core.evaluators.alphazero import AlphaZero
 from core.types import EnvStepFn, EvalFn, StepMetadata
 
 
-class StochasticMCTS(MCTS):
+class StochasticMCTS(AlphaZero(MCTS)):
     """Batched implementation of Monte Carlo Tree Search (MCTS).
     
     Not stateful. This class operates on 'MCTSTree' state objects.
@@ -25,7 +26,9 @@ class StochasticMCTS(MCTS):
         temperature: float = 1.0,
         tiebreak_noise: float = 1e-8,
         persist_tree: bool = True,
-        noise_scale: float = 0.05
+        noise_scale: float = 0.05,
+        dirichlet_alpha: float = 0.3,
+        dirichlet_epsilon: float = 0.25
     ):
         """
         Args:
@@ -42,8 +45,10 @@ class StochasticMCTS(MCTS):
         - `tiebreak_noise`: magnitude of noise to add to policy weights for breaking ties (default: 1e-8)
         - `persist_tree`: whether to persist search tree state between calls to `evaluate` (default: True)
         - `noise_scale`: scale of noise to add to delta values in stochastic action selection (default: 0.05)
+        - `dirichlet_alpha`: magnitude of Dirichlet noise for AlphaZero (default: 0.3)
+        - `dirichlet_epsilon`: proportion of root policy composed of Dirichlet noise (default: 0.25)
         """
-        super().__init__(eval_fn, action_selector, branching_factor, max_nodes, num_iterations, discount, temperature, tiebreak_noise, persist_tree)
+        super().__init__(eval_fn, action_selector, branching_factor, max_nodes, num_iterations, discount, temperature, tiebreak_noise, persist_tree, dirichlet_alpha=dirichlet_alpha, dirichlet_epsilon=dirichlet_epsilon)
 
         self.stochastic_action_probs = stochastic_action_probs
         self.noise_scale = noise_scale
@@ -79,7 +84,7 @@ class StochasticMCTS(MCTS):
             return self.stochastic_evaluate(key, eval_state, env_state, root_metadata, params, env_step_fn)
         
         def false_fn():
-            return MCTS.evaluate(self, key, eval_state, env_state, root_metadata, params, env_step_fn)
+            return super().evaluate(key, eval_state, env_state, root_metadata, params, env_step_fn)
         
         return jax.lax.cond(
             StochasticMCTS.is_node_idx_stochastic(tree, tree.ROOT_INDEX),
