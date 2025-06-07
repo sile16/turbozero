@@ -48,7 +48,7 @@ class StochasticMCTS(AlphaZero(MCTS)):
         - `dirichlet_alpha`: magnitude of Dirichlet noise for AlphaZero (default: 0.3)
         - `dirichlet_epsilon`: proportion of root policy composed of Dirichlet noise (default: 0.25)
         """
-        super().__init__(eval_fn, action_selector, branching_factor, max_nodes, num_iterations, discount, temperature, tiebreak_noise, persist_tree, dirichlet_alpha=dirichlet_alpha, dirichlet_epsilon=dirichlet_epsilon)
+        super().__init__(dirichlet_alpha=dirichlet_alpha, dirichlet_epsilon=dirichlet_epsilon, eval_fn=eval_fn, action_selector=action_selector, branching_factor=branching_factor, max_nodes=max_nodes, num_iterations=num_iterations, discount=discount, temperature=temperature, tiebreak_noise=tiebreak_noise, persist_tree=persist_tree)
 
         self.stochastic_action_probs = stochastic_action_probs
         self.noise_scale = noise_scale
@@ -78,13 +78,17 @@ class StochasticMCTS(AlphaZero(MCTS)):
         - (MCTSOutput): contains new tree state, selected action, root value, and policy weights
         """
         tree = eval_state
-        self.num_iterations = max(int(1 - self.temperature * self.max_num_iterations), 300)
+        self.num_iterations = max(int(self.max_num_iterations * (1 - self.temperature)), 300)
+        
+        # Store super class reference for use in nested function
+        super_evaluate = super().evaluate
+        
         # Define lambda functions that capture all required parameters
         def true_fn():
             return self.stochastic_evaluate(key, eval_state, env_state, root_metadata, params, env_step_fn)
         
         def false_fn():
-            return super().evaluate(key, eval_state, env_state, root_metadata, params, env_step_fn)
+            return super_evaluate(key, eval_state, env_state, root_metadata, params, env_step_fn)
         
         return jax.lax.cond(
             StochasticMCTS.is_node_idx_stochastic(tree, tree.ROOT_INDEX),
@@ -172,10 +176,11 @@ class StochasticMCTS(AlphaZero(MCTS)):
         # The PUCT selector will use this to adjust Q-values
         discount = 1.0  # Default: use raw values (same player)
         
-        # Check if ANY child has a different player (simple approach)
-        # If so, we need to tell PUCT to apply discount
-        # this will hold true for backgammon but isn't generalizable for all games, 
-        # would need to have the PUCT selector take a discount arrays for each child.
+        # LIMITATION: This applies the same discount to ALL children if ANY child has a different player.
+        # This is incorrect - discount should be applied per-child, not globally.
+        # However, current action selector interface expects a single discount value.
+        # TODO: Enhance action selector to accept per-child discount arrays for better generalization.
+        # For now, this works for backgammon where all children at same level have same player transitions.
 
         has_diff_player = jnp.any(jnp.abs(child_players - current_player))
         discount = jnp.where(has_diff_player, -1.0, 1.0)
@@ -232,6 +237,15 @@ class StochasticMCTS(AlphaZero(MCTS)):
         
         # Calculate deltas between actual visit frequencies and theoretical probabilities
         # Now both arrays have shape (num_stochastic_actions,)
+        # NOTE: This selects actions that are under-visited relative to their probability.
+        # LIMITATION: This approach may miss low-probability but high-reward actions.
+        # If some stochastic outcomes have small probabilities but lead to significantly
+        # better rewards, this selector will under-explore them since it only balances
+        # visit frequency with theoretical probability.
+        # POTENTIAL IMPROVEMENT: Could incorporate value estimates or UCB-like exploration
+        # bonus for high-value but low-probability actions, e.g.:
+        # delta = (self.stochastic_action_probs - normalized_visits) + exploration_bonus
+        # where exploration_bonus considers both probability and estimated value.
         delta = self.stochastic_action_probs - normalized_visits 
         
         # Add some noise to break ties
@@ -341,6 +355,9 @@ class StochasticMCTS(AlphaZero(MCTS)):
             - `parent`: index of the parent node
             - `action`: action to take from the parent node
         """
+        
+        # Split key for root action and body iterations
+        root_key, body_key = jax.random.split(key)
 
         # continue while:
         # - there is an existing edge corresponding to the chosen action
@@ -358,12 +375,14 @@ class StochasticMCTS(AlphaZero(MCTS)):
         def body_fn(state: TraversalState) -> TraversalState:
             node_idx = tree.edge_map[state.parent, state.action]
              
-            # Call action selector with calculated discount
-            action = self.cond_action_selector(key, tree, node_idx)
+            # Generate unique key for this iteration based on parent and action
+            # This ensures different randomness for each traversal step
+            iteration_key = jax.random.fold_in(body_key, node_idx * tree.branching_factor + state.action)
+            action = self.cond_action_selector(iteration_key, tree, node_idx)
             return TraversalState(parent=node_idx, action=action)
         
         # the action to take from the root
-        root_action = self.cond_action_selector(key, tree, tree.ROOT_INDEX)
+        root_action = self.cond_action_selector(root_key, tree, tree.ROOT_INDEX)
         # traverse from root to leaf
         return jax.lax.while_loop(
             cond_fn, body_fn,
@@ -515,9 +534,8 @@ class StochasticMCTS(AlphaZero(MCTS)):
         
         Returns a JAX boolean that can be used with jax.lax.cond.
         """
-        # Access the is_stochastic flag directly without conversion to Python bool
-        # which would cause tracing errors
-        return node.embedding.is_stochastic
+        # Check if embedding has is_stochastic attribute, default to False if not
+        return getattr(node.embedding, 'is_stochastic', False)
     
     @staticmethod
     def is_node_idx_stochastic(tree: MCTSTree, node_idx: int):
@@ -525,6 +543,5 @@ class StochasticMCTS(AlphaZero(MCTS)):
         
         Returns a JAX boolean that can be used with jax.lax.cond.
         """
-        # Access the is_stochastic flag directly from the embedded state
-        # Don't convert to Python bool as that would break JAX tracing
-        return tree.data_at(node_idx).embedding.is_stochastic
+        # Check if embedding has is_stochastic attribute, default to False if not
+        return getattr(tree.data_at(node_idx).embedding, 'is_stochastic', False)
