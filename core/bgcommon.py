@@ -66,13 +66,12 @@ def bg_step_fn(env: Env, state: bg.State, action: int, key: chex.PRNGKey) -> Tup
 
 
 # --- Pip Count Eval Fn (for test evaluator) ---
-
 def bg_pip_count_eval(state: chex.ArrayTree, params: chex.ArrayTree, key: chex.PRNGKey) -> Tuple[Array, Array]:
     """Calculates value based on pip count difference. Ignores params/key.
     The board is always from the current players perspective, 
     current player is positive numbers opponent is negative."""
     board = state._board
-    pips = state._board[0:24]
+    pips = state._board[0:24] # this trucates the off and bar
     opponent_pips = -pips[::-1]
 
 
@@ -92,14 +91,14 @@ def bg_pip_count_eval(state: chex.ArrayTree, params: chex.ArrayTree, key: chex.P
     # Add born-off checkers with appropriate weights
     # Using 25 points for born-off checkers (standard backgammon pip count)
     current_born_off = board[26] * 25  # Current player's born-off checkers
-    opponent_born_off = board[27] * 25  # Opponent's born-off checkers
-    current_bar = board[bg._bar_idx()] * -5
-    opponent_bar = board[bg._bar_idx() + 1] * -5
+    opponent_born_off = board[27] * 25 * -1  # Opponent's born-off checkers
+    current_bar = board[24] * -5
+    opponent_bar = board[25] * -5 * -1
 
     #jax.debug.print(f"[DEBUG-BG_PIP_COUNT_EVAL] Current born-off: {current_born_off}, Opponent born-off: {opponent_born_off}")
     # Calculate normalized value between -1 and 1
     # Positive value means current player is ahead
-    value = (current_pips + current_born_off + current_bar- opponent_pips - opponent_born_off - opponent_bar) / 400
+    value = (current_pips + current_born_off + current_bar - opponent_pips - opponent_born_off - opponent_bar) / 200
     value = jnp.clip(value, -1.0, 1.0) # Clip to [-1, 1]
     #jax.debug.print(f"[DEBUG-BG_PIP_COUNT_EVAL] Value: {value}")
     
