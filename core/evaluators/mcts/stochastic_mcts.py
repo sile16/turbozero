@@ -47,7 +47,7 @@ class StochasticMCTS(MCTS):
 
         self.stochastic_action_probs = stochastic_action_probs
         self.noise_scale = noise_scale
-
+        self.max_num_iterations = self.num_iterations
 
 
     def evaluate(self, #pylint: disable=arguments-differ
@@ -73,7 +73,7 @@ class StochasticMCTS(MCTS):
         - (MCTSOutput): contains new tree state, selected action, root value, and policy weights
         """
         tree = eval_state
-        
+        self.num_iterations = max(int(1 - self.temperature * self.max_num_iterations), 300)
         # Define lambda functions that capture all required parameters
         def true_fn():
             return self.stochastic_evaluate(key, eval_state, env_state, root_metadata, params, env_step_fn)

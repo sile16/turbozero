@@ -6,22 +6,21 @@ import jax
 import jax.numpy as jnp
 import chex
 import time
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Callable
 import wandb
 
+from core.common import partition
+
 from flax.training.train_state import TrainState
-from core.training.train import Trainer, CollectionState, ReplayBufferState
+from core.training.train import Trainer, CollectionState, ReplayBufferState, TrainLoopOutput
 from core.types import BaseExperience
 
-
-from core.training.train import Trainer, CollectionState, ReplayBufferState
-from core.types import BaseExperience
 
 class StochasticTrainer(Trainer):
     """Trainer variant that explicitly handles stochastic environment steps 
     during self-play data collection."""
 
-    def set_temp_fn(self, temp_func: Callable[int, float]) -> None:
+    def set_temp_fn(self, temp_func: Callable[[int], float]) -> None:
         self.temp_func = temp_func
 
 
@@ -189,10 +188,9 @@ class StochasticTrainer(Trainer):
             # Track epoch start time for performance metrics
 
             # get the temperature
-            current_temp = self.temp_func(cur_epoch * self.collection_steps_per_epoch)
-            metrics["collect/temperature"] = current_temp
+            current_temp = self.temp_func(cur_epoch * self.collection_steps_per_epoch * self.batch_size)
             self.evaluator_train.temperature = current_temp
-
+            print(f"Temperature: {current_temp}")
 
 
             epoch_start_time = time.time()
@@ -212,13 +210,14 @@ class StochasticTrainer(Trainer):
             collection_state, train_state, metrics = self.train_steps(train_key, collection_state, train_state, self.train_steps_per_epoch)
             print("Training Done")
             train_duration = time.time() - train_start_time
-            metrics["perf/train_time_sec"] = train_duration
-            metrics["perf/train_steps_per_sec"] = self.train_steps_per_epoch * self.train_batch_size / jnp.maximum(train_duration, 1e-6)
+            metrics["train/train_time_sec"] = train_duration
+            metrics["train/train_steps_per_sec"] = self.train_steps_per_epoch * self.train_batch_size / jnp.maximum(train_duration, 1e-6)
+            metrics["collect/temperature"] = current_temp
             
            # Add performance metrics
             collection_steps = self.batch_size * (cur_epoch+1) * self.collection_steps_per_epoch
-            metrics["perf/collect_time_sec"] = collect_duration
-            metrics["perf/collect_steps_per_sec"] = self.collection_steps_per_epoch / max(collect_duration, 1e-6)
+            metrics["collect/collect_time_sec"] = collect_duration
+            metrics["collect/collect_steps_per_sec"] = self.collection_steps_per_epoch / max(collect_duration, 1e-6)
             # we don't know how many games, 
             #metrics["perf/collect_game_steps_per_sec"] = (self.collection_steps_per_epoch * self.batch_size) / max(collect_duration, 1e-6)
 
