@@ -28,7 +28,8 @@ class StochasticMCTS(AlphaZero(MCTS)):
         persist_tree: bool = True,
         noise_scale: float = 0.05,
         dirichlet_alpha: float = 0.3,
-        dirichlet_epsilon: float = 0.25
+        dirichlet_epsilon: float = 0.25,
+        min_num_iterations: int = 300
     ):
         """
         Args:
@@ -53,6 +54,8 @@ class StochasticMCTS(AlphaZero(MCTS)):
         self.stochastic_action_probs = stochastic_action_probs
         self.noise_scale = noise_scale
         self.max_num_iterations = self.num_iterations
+        self.min_num_iterations = min(min_num_iterations, self.max_num_iterations)
+        
 
 
     def evaluate(self, #pylint: disable=arguments-differ
@@ -78,7 +81,7 @@ class StochasticMCTS(AlphaZero(MCTS)):
         - (MCTSOutput): contains new tree state, selected action, root value, and policy weights
         """
         tree = eval_state
-        self.num_iterations = max(int(self.max_num_iterations * (1 - self.temperature)), 300)
+        self.num_iterations = max(int(self.max_num_iterations * (1 - self.temperature)), self.min_num_iterations)
         
         # Store super class reference for use in nested function
         super_evaluate = super().evaluate

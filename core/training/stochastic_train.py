@@ -217,10 +217,8 @@ class StochasticTrainer(Trainer):
            # Add performance metrics
             collection_steps = self.batch_size * (cur_epoch+1) * self.collection_steps_per_epoch
             metrics["collect/collect_time_sec"] = collect_duration
-            metrics["collect/collect_steps_per_sec"] = self.collection_steps_per_epoch / max(collect_duration, 1e-6)
-            # we don't know how many games, 
-            #metrics["perf/collect_game_steps_per_sec"] = (self.collection_steps_per_epoch * self.batch_size) / max(collect_duration, 1e-6)
-
+            metrics["collect/collect_steps_per_sec"] = self.batch_size * self.collection_steps_per_epoch / max(collect_duration, 1e-6)
+           
             
            # Add replay buffer statistics
             buffer_state = collection_state.buffer_state
