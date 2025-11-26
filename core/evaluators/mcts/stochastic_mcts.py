@@ -411,9 +411,53 @@ class StochasticMCTS(AlphaZero(MCTS)):
         player_diff = jnp.abs(current_player - other_player)
         return 1.0 - 2.0 * player_diff
 
+    def compute_expectimax_value(self, tree: MCTSTree, node_idx: int) -> float:
+        """Compute the expected value at a stochastic node using expectimax.
+
+        For stochastic nodes, the value is the weighted sum of child values
+        based on their stochastic action probabilities:
+            V(node) = Σ P(action) * V(child_action)
+
+        Args:
+        - `tree`: MCTSTree containing the nodes
+        - `node_idx`: index of the stochastic node
+
+        Returns:
+        - float: expected value across all stochastic outcomes
+        """
+        num_stochastic_actions = len(self.stochastic_action_probs)
+
+        # Get child indices for stochastic actions
+        child_indices = tree.edge_map[node_idx, :num_stochastic_actions]
+
+        # Check which children exist
+        child_exists_mask = child_indices != tree.NULL_INDEX
+
+        # Safe access to child Q-values
+        safe_indices = jnp.maximum(child_indices, 0)
+        child_q_values = tree.data.q[safe_indices]
+
+        # Apply mask - use 0 for non-existent children (neutral contribution)
+        masked_q_values = jnp.where(child_exists_mask, child_q_values, 0.0)
+
+        # Compute expected value: weighted sum of child Q-values
+        # Only include probabilities for children that exist
+        masked_probs = jnp.where(child_exists_mask, self.stochastic_action_probs, 0.0)
+
+        # Normalize probabilities to sum to 1 for existing children
+        prob_sum = jnp.sum(masked_probs)
+        normalized_probs = jnp.where(prob_sum > 0, masked_probs / prob_sum, masked_probs)
+
+        expected_value = jnp.sum(normalized_probs * masked_q_values)
+
+        return expected_value
+
     def backpropagate(self, key: chex.PRNGKey, tree: MCTSTree, parent: int, child: int, value: float) -> MCTSTree:
         """Backpropagate the value estimate from the leaf node to the root node and update visit counts.
-        
+
+        Uses expectimax for stochastic nodes: the value propagated from a stochastic node
+        is the expected value (weighted sum of child values by their probabilities).
+
         Args:
         - `key`: rng
         - `tree`: MCTSTree to evaluate
@@ -424,80 +468,64 @@ class StochasticMCTS(AlphaZero(MCTS)):
         Returns:
         - (MCTSTree): updated search tree
         """
+        # Store reference to self for use in nested function
+        compute_expectimax = self.compute_expectimax_value
 
         def body_fn(state: BackpropState) -> BackpropState:
             node_idx, value, tree = state.node_idx, state.value, state.tree
-            
-            
+
             node = tree.data_at(node_idx)
             # increment visit count and update value estimate
             new_node = self.visit_node(node, value)
             tree = tree.update_node(node_idx, new_node)
-            # go to parent 
+            # go to parent
             parent_idx = tree.parents[node_idx]
-            
-            # Get player values for debugging
-            current_player = node.embedding.current_player
-            parent_player = tree.data_at(parent_idx).embedding.current_player
-            
-            child_and_parent_value_discount = self.calculate_discount_factor(tree, parent_idx, node_idx)
-            
-            # Debug prints with concrete values
-            # jax.debug.print("""
-            #    [DEBUG-BACKPROPAGATE] 
-            #    node_idx: {}
-            #    parent_idx: {}
-            #    current_player: {}
-            #    parent_player: {}
-            #    value before discount: {}
-            #    discount: {}
-            #    value after discount: {}
-            #    visit count: {}
-            #""", node_idx, parent_idx, current_player, parent_player, value, child_and_parent_value_discount, value * child_and_parent_value_discount, new_node.n)
-            
-            value *= child_and_parent_value_discount
 
-            return BackpropState(node_idx=parent_idx, value=value, tree=tree)
-        
-        # Initial debug print for the first step
-        current_player = tree.data_at(child).embedding.current_player
-        parent_player = tree.data_at(parent).embedding.current_player
+            child_and_parent_value_discount = self.calculate_discount_factor(tree, parent_idx, node_idx)
+
+            # For stochastic nodes, use expectimax value instead of sampled value
+            # The expectimax value is the weighted sum of all child values
+            is_stochastic = StochasticMCTS.is_node_idx_stochastic(tree, node_idx)
+
+            # Compute expectimax value for stochastic nodes
+            expectimax_value = compute_expectimax(tree, node_idx)
+
+            # Use expectimax value for stochastic nodes, sampled value for deterministic
+            value_to_propagate = jax.lax.cond(
+                is_stochastic,
+                lambda: expectimax_value,
+                lambda: value
+            )
+
+            value_to_propagate *= child_and_parent_value_discount
+
+            return BackpropState(node_idx=parent_idx, value=value_to_propagate, tree=tree)
+
         child_and_parent_value_discount = self.calculate_discount_factor(tree, parent, child)
-        
-        #jax.debug.print("""
-        #    [DEBUG-BACKPROPAGATE - initial] 
-        #    child: {}
-        #    parent: {}
-        #    child_player: {}
-        #    parent_player: {}
-        #    value before discount: {}
-        #    discount: {}
-        #    value after discount: {}
-        #    visit count: {}
-        #""", child, parent, current_player, parent_player, value, child_and_parent_value_discount, value * child_and_parent_value_discount, tree.data_at(child).n)
-        
+
         value *= child_and_parent_value_discount
         state = BackpropState(node_idx=parent, value=value, tree=tree)
-        
+
         # Backpropagate until we reach the root
         state = jax.lax.while_loop(
-            lambda s: s.node_idx != s.tree.ROOT_INDEX, 
-            body_fn, 
+            lambda s: s.node_idx != s.tree.ROOT_INDEX,
+            body_fn,
             state
         )
 
-        # this will update the root node (discount already applied)
+        # Update the root node
         node = state.tree.data_at(state.node_idx)
-        new_node = self.visit_node(node, state.value)
+
+        # For stochastic root, use expectimax value
+        is_root_stochastic = StochasticMCTS.is_node_idx_stochastic(state.tree, state.node_idx)
+        final_value = jax.lax.cond(
+            is_root_stochastic,
+            lambda: compute_expectimax(state.tree, state.node_idx),
+            lambda: state.value
+        )
+
+        new_node = self.visit_node(node, final_value)
         tree = state.tree.update_node(state.node_idx, new_node)
-        
-        # Debug print for root node update
-        #jax.debug.print("""
-        #    [DEBUG-BACKPROPAGATE - root] 
-        #    node_idx: {}
-        #    value: {}
-        #    visit count: {}
-        #""", state.node_idx, state.value, new_node.n)
 
         return tree
 
@@ -531,17 +559,23 @@ class StochasticMCTS(AlphaZero(MCTS)):
     @staticmethod
     def is_node_stochastic(node: MCTSNode):
         """Check if the node is stochastic.
-        
+
         Returns a JAX boolean that can be used with jax.lax.cond.
         """
         # Check if embedding has is_stochastic attribute, default to False if not
-        return getattr(node.embedding, 'is_stochastic', False)
-    
+        is_stochastic = getattr(node.embedding, 'is_stochastic', None)
+        if is_stochastic is None:
+            return jnp.array(False)
+        return is_stochastic
+
     @staticmethod
     def is_node_idx_stochastic(tree: MCTSTree, node_idx: int):
         """Check if the node is stochastic.
-        
+
         Returns a JAX boolean that can be used with jax.lax.cond.
         """
         # Check if embedding has is_stochastic attribute, default to False if not
-        return getattr(tree.data_at(node_idx).embedding, 'is_stochastic', False)
+        is_stochastic = getattr(tree.data_at(node_idx).embedding, 'is_stochastic', None)
+        if is_stochastic is None:
+            return jnp.array(False)
+        return is_stochastic
