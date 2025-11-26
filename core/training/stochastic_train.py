@@ -6,10 +6,11 @@ import jax
 import jax.numpy as jnp
 import chex
 import time
+from functools import partial
 from typing import Optional, Tuple, Callable
 import wandb
 
-from core.common import partition
+from core.common import partition, step_env_and_evaluator
 
 from flax.training.train_state import TrainState
 from core.training.train import Trainer, CollectionState, ReplayBufferState, TrainLoopOutput
@@ -17,11 +18,41 @@ from core.types import BaseExperience
 
 
 class StochasticTrainer(Trainer):
-    """Trainer variant that explicitly handles stochastic environment steps 
+    """Trainer variant that explicitly handles stochastic environment steps
     during self-play data collection."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Default temperature function returns constant 1.0 (exploration mode)
+        self.temp_func = lambda step: 1.0
 
     def set_temp_fn(self, temp_func: Callable[[int], float]) -> None:
         self.temp_func = temp_func
+    
+    def set_curriculum_fn(self, curriculum_func: Callable[[int], Callable]) -> None:
+        """Set a curriculum function that returns different env_init_fn based on training step.
+        
+        Args:
+            curriculum_func: Function that takes training step and returns an env_init_fn
+        """
+        self.curriculum_func = curriculum_func
+        self._original_env_init_fn = self.env_init_fn
+    
+    def _get_current_env_init_fn(self, training_step: int):
+        """Get the appropriate env_init_fn for the current training step."""
+        if hasattr(self, 'curriculum_func'):
+            return self.curriculum_func(training_step)
+        return self.env_init_fn
+    
+    def _update_step_train_for_curriculum(self, training_step: int):
+        """Update the step_train function with curriculum-aware env_init_fn."""
+        current_env_init_fn = self._get_current_env_init_fn(training_step)
+        self.step_train = partial(step_env_and_evaluator,
+            evaluator=self.evaluator_train,
+            env_step_fn=self.env_step_fn,
+            env_init_fn=current_env_init_fn,
+            max_steps=self.max_episode_steps
+        )
 
 
     def collect(self,
@@ -77,8 +108,10 @@ class StochasticTrainer(Trainer):
             return state.buffer_state
 
         # Use jax.lax.cond to choose between handling deterministic or stochastic state
-        # We need to check if the state has is_stochastic attribute and what its value is
-        is_stochastic = state.env_state.is_stochastic
+        # Check if the state has _is_stochastic attribute, default to False if not present
+        is_stochastic = getattr(state.env_state, '_is_stochastic', getattr(state.env_state, 'is_stochastic', False))
+        
+        
         buffer_state = jax.lax.cond(
             is_stochastic,
             handle_stochastic_state,
@@ -192,6 +225,9 @@ class StochasticTrainer(Trainer):
             self.evaluator_train.temperature = current_temp
             print(f"Temperature: {current_temp}")
 
+            # Update curriculum if curriculum function is set
+            training_step = cur_epoch * self.collection_steps_per_epoch * self.batch_size
+            self._update_step_train_for_curriculum(training_step)
 
             epoch_start_time = time.time()
             

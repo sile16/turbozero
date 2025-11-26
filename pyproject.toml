@@ -29,11 +29,11 @@ flax = ">=0.10.5"
 optax = ">=0.1.8"
 orbax-checkpoint = ">=0.10.1"
 chex = ">=0.1.85"
-pgx = { git = "https://github.com/sile16/pgx.git", branch = "master" } # Git dependency remains unchanged
 pytest = "^8.3.5"
 cairosvg = "^2.8.2"
 svgwrite = "^1.4.3"
 dm-haiku = "^0.0.14"
+pgx = {git = "https://github.com/sile16/pgx.git", rev = "master"}
 
 
 [tool.poetry.group.dev.dependencies]

@@ -1,6 +1,7 @@
 """MCTS tests for backgammon."""
 from functools import partial
 import jax
+import pytest
 
 
 
@@ -16,6 +17,7 @@ from core.bgcommon import bg_step_fn
 from core.bgcommon import bg_pip_count_eval, bg_hit2_eval
 
 
+@pytest.mark.slow
 def test_stochastic_mcts_backgammon_simple_doubles_valid_actions():
     """
     Tests a full backgammon game (simple_doubles) using two StochasticMCTS agents
@@ -158,10 +160,11 @@ def test_stochastic_mcts_backgammon_simple_doubles_valid_actions():
     assert bool(state.terminated), f"Game did not terminate within {max_steps} steps."
     print(f"Game completed successfully in {step_count} steps.")
 
+@pytest.mark.slow
 def test_traverse_through_stochastic_nodes():
     """
     Test that MCTS can traverse through all node types during the evaluate
-    
+
     This verifies the fix for allowing MCTS to continue exploration through stochastic
     nodes in subsequent iterations during evaluate.
     """

@@ -1,6 +1,7 @@
 checkpoints/
 .vscode/
 wandb/*
+notebooks/wandb/*
 venv*
 poetry.lock
 

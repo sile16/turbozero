@@ -166,15 +166,18 @@ class MCTS(Evaluator):
         Returns:
         - (MCTSTree): updated MCTSTree
         """
+        # Get Keys:
+        step_key, eval_key, key = jax.random.split(key, 3)
+        
         # traverse from root -> leaf
         traversal_state = self.traverse(tree)
         parent, action = traversal_state.parent, traversal_state.action
         # get env state (embedding) for leaf node
         embedding = tree.data_at(parent).embedding
-        new_embedding, metadata = env_step_fn(embedding, action)
+        new_embedding, metadata = env_step_fn(embedding, action, step_key)
         player_reward = metadata.rewards[metadata.cur_player_id]
         # evaluate leaf node
-        eval_key, key = jax.random.split(key)
+        
         policy_logits, value = self.eval_fn(new_embedding, params, eval_key)
         policy_logits = jnp.where(metadata.action_mask, policy_logits, jnp.finfo(policy_logits).min)
         policy = jax.nn.softmax(policy_logits)

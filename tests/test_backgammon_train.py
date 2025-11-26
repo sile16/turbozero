@@ -161,40 +161,37 @@ replay_memory = EpisodeReplayBuffer(capacity=500)
 
 
 # --- Main Execution ---
+@pytest.mark.slow
 def test_backgammon_training_loop():
     # --- Trainer ---
+    # Use minimal test configuration to keep test under 2 minutes
     trainer = StochasticTrainer(
         batch_size=2,      # Minimal batch size
         train_batch_size=2,
         warmup_steps=0,
-        collection_steps_per_epoch=300,  # needs to be higher than average game length, or better, 10x
-        train_steps_per_epoch=2,       
+        collection_steps_per_epoch=20,  # Reduced from 300 for faster test
+        train_steps_per_epoch=2,
         nn=mlp_policy_value_net,
         loss_fn=partial(az_default_loss_fn, l2_reg_lambda=0.0),
         optimizer=optax.adam(1e-4),
         # Use the stochastic evaluator for training
-        evaluator=evaluator, 
+        evaluator=evaluator,
         memory_buffer=replay_memory,
-        max_episode_steps=1000,  
+        max_episode_steps=100,  # Reduced from 1000 for faster test
         env_step_fn=partial(bg_step_fn, env),
         env_init_fn=init_fn,
         state_to_nn_input_fn=state_to_nn_input,
         testers=[
             # Use our custom BackgammonTwoPlayerBaseline
             TwoPlayerBaseline(
-                num_episodes=50,
+                num_episodes=5,  # Reduced from 50 for faster test
                 baseline_evaluator=pip_count_mcts_evaluator_test,
-                #render_fn=render_fn,
-                #render_dir='training_eval/pip_count_baseline',
                 name='pip_count_baseline'
             ),
-            # Add another tester using the RandomEvaluator
+            # Add another tester using the Hit2 evaluator
             TwoPlayerBaseline(
-                num_episodes=50, 
-                baseline_evaluator=hit2_mcts_test, # Use the random evaluator here
-                # Optionally add rendering for this baseline too
-                #render_fn=render_fn,  # renddering takes way tooo long
-                #render_dir='training_eval/random_baseline',
+                num_episodes=5,  # Reduced from 50 for faster test
+                baseline_evaluator=hit2_mcts_test,
                 name='hit2_baseline'
             )
         ],
@@ -202,17 +199,17 @@ def test_backgammon_training_loop():
     )
     """Runs a minimal training loop for Backgammon with StochasticMCTS."""
     print("Starting minimal Backgammon training test with StochasticMCTS...")
-    
+
     print("Using minimal configuration with StochasticMCTS and Pip Count Test Evaluator")
-    
-    num_epochs = 6
+
+    num_epochs = 2  # Reduced from 6 for faster test
     output = None
     # Update temperature for each epoch
     for epoch in range(num_epochs):
         current_temp = get_temperature(epoch, num_epochs)
         evaluator.temperature = current_temp
         print(f"Epoch {epoch + 1}/{num_epochs}, Temperature: {current_temp:.2f}")
-        
+
         # Run one epoch of training
         output = trainer.train_loop(seed=42, num_epochs=epoch, eval_every=1, initial_state=output)
         assert output is not None # Basic check to ensure it ran

@@ -16,10 +16,10 @@ from core.types import EnvStepFn
 from pgx._src.types import Array
 import flax.linen as nn
 
-def bg_simple_step_fn(env: Env, state, action):
+def bg_simple_step_fn(env: Env, state, action, key=None):
     """Simple step function for testing does not know about stochastic nodes."""
-    # MCTS step_fn doesn't take a key parameter
-    step_key = jax.random.PRNGKey(23)  # Use a fixed key for determinism
+    # MCTS step_fn expects a key parameter, use it if provided, otherwise use fixed key
+    step_key = key if key is not None else jax.random.PRNGKey(23)
     new_state = env.step(state, action, step_key)
     return new_state, StepMetadata(
         rewards=new_state.rewards,
@@ -31,7 +31,7 @@ def bg_simple_step_fn(env: Env, state, action):
 
 def bg_step_fn(env: Env, state: bg.State, action: int, key: chex.PRNGKey) -> Tuple[bg.State, StepMetadata]:
     """Combined step function for backgammon environment that handles both deterministic and stochastic actions."""
-    # print(f"[DEBUG-BG_STEP-{time.time()}] Called with state (stochastic={state.is_stochastic}), action={action}") # Optional debug
+    # print(f"[DEBUG-BG_STEP-{time.time()}] Called with state (stochastic={state._is_stochastic}), action={action}") # Optional debug
 
     # Handle stochastic vs deterministic branches
     def stochastic_branch(operand):
@@ -46,7 +46,7 @@ def bg_step_fn(env: Env, state: bg.State, action: int, key: chex.PRNGKey) -> Tup
         # If the state becomes stochastic (player change), we want to keep it that way
         # but prevent the automatic dice roll by setting playable_dice to -1
         return jax.lax.cond(
-            new_state.is_stochastic,
+            new_state._is_stochastic,
             lambda s: s.replace(_playable_dice=jnp.array([-1, -1, -1, -1])),
             lambda s: s,
             new_state
@@ -55,7 +55,7 @@ def bg_step_fn(env: Env, state: bg.State, action: int, key: chex.PRNGKey) -> Tup
     # Use conditional to route to the appropriate branch
     # The key is only needed for the deterministic branch
     new_state = jax.lax.cond(
-        state.is_stochastic,
+        state._is_stochastic,
         stochastic_branch,
         deterministic_branch,
         (state, action, key) # Pass all required operands

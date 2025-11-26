@@ -6,6 +6,7 @@ without relying on the actual MCTS implementation.
 """
 
 import os
+import shutil
 from pathlib import Path
 from functools import partial
 import json
@@ -15,42 +16,50 @@ import glob
 from typing import Any
 Array = Any
 
-# cairosvg might not be needed if we save SVGs directly
-# import cairosvg 
 import jax
 import jax.numpy as jnp
 
-# Use display and HTML from IPython if needed for direct SVG rendering in notebooks
-# from IPython.display import display, HTML
-
 import pgx.backgammon as bg
-# Assuming render_pgx_2p is not needed anymore
-# from core.testing.utils import render_pgx_2p
 from core.evaluators.mcts.stochastic_mcts import StochasticMCTS
 from core.evaluators.mcts.action_selection import PUCTSelector
 from core.types import StepMetadata
 from core.bgcommon import bg_pip_count_eval, bg_step_fn
 
+# Check if graphviz 'dot' command is available
+GRAPHVIZ_AVAILABLE = shutil.which('dot') is not None
+if not GRAPHVIZ_AVAILABLE:
+    print("WARNING: Graphviz 'dot' command not found. Install with: sudo apt-get install graphviz")
+    print("         SVG rendering will be skipped, but DOT source files will be saved.")
+
 # Create a sample Backgammon environment for action labels and SVG generation
 backgammon_env = bg.Backgammon(short_game=True)
 print("Backgammon environment initialized.")
 
-def tree_to_graph(eval_state, output_dir, boards_dir):
-    """Convert a tree to a Graphviz graph."""
+def tree_to_graph(eval_state, output_dir, boards_dir, max_nodes_to_render=50, verbose=False):
+    """Convert a tree to a Graphviz graph.
+
+    Args:
+        eval_state: The MCTS tree state
+        output_dir: Directory for output files
+        boards_dir: Directory for board SVG files
+        max_nodes_to_render: Maximum number of nodes to render (for performance)
+        verbose: Enable verbose debug output
+    """
     tree = eval_state  # The eval_state is the tree itself
-    
+
     # Debug print to show tree structure
-    print(f"DEBUG - Tree structure: {jax.tree_util.tree_map(lambda x: x.shape if hasattr(x, 'shape') else x, tree)}")
-    print(f"DEBUG - Number of nodes: {tree.next_free_idx}")  # For StochasticMCTSTree use next_free_idx
-    print(f"DEBUG - Root index: {tree.ROOT_INDEX}")  # For StochasticMCTSTree use ROOT_INDEX
-    
-    # Enhanced debugging: Show edge map for first few nodes
-    for i in range(min(tree.next_free_idx, 3)):  # Show up to first 3 nodes
-        print(f"DEBUG - Node {i} edge map:")
-        for j in range(min(tree.branching_factor, 10)):  # Show first 10 edges
-            target = tree.edge_map[i, j]
-            if target != -1:  # -1 is usually the null value
-                print(f"  Edge {i}--{j}-->{target}")
+    if verbose:
+        print(f"DEBUG - Tree structure: {jax.tree_util.tree_map(lambda x: x.shape if hasattr(x, 'shape') else x, tree)}")
+        print(f"DEBUG - Number of nodes: {tree.next_free_idx}")  # For StochasticMCTSTree use next_free_idx
+        print(f"DEBUG - Root index: {tree.ROOT_INDEX}")  # For StochasticMCTSTree use ROOT_INDEX
+
+        # Enhanced debugging: Show edge map for first few nodes
+        for i in range(min(tree.next_free_idx, 3)):  # Show up to first 3 nodes
+            print(f"DEBUG - Node {i} edge map:")
+            for j in range(min(tree.branching_factor, 10)):  # Show first 10 edges
+                target = tree.edge_map[i, j]
+                if target != -1:  # -1 is usually the null value
+                    print(f"  Edge {i}--{j}-->{target}")
     
     graph = graphviz.Digraph('MCTS Tree', format='svg')
     graph.attr(rankdir='TD')
@@ -59,24 +68,25 @@ def tree_to_graph(eval_state, output_dir, boards_dir):
     # Add root node
     root_idx = tree.ROOT_INDEX
     root_node_id = str(root_idx)
-    
+
+    # Limit number of nodes to render for performance
+    num_nodes_to_render = min(tree.next_free_idx, max_nodes_to_render)
+    if tree.next_free_idx > max_nodes_to_render:
+        print(f"  [PERF] Rendering {max_nodes_to_render} of {tree.next_free_idx} nodes for performance")
+
     # Only add nodes that are actually in the tree
-    for node_idx in range(tree.next_free_idx):
+    for node_idx in range(num_nodes_to_render):
         node_id = str(node_idx)
-        
+
         # Get node data
         node_data = tree.data_at(node_idx)
-        
+
         # Format node label
         q_value = float(node_data.q)
         visit_count = int(node_data.n)
-        
-        
-        
-        
-        
-        # Debug for each node
-        if node_idx < 10:  # Limit to first 10 nodes to avoid spam
+
+        # Debug for each node (only if verbose)
+        if verbose and node_idx < 10:  # Limit to first 10 nodes to avoid spam
             print(f"DEBUG - Node {node_idx}: visits={visit_count}, q_value={q_value:.4f}")
             # Get children info
             children = []
@@ -88,10 +98,6 @@ def tree_to_graph(eval_state, output_dir, boards_dir):
                 print(f"DEBUG - Children of node {node_idx}: {children}")
             else:
                 print(f"DEBUG - Node {node_idx} has no children")
-        
-        # === ADDED DEBUG for Visit Count ===
-        print(f"  GRAPH_TRACE - Node {node_idx}: Visit count for label = {visit_count}")
-        # === END DEBUG ===
         
         # Create node label
         player_id = node_data.embedding.current_player if hasattr(node_data.embedding, 'current_player') else 'N/A'
@@ -159,11 +165,11 @@ def tree_to_graph(eval_state, output_dir, boards_dir):
         # === END Add Board SVG Tooltip ===
         
         graph.node(node_id, label=label, fillcolor=fillcolor)
-        
-        # Add edges to children
+
+        # Add edges to children (only to nodes we're rendering)
         for action in range(tree.branching_factor):
-            child_node_idx = tree.edge_map[node_idx, action]
-            if child_node_idx != -1:  # Valid edge
+            child_node_idx = int(tree.edge_map[node_idx, action])
+            if child_node_idx != -1 and child_node_idx < num_nodes_to_render:  # Valid edge within render limit
                 child_id = str(child_node_idx)
                 
                 # Format edge label - REFINED LOGIC
@@ -205,6 +211,27 @@ def save_svg_string(svg_string, filepath):
     except Exception as e:
         print(f"Error saving SVG to {filepath}: {e}")
 
+
+def render_graph_safely(graph, output_path_without_ext):
+    """Render a graphviz graph to SVG, handling missing graphviz gracefully."""
+    if GRAPHVIZ_AVAILABLE:
+        graph.render(filename=output_path_without_ext, cleanup=True, view=False)
+    else:
+        # Save DOT source file instead
+        dot_path = output_path_without_ext + '.dot'
+        with open(dot_path, 'w') as f:
+            f.write(graph.source)
+        # Create a placeholder SVG
+        svg_path = output_path_without_ext + '.svg'
+        placeholder_svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="400" height="100">
+  <rect width="100%" height="100%" fill="#ffeeee"/>
+  <text x="10" y="50" font-family="sans-serif" font-size="14">
+    Graphviz not installed. DOT source saved to {os.path.basename(dot_path)}
+  </text>
+</svg>'''
+        with open(svg_path, 'w') as f:
+            f.write(placeholder_svg)
+
 def create_real_mcts_visualization(output_dir):
     """Create visualizations of a real StochasticMCTS tree over multiple iterations and turns."""
     print("Creating StochasticMCTS visualization...")
@@ -221,7 +248,7 @@ def create_real_mcts_visualization(output_dir):
         eval_fn=bg_pip_count_eval,
         action_selector=PUCTSelector(),
         branching_factor=backgammon_env.num_actions,
-        max_nodes=500,
+        max_nodes=200,  # Reduced for faster visualization
         num_iterations=1,  # Use 1 iteration per step for step-by-step visualization
         stochastic_action_probs=backgammon_env.stochastic_action_probs,
         discount=-1.0,
@@ -229,12 +256,8 @@ def create_real_mcts_visualization(output_dir):
         persist_tree=True,  # Critical to preserve tree between steps
     )
     
-    # Debug - Confirm the MCTS configuration
-    print(f"DEBUG - MCTS configuration:")
-    print(f"DEBUG - persist_tree: {mcts.persist_tree}")
-    print(f"DEBUG - max_nodes: {mcts.max_nodes}")
-    print(f"DEBUG - num_iterations: {mcts.num_iterations}")
-    print(f"DEBUG - branching_factor: {mcts.branching_factor}")
+    # Confirm the MCTS configuration
+    print(f"MCTS config: max_nodes={mcts.max_nodes}, persist_tree={mcts.persist_tree}")
     
     # Initialize state
     key, init_key = jax.random.split(key)
@@ -256,8 +279,10 @@ def create_real_mcts_visualization(output_dir):
 
     visualization_frames = []
     frame_idx = 0
-    total_turns = 10 # Reduced to 2 turns for faster testing
-    iterations_per_deterministic_turn = 25 # Reduced to 5 iterations for faster visualization
+    total_turns = 5  # Reduced number of turns
+    iterations_per_deterministic_turn = 10  # Reduced iterations per turn
+    render_every_n_iterations = 2  # Only render every Nth iteration for performance
+    verbose = False  # Set to True for detailed debug output
 
     # Keep track of the latest board SVG paths relative to output_dir
     last_saved_curr_board_path = None
@@ -279,13 +304,10 @@ def create_real_mcts_visualization(output_dir):
         is_turn_stochastic = bool(state.is_stochastic) # Ensure it's a Python bool
 
         if is_turn_stochastic:
-            print(f"DEBUG - Processing stochastic state at turn {turn}")
-            
             key, eval_key, step_key = jax.random.split(key, 3)
-            
+
             # Call MCTS.evaluate on the stochastic state
             # For stochastic state, this will sample a stochastic action but not modify the tree
-            print(f"DEBUG - Before stochastic evaluate - Tree node count: {eval_state.next_free_idx}")
             mcts_output = mcts.evaluate(
                 key=eval_key,
                 eval_state=eval_state,
@@ -297,17 +319,16 @@ def create_real_mcts_visualization(output_dir):
             # Important: For stochastic nodes, the tree stays the same
             eval_state = mcts_output.eval_state
             action = mcts_output.action
-            print(f"DEBUG - After stochastic evaluate - Tree node count: {eval_state.next_free_idx}")
-            print(f"DEBUG - Stochastic action selected: {action}")
+            print(f"  Turn {turn+1}: Stochastic action selected: {action} ({bg.stochastic_action_to_str(action)})")
             
             # Add selected stochastic action to visualization
-            graph = tree_to_graph(eval_state, output_dir, boards_dir)
+            graph = tree_to_graph(eval_state, output_dir, boards_dir, verbose=verbose)
             
             # Visualize MCTS tree for the stochastic root
             graph_filename = f'real_tree_turn_{turn}_stochastic_eval.svg'
             graph_path_abs = os.path.join(output_dir, graph_filename)
             graph_path_rel = graph_filename # Relative path for HTML
-            graph.render(filename=graph_path_abs.replace('.svg', ''), cleanup=True, view=False)
+            render_graph_safely(graph, graph_path_abs.replace('.svg', ''))
             
             # Store frame for stochastic evaluation
             visualization_frames.append({
@@ -323,16 +344,13 @@ def create_real_mcts_visualization(output_dir):
             
             # --- Action Step ---
             action_str = bg.stochastic_action_to_str(action)
-            print(f"Applying stochastic action: {action} ({action_str})")
             previous_state = state
-            last_saved_prev_board_path = last_saved_curr_board_path # Current becomes previous
-            
+            last_saved_prev_board_path = last_saved_curr_board_path  # Current becomes previous
+
             # Step environment with the chosen stochastic action
             state, metadata = bg_step_fn(backgammon_env, state, action, step_key)
             # Step MCTS tree - always step after environment steps with stochastic actions
-            print(f"DEBUG - Before mcts.step (stochastic) - Tree node count: {eval_state.next_free_idx}")
             eval_state = mcts.step(eval_state, action)
-            print(f"DEBUG - After mcts.step (stochastic) - Tree node count: {eval_state.next_free_idx}")
 
             # Save current board state SVG
             curr_board_filename = f'board_turn_{turn}_stochastic_curr.svg'
@@ -341,11 +359,11 @@ def create_real_mcts_visualization(output_dir):
             last_saved_curr_board_path = os.path.join("boards", curr_board_filename) # Update last saved current board
 
             # Visualize MCTS tree *after* the stochastic step
-            graph_after_step = tree_to_graph(eval_state, output_dir, boards_dir)
+            graph_after_step = tree_to_graph(eval_state, output_dir, boards_dir, verbose=verbose)
             graph_after_step_filename = f'real_tree_turn_{turn}_stochastic_after.svg'
             graph_after_step_path_abs = os.path.join(output_dir, graph_after_step_filename)
             graph_after_step_path_rel = graph_after_step_filename
-            graph_after_step.render(filename=graph_after_step_path_abs.replace('.svg', ''), cleanup=True, view=False)
+            render_graph_safely(graph_after_step, graph_after_step_path_abs.replace('.svg', ''))
 
             # Store frame for the action step
             visualization_frames.append({
@@ -359,98 +377,76 @@ def create_real_mcts_visualization(output_dir):
                 'info': f'Turn {turn+1}: Applied stochastic action {action_str} (Player {previous_state.current_player}) -> Player {state.current_player}'
             })
             frame_idx += 1
-            print(f"Resulting state: Player {state.current_player}, Stochastic: {state.is_stochastic}")
 
         else:
-            print(f"DEBUG - Processing deterministic state at turn {turn}")
-            
+            if verbose:
+                print(f"DEBUG - Processing deterministic state at turn {turn}")
+                print(f"DEBUG - Before MCTS evaluate - Turn {turn}, steps {current_iterations}")
+                print(f"DEBUG - eval_state tree node count: {eval_state.next_free_idx}")
+
             # Call MCTS.evaluate on the current state to get the action for visualization
             key, eval_key = jax.random.split(key)
-            print(f"DEBUG - Before MCTS evaluate - Turn {turn}, steps {current_iterations}")
-            print(f"DEBUG - eval_state tree node count: {eval_state.next_free_idx}")
-            final_action = -1 # Placeholder
-            
+            final_action = -1  # Placeholder
+
             for iteration in range(iterations_per_deterministic_turn):
                 key, eval_key = jax.random.split(key)
-                
+
                 mcts_output = mcts.evaluate(
                     key=eval_key,
-                    eval_state=eval_state, # Current deterministic state
+                    eval_state=eval_state,  # Current deterministic state
                     env_state=state,
                     root_metadata=metadata,
                     params={},
                     env_step_fn=partial(bg_step_fn, backgammon_env)
                 )
                 eval_state = mcts_output.eval_state
-                current_iter_action = mcts_output.action # Action MCTS would choose *if stopped now*
-                final_action = current_iter_action # Keep track of the best action found
+                current_iter_action = mcts_output.action  # Action MCTS would choose *if stopped now*
+                final_action = current_iter_action  # Keep track of the best action found
 
-                # --- DEBUG: Print action considered in this iteration ---
-                print(f"    DEBUG: Iter {iteration+1}: Action considered = {current_iter_action} ({bg.action_to_str(current_iter_action)})", flush=True)
-                if current_iter_action == 0:
-                    is_only_legal = (state.legal_action_mask[0] == 1) and (jnp.sum(state.legal_action_mask) == 1)
-                    print(f"      DEBUG: No-op (0) considered. Is it the only legal move? {is_only_legal}")
-                    # --- ADDED DEBUG: Print state when no-op is considered ---
-                    print(f"      DEBUG: State causing no-op consideration:\n{state}") 
-                    # --- END ADDED DEBUG ---
-                # --- END DEBUG ---
-                
-                # === ADDED DEBUG: Inspect Node 1 after iteration ===
-                if eval_state.next_free_idx > 1: # Check if node 1 exists
-                    try:
-                        node1_data = eval_state.data_at(1)
-                        node1_= np.array(node1_data.p) # Convert to numpy for printing
-                        node1_mask = np.array(node1_data.embedding.legal_action_mask)
-                        print(f"    DEBUG: Inspecting Node 1 (after iter {iteration+1}):")
-                        print(f"      Node 1 Policy (Top 5): {np.argsort(node1_policy)[-5:][::-1]}") # Indices of top 5
-                        print(f"      Node 1 Policy Probs (Top 5): {np.sort(node1_policy)[-5:][::-1]}")
-                        print(f"      Node 1 Mask (first 10): {node1_mask[:10]}")
-                        print(f"      Node 1 Mask[0] (No-Op Legal?): {node1_mask[0]}")
-                    except Exception as e:
-                        print(f"    DEBUG: Error inspecting Node 1: {e}")
-                # === END DEBUG ===
+                # DEBUG output (only if verbose)
+                if verbose:
+                    print(f"    DEBUG: Iter {iteration+1}: Action = {current_iter_action} ({bg.action_to_str(current_iter_action)})", flush=True)
+                    if current_iter_action == 0:
+                        is_only_legal = (state.legal_action_mask[0] == 1) and (jnp.sum(state.legal_action_mask) == 1)
+                        print(f"      DEBUG: No-op (0) considered. Only legal? {is_only_legal}")
+                    if eval_state.next_free_idx > 1:
+                        try:
+                            node1_data = eval_state.data_at(1)
+                            node1_policy = np.array(node1_data.p)
+                            print(f"      Node 1 Policy (Top 5): {np.argsort(node1_policy)[-5:][::-1]}")
+                        except Exception as e:
+                            print(f"      DEBUG: Error inspecting Node 1: {e}")
+                    print(f"    DEBUG: After iteration {iteration+1}, tree size: {eval_state.next_free_idx}")
 
-                # Simple tree size check without JAX callbacks
-                print(f"    DEBUG: After iteration {iteration+1}, tree size: {eval_state.next_free_idx}")
-                
+                # Only render every Nth iteration for performance
+                should_render = (iteration + 1) % render_every_n_iterations == 0 or iteration == iterations_per_deterministic_turn - 1
+                if should_render:
+                    # Visualize tree after this iteration
+                    graph = tree_to_graph(eval_state, output_dir, boards_dir, verbose=verbose)
+                    graph_filename = f'real_tree_turn_{turn}_iter_{iteration:02d}.svg'
+                    graph_path_abs = os.path.join(output_dir, graph_filename)
+                    graph_path_rel = graph_filename
+                    render_graph_safely(graph, graph_path_abs.replace('.svg', ''))
 
-                # Visualize tree after this iteration
-                graph = tree_to_graph(eval_state, output_dir, boards_dir)
-                graph_filename = f'real_tree_turn_{turn}_iter_{iteration:02d}.svg'
-                graph_path_abs = os.path.join(output_dir, graph_filename)
-                graph_path_rel = graph_filename
-                graph.render(filename=graph_path_abs.replace('.svg', ''), cleanup=True, view=False)
+                    # Store iteration frame
+                    visualization_frames.append({
+                        'type': 'iteration',
+                        'turn': turn,
+                        'iteration': iteration,
+                        'graph_path': graph_path_rel,
+                        'info': f'Turn {turn+1}, Iteration {iteration+1}/{iterations_per_deterministic_turn} (Player {state.current_player})',
+                        'current_board_path': last_saved_curr_board_path,
+                        'previous_board_path': last_saved_prev_board_path,
+                        'action_str': ''  # No action during iteration
+                    })
+                    frame_idx += 1
 
-                # Store iteration frame
-                visualization_frames.append({
-                    'type': 'iteration',
-                    'turn': turn,
-                    'iteration': iteration,
-                    'graph_path': graph_path_rel,
-                    'info': f'Turn {turn+1}, Iteration {iteration+1}/{iterations_per_deterministic_turn} (Player {state.current_player})',
-                    'current_board_path': last_saved_curr_board_path,
-                    'previous_board_path': last_saved_prev_board_path,
-                    'action_str': '' # No action during iteration
-                })
-                frame_idx += 1
                 current_iterations += 1
-                # if (iteration + 1) % 5 == 0:
-                #      print(f"  Iteration {iteration + 1}/{iterations_per_deterministic_turn} done.")
 
-            # --- Action Step ---            
-            action = final_action # Use action determined by MCTS after all iterations
+            # --- Action Step ---
+            action = final_action  # Use action determined by MCTS after all iterations
             action_str = bg.action_to_str(action)
-            # --- DEBUG: Print final chosen action and mask ---
-            print(f"  DEBUG: Iterations complete. Final selected action = {action} ({action_str})")
-            print(f"  DEBUG: Legal mask at time of selection: {state.legal_action_mask}")
-            if action == 0:
-                 is_only_legal = (state.legal_action_mask[0] == 1) and (jnp.sum(state.legal_action_mask) == 1)
-                 print(f"    DEBUG: Final action is No-op (0). Was it the only legal move? {is_only_legal}")
-                 # --- ADDED DEBUG: Print state when no-op is selected ---
-                 print(f"    DEBUG: State causing final no-op selection:\n{state}")
-                 # --- END ADDED DEBUG ---
-            # --- END DEBUG ---
-            print(f"Iterations complete. Applying deterministic action: {action} ({action_str})")
+            print(f"  Turn {turn+1}: Applying deterministic action: {action} ({action_str})")
             previous_state = state
             last_saved_prev_board_path = last_saved_curr_board_path # Current becomes previous
             key, step_key = jax.random.split(key)
@@ -459,22 +455,20 @@ def create_real_mcts_visualization(output_dir):
             state, metadata = bg_step_fn(backgammon_env, state, action, step_key)
 
             # Step MCTS tree - always step after a deterministic action
-            print(f"DEBUG - Before mcts.step - Tree node count: {eval_state.next_free_idx}")
             eval_state = mcts.step(eval_state, action)
-            print(f"DEBUG - After mcts.step - Tree node count: {eval_state.next_free_idx}")
 
             # Save current board state SVG
             curr_board_filename = f'board_turn_{turn}_deterministic_curr.svg'
             curr_board_path_abs = os.path.join(boards_dir, curr_board_filename)
             save_svg_string(state.to_svg(), curr_board_path_abs)
-            last_saved_curr_board_path = os.path.join("boards", curr_board_filename) # Update last saved current board
+            last_saved_curr_board_path = os.path.join("boards", curr_board_filename)  # Update last saved current board
 
             # Visualize MCTS tree *after* the step
-            graph_after_step = tree_to_graph(eval_state, output_dir, boards_dir)
+            graph_after_step = tree_to_graph(eval_state, output_dir, boards_dir, verbose=verbose)
             graph_after_step_filename = f'real_tree_turn_{turn}_deterministic_after.svg'
             graph_after_step_path_abs = os.path.join(output_dir, graph_after_step_filename)
             graph_after_step_path_rel = graph_after_step_filename
-            graph_after_step.render(filename=graph_after_step_path_abs.replace('.svg', ''), cleanup=True, view=False)
+            render_graph_safely(graph_after_step, graph_after_step_path_abs.replace('.svg', ''))
 
             # Store action frame
             visualization_frames.append({
@@ -488,8 +482,7 @@ def create_real_mcts_visualization(output_dir):
                 'info': f'Turn {turn+1}: Applied move {action_str} (Player {previous_state.current_player}) -> Player {state.current_player}'
             })
             frame_idx += 1
-            print(f"Resulting state: Player {state.current_player}, Stochastic: {state.is_stochastic}")
-            
+
         # Check for game termination
         if bool(state.terminated):
              print(f"--- Game terminated at Turn {turn + 1} ---")
