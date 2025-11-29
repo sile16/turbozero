@@ -178,16 +178,17 @@ class MCTS(Evaluator):
         """
         # Get Keys:
         step_key, eval_key, key = jax.random.split(key, 3)
-        
+
         # traverse from root -> leaf
         traversal_state = self.traverse(tree)
         parent, action = traversal_state.parent, traversal_state.action
         # get env state (embedding) for leaf node
-        embedding = tree.data_at(parent).embedding
+        # OPTIMIZATION: Direct access to embedding instead of data_at() which reconstructs entire node
+        embedding = jax.tree_util.tree_map(lambda x: x[parent], tree.data.embedding)
         new_embedding, metadata = env_step_fn(embedding, action, step_key)
         player_reward = metadata.rewards[metadata.cur_player_id]
         # evaluate leaf node
-        
+
         policy_logits, value = self.eval_fn(new_embedding, params, eval_key)
         policy_logits = jnp.where(metadata.action_mask, policy_logits, jnp.finfo(policy_logits).min)
         policy = jax.nn.softmax(policy_logits)
@@ -196,27 +197,27 @@ class MCTS(Evaluator):
         node_exists = tree.is_edge(parent, action)
         node_idx = tree.edge_map[parent, action]
 
-        node_data = jax.lax.cond(
-            node_exists,
-            lambda: self.visit_node(node=tree.data_at(node_idx), value=value, p=policy, terminated=metadata.terminated, embedding=new_embedding),
-            lambda: self.new_node(policy=policy, value=value, embedding=new_embedding, terminated=metadata.terminated)
-        )
+        # OPTIMIZATION: For existing nodes, only update n/q stats (not the full node with embedding)
+        # For new nodes, create the full node and add to tree
+        def update_existing_node():
+            return MCTS._update_node_stats(tree, node_idx, value)
 
-        tree = jax.lax.cond(
-            node_exists,
-            lambda: tree.update_node(index=node_idx, data = node_data),
-            lambda: tree.add_node(parent_index=parent, edge_index=action, data=node_data)
-        )
+        def add_new_node():
+            node_data = self.new_node(policy=policy, value=value, embedding=new_embedding, terminated=metadata.terminated)
+            return tree.add_node(parent_index=parent, edge_index=action, data=node_data)
+
+        tree = jax.lax.cond(node_exists, update_existing_node, add_new_node)
+
         # backpropagate
         return self.backpropagate(key, tree, parent, value)
 
 
     def traverse(self, tree: MCTSTree) -> TraversalState:
         """ Traverse from the root node until an unvisited leaf node is reached.
-        
+
         Args:
         - `tree`: MCTSTree to evaluate
-        
+
         Returns:
         - (TraversalState): state of the traversal
             - `parent`: index of the parent node
@@ -227,9 +228,14 @@ class MCTS(Evaluator):
         # - there is an existing edge corresponding to the chosen action
         # - AND the child node connected to that edge is not terminal
         def cond_fn(state: TraversalState) -> bool:
+            # OPTIMIZATION: Direct array access instead of data_at() for terminated check
+            child_idx = tree.edge_map[state.parent, state.action]
+            # Use safe index for array access (in case child_idx is NULL_INDEX)
+            safe_child_idx = jnp.maximum(child_idx, 0)
+            child_terminated = tree.data.terminated[safe_child_idx]
             return jnp.logical_and(
                 tree.is_edge(state.parent, state.action),
-                ~(tree.data_at(tree.edge_map[state.parent, state.action]).terminated)
+                ~child_terminated
                 # TODO: maximum depth
             )
         
@@ -252,7 +258,7 @@ class MCTS(Evaluator):
 
     def backpropagate(self, key: chex.PRNGKey, tree: MCTSTree, parent: int, value: float) -> MCTSTree: #pylint: disable=unused-argument
         """Backpropagate the value estimate from the leaf node to the root node and update visit counts.
-        
+
         Args:
         - `key`: rng
         - `tree`: MCTSTree to evaluate
@@ -263,22 +269,20 @@ class MCTS(Evaluator):
         - (MCTSTree): updated search tree
         """
 
-        def body_fn(state: BackpropState) -> Tuple[int, MCTSTree]:
+        def body_fn(state: BackpropState) -> BackpropState:
             node_idx, value, tree = state.node_idx, state.value, state.tree
             # apply discount to value estimate
             value *= self.discount
-            node = tree.data_at(node_idx)
-            # increment visit count and update value estimate
-            new_node = self.visit_node(node, value)
-            tree = tree.update_node(node_idx, new_node)
-            # go to parent 
+            # OPTIMIZATION: Use partial update (only n and q) instead of full node reconstruction
+            tree = MCTS._update_node_stats(tree, node_idx, value)
+            # go to parent
             return BackpropState(node_idx=tree.parents[node_idx], value=value, tree=tree)
-        
+
         # backpropagate while the node is a valid node
-        # the root has no parent, so the loop will terminate 
+        # the root has no parent, so the loop will terminate
         # when the parent of the root is visited
         state = jax.lax.while_loop(
-            lambda s: s.node_idx != s.tree.NULL_INDEX, body_fn, 
+            lambda s: s.node_idx != s.tree.NULL_INDEX, body_fn,
             BackpropState(node_idx=parent, value=value, tree=tree)
         )
         return state.tree
@@ -356,7 +360,38 @@ class MCTS(Evaluator):
             terminated=terminated,
             embedding=embedding
         )
-    
+
+    @staticmethod
+    def _update_node_stats(tree: MCTSTree, node_idx: int, value: float) -> MCTSTree:
+        """Update only n and q for a node (optimized partial update).
+
+        OPTIMIZATION: Instead of reconstructing the entire node with data_at() and
+        updating all fields including the heavy embedding, we directly update only
+        the n and q arrays. This avoids copying the entire game state.
+
+        Args:
+        - `tree`: MCTSTree to update
+        - `node_idx`: index of the node to update
+        - `value`: value to incorporate into running average
+
+        Returns:
+        - MCTSTree with updated n and q at node_idx
+        """
+        # Read current values directly from arrays
+        old_n = tree.data.n[node_idx]
+        old_q = tree.data.q[node_idx]
+
+        # Compute new values
+        new_n = old_n + 1
+        new_q = (old_q * old_n + value) / new_n
+
+        # Update only n and q arrays (not the entire node)
+        new_data = tree.data.replace(
+            n=tree.data.n.at[node_idx].set(new_n),
+            q=tree.data.q.at[node_idx].set(new_q)
+        )
+
+        return tree.replace(data=new_data)
 
     @staticmethod
     def new_node(policy: chex.Array, value: float, embedding: chex.ArrayTree, terminated: bool) -> MCTSNode:

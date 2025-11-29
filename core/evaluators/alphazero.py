@@ -76,9 +76,19 @@ class _AlphaZero:
         renorm_policy = jax.nn.softmax(policy)
 
         # update the root node
-        root_node = tree.data_at(tree.ROOT_INDEX)
-        root_node = self.update_root_node(root_node, renorm_policy, root_value, root_embedding) #pylint: disable=no-member
-        return tree.set_root(root_node)
+        # OPTIMIZATION: Check if root already visited via direct array access
+        root_n = tree.data.n[tree.ROOT_INDEX]
+
+        def do_update():
+            root_node = tree.data_at(tree.ROOT_INDEX)
+            updated_root = self.update_root_node(root_node, renorm_policy, root_value, root_embedding) #pylint: disable=no-member
+            return tree.set_root(updated_root)
+
+        def skip_update():
+            return tree
+
+        # Only update if root hasn't been visited yet
+        return jax.lax.cond(root_n == 0, do_update, skip_update)
     
 
 class AlphaZero(MCTS):

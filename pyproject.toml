@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "turbozero"
-version = "0.1.1"
+version = "0.2.0"
 description = "vectorized alphazero/mcts in JAX"
 authors = ["lowrollr <92640744+lowrollr@users.noreply.github.com>"]
 license = "Apache-2.0"
