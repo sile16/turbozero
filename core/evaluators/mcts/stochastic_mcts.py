@@ -159,30 +159,30 @@ class StochasticMCTS(AlphaZero(MCTS)):
     
     def deterministic_action_selector(self, key: chex.PRNGKey, tree: MCTSTree, node_idx: int) -> int:
         """called when traversing the tree and exploring possibilities, a wrapper to remove the key
-        
+
         Args:
         - `tree`: MCTSTree to evaluate
         - `node_idx`: index of the node to select an action from
-        """
 
-        current_player = tree.data_at(node_idx).embedding.current_player
-            
-        # Get child players
+        Optimized: Direct array access instead of data_at() to avoid full node reconstruction.
+        """
+        # Direct access to current_player array
+        current_player = tree.data.embedding.current_player[node_idx]
+
+        # Get child players - direct array slice
         child_indices = tree.edge_map[node_idx]
-        
+
         # Safe access to child players
         safe_indices = jnp.maximum(child_indices, 0)
         child_players = tree.data.embedding.current_player[safe_indices]
-        
+
         # Create a discount mask for each child based on player difference
         # We want discount = -1.0 when players differ, 1.0 when same
         # The PUCT selector will use this to adjust Q-values
-        discount = 1.0  # Default: use raw values (same player)
-        
+
         # LIMITATION: This applies the same discount to ALL children if ANY child has a different player.
         # This is incorrect - discount should be applied per-child, not globally.
         # However, current action selector interface expects a single discount value.
-        # TODO: Enhance action selector to accept per-child discount arrays for better generalization.
         # For now, this works for backgammon where all children at same level have same player transitions.
 
         has_diff_player = jnp.any(jnp.abs(child_players - current_player))
@@ -396,20 +396,21 @@ class StochasticMCTS(AlphaZero(MCTS)):
 
     def calculate_discount_factor(self, tree: MCTSTree, node_idx: int, other_idx: int) -> float:
         """Calculate discount factor to convert values between player perspectives.
-        
+
         Args:
             - `tree`: MCTSTree containing the nodes
             - `node_idx`: Index of the current node
             - `other_idx`: Index of the node to compare with
-                        
+
         Returns:
             - float: 1.0 if players are same, -1.0 if different
+
+        Optimized: Direct array access instead of data_at() to avoid full node reconstruction.
         """
-        current_player = tree.data_at(node_idx).embedding.current_player
-        
-        # Get other player
-        other_player = tree.data_at(other_idx).embedding.current_player
-        
+        # Direct access to current_player array instead of reconstructing entire node
+        current_player = tree.data.embedding.current_player[node_idx]
+        other_player = tree.data.embedding.current_player[other_idx]
+
         # Calculate discount factor
         player_diff = jnp.abs(current_player - other_player)
         return 1.0 - 2.0 * player_diff
@@ -455,6 +456,38 @@ class StochasticMCTS(AlphaZero(MCTS)):
 
         return expected_value
 
+    @staticmethod
+    def _update_node_stats(tree: MCTSTree, node_idx: int, value: float) -> MCTSTree:
+        """Update only n and q for a node (optimized partial update).
+
+        OPTIMIZATION: Instead of reconstructing the entire node with data_at() and
+        updating all fields including the heavy embedding, we directly update only
+        the n and q arrays. This avoids copying the entire game state.
+
+        Args:
+        - `tree`: MCTSTree to update
+        - `node_idx`: index of the node to update
+        - `value`: value to incorporate into running average
+
+        Returns:
+        - MCTSTree with updated n and q at node_idx
+        """
+        # Read current values directly from arrays
+        old_n = tree.data.n[node_idx]
+        old_q = tree.data.q[node_idx]
+
+        # Compute new values
+        new_n = old_n + 1
+        new_q = (old_q * old_n + value) / new_n
+
+        # Update only n and q arrays (not the entire node)
+        new_data = tree.data.replace(
+            n=tree.data.n.at[node_idx].set(new_n),
+            q=tree.data.q.at[node_idx].set(new_q)
+        )
+
+        return tree.replace(data=new_data)
+
     def backpropagate(self, key: chex.PRNGKey, tree: MCTSTree, parent: int, child: int, value: float) -> MCTSTree:
         """Backpropagate the value estimate from the leaf node to the root node and update visit counts.
 
@@ -477,10 +510,9 @@ class StochasticMCTS(AlphaZero(MCTS)):
         def body_fn(state: BackpropState) -> BackpropState:
             node_idx, value, tree = state.node_idx, state.value, state.tree
 
-            node = tree.data_at(node_idx)
-            # increment visit count and update value estimate
-            new_node = self.visit_node(node, value)
-            tree = tree.update_node(node_idx, new_node)
+            # OPTIMIZATION: Use partial update (only n and q) instead of full node reconstruction
+            tree = StochasticMCTS._update_node_stats(tree, node_idx, value)
+
             # go to parent
             parent_idx = tree.parents[node_idx]
 
@@ -490,13 +522,12 @@ class StochasticMCTS(AlphaZero(MCTS)):
             # The expectimax value is the weighted sum of all child values
             is_stochastic = StochasticMCTS.is_node_idx_stochastic(tree, node_idx)
 
-            # Compute expectimax value for stochastic nodes
-            expectimax_value = compute_expectimax(tree, node_idx)
-
             # Use expectimax value for stochastic nodes, sampled value for deterministic
+            # OPTIMIZATION: expectimax calculation is now INSIDE the cond, so it only
+            # runs for stochastic nodes (lazy evaluation)
             value_to_propagate = jax.lax.cond(
                 is_stochastic,
-                lambda: expectimax_value,
+                lambda: compute_expectimax(tree, node_idx),  # Only computed when stochastic
                 lambda: value
             )
 
@@ -516,10 +547,7 @@ class StochasticMCTS(AlphaZero(MCTS)):
             state
         )
 
-        # Update the root node
-        node = state.tree.data_at(state.node_idx)
-
-        # For stochastic root, use expectimax value
+        # Update the root node - also use optimized partial update
         is_root_stochastic = StochasticMCTS.is_node_idx_stochastic(state.tree, state.node_idx)
         final_value = jax.lax.cond(
             is_root_stochastic,
@@ -527,37 +555,9 @@ class StochasticMCTS(AlphaZero(MCTS)):
             lambda: state.value
         )
 
-        new_node = self.visit_node(node, final_value)
-        tree = state.tree.update_node(state.node_idx, new_node)
+        tree = StochasticMCTS._update_node_stats(state.tree, state.node_idx, final_value)
 
         return tree
-
-    @staticmethod
-    def is_child_different_player(tree: MCTSTree, node_idx: int) -> float:
-        """Check if the child of the node is of a different player.
-        
-        Returns:
-        - float: 1.0 if players are same, -1.0 if different
-        """
-        current_player = tree.data_at(node_idx).embedding.current_player
-        
-        # Get all possible child indices for this node
-        child_indices = jax.vmap(lambda a: tree.edge_map[node_idx, a])(jnp.arange(tree.branching_factor))
-        
-        # Check which edges exist
-        edge_exists = jax.vmap(lambda a: tree.is_edge(node_idx, a))(jnp.arange(tree.branching_factor))
-        
-        # Get the first valid child index, or NULL_INDEX if none exist
-        valid_child_indices = jnp.where(edge_exists, child_indices, tree.NULL_INDEX)
-        first_valid_child = jnp.min(valid_child_indices)
-        
-        # If no child exists, return 1.0 (no discount)
-        return jax.lax.cond(
-            first_valid_child == tree.NULL_INDEX,
-            lambda: 1.0,
-            lambda: 1.0 - 2.0 * jnp.abs(current_player - tree.data_at(first_valid_child).embedding.current_player)
-        )
-    
 
     @staticmethod
     def is_node_stochastic(node: MCTSNode):
@@ -576,9 +576,10 @@ class StochasticMCTS(AlphaZero(MCTS)):
         """Check if the node is stochastic.
 
         Returns a JAX boolean that can be used with jax.lax.cond.
+        Optimized: Direct array access instead of data_at() to avoid full node reconstruction.
         """
-        # Check if embedding has is_stochastic attribute, default to False if not
-        is_stochastic = getattr(tree.data_at(node_idx).embedding, 'is_stochastic', None)
+        # Direct access to is_stochastic array instead of reconstructing entire node
+        is_stochastic = getattr(tree.data.embedding, 'is_stochastic', None)
         if is_stochastic is None:
             return jnp.array(False)
-        return is_stochastic
+        return is_stochastic[node_idx]
