@@ -334,13 +334,10 @@ class StochasticMCTS(AlphaZero(MCTS)):
             lambda: tree.update_node(index=node_idx, data = node_data),
             lambda: tree.add_node(parent_index=parent, edge_index=action, data=node_data)
         )
-        
+
         # Get the correct node index after adding/updating
-        node_idx = jax.lax.cond(
-            node_exists,
-            lambda: node_idx,
-            lambda: tree.next_free_idx - 1  # After adding a node, the new node is at next_free_idx - 1
-        )
+        # OPTIMIZATION: Use jnp.where instead of jax.lax.cond for simple scalar selection
+        node_idx = jnp.where(node_exists, node_idx, tree.next_free_idx - 1)
         
         # backpropagate
         return self.backpropagate(key, tree, parent, node_idx, value) 
@@ -366,9 +363,14 @@ class StochasticMCTS(AlphaZero(MCTS)):
         # - there is an existing edge corresponding to the chosen action
         # - AND the child node connected to that edge is not terminal
         def cond_fn(state: TraversalState) -> bool:
+            # OPTIMIZATION: Direct array access instead of data_at() for terminated check
+            child_idx = tree.edge_map[state.parent, state.action]
+            # Use safe index for array access (in case child_idx is NULL_INDEX)
+            safe_child_idx = jnp.maximum(child_idx, 0)
+            child_terminated = tree.data.terminated[safe_child_idx]
             return jnp.logical_and(
                 tree.is_edge(state.parent, state.action),
-                ~(tree.data_at(tree.edge_map[state.parent, state.action]).terminated)
+                ~child_terminated
                 # TODO: maximum depth
             )
 
