@@ -78,7 +78,7 @@ def test_stochastic_mcts_backgammon_simple_doubles_valid_actions():
     while not bool(state.terminated) and step_count < max_steps:
         step_count += 1
         current_player = int(state.current_player) # Ensure Python int
-        is_stochastic = bool(state.is_stochastic)
+        is_stochastic = bool(state._is_stochastic)
         
         key, eval_key, step_key = jax.random.split(key, 3)
 
@@ -110,7 +110,7 @@ def test_stochastic_mcts_backgammon_simple_doubles_valid_actions():
             eval_state_p1 = mcts_output.eval_state
 
         # --- CRITICAL CHECK: Verify action legality ---
-        # is_stochastic = bool(state.is_stochastic) # Redundant, already defined
+        # is_stochastic = bool(state._is_stochastic) # Redundant, already defined
         if is_stochastic:
             # For stochastic states, check if action is within the valid range of stochastic outcomes
             num_stochastic_outcomes = len(env.stochastic_action_probs)

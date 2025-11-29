@@ -568,8 +568,8 @@ class StochasticMCTS(AlphaZero(MCTS)):
 
         Returns a JAX boolean that can be used with jax.lax.cond.
         """
-        # Check if embedding has is_stochastic attribute, default to False if not
-        is_stochastic = getattr(node.embedding, 'is_stochastic', None)
+        # Check if embedding has _is_stochastic attribute, default to False if not
+        is_stochastic = getattr(node.embedding, '_is_stochastic', None)
         if is_stochastic is None:
             return jnp.array(False)
         return is_stochastic
@@ -581,8 +581,8 @@ class StochasticMCTS(AlphaZero(MCTS)):
         Returns a JAX boolean that can be used with jax.lax.cond.
         Optimized: Direct array access instead of data_at() to avoid full node reconstruction.
         """
-        # Direct access to is_stochastic array instead of reconstructing entire node
-        is_stochastic = getattr(tree.data.embedding, 'is_stochastic', None)
+        # Direct access to _is_stochastic array instead of reconstructing entire node
+        is_stochastic = getattr(tree.data.embedding, '_is_stochastic', None)
         if is_stochastic is None:
             return jnp.array(False)
         return is_stochastic[node_idx]

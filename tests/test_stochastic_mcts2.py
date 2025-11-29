@@ -111,12 +111,12 @@ def test_stochastic_node_handling(stochastic_mcts, backgammon_env, key):
     
     # Initialize a deterministic state
     initial_state = backgammon_env.init(init_key)
-    if initial_state.is_stochastic:
+    if initial_state._is_stochastic:
         # Roll dice to get a deterministic state
         dice_action = 0  # Use fixed dice roll for reproducibility
         initial_state = backgammon_env.stochastic_step(initial_state, dice_action)
     
-    assert not initial_state.is_stochastic, "State should be deterministic after dice roll"
+    assert not initial_state._is_stochastic, "State should be deterministic after dice roll"
     
     # Initialize tree and evaluate
     eval_state = stochastic_mcts.init(template_embedding=initial_state)
@@ -162,13 +162,13 @@ def test_stochastic_expansion(stochastic_mcts, backgammon_env, key, mock_params)
     
     # Create a stochastic state (dice roll needed)
     state = backgammon_env.init(init_key)
-    if not state.is_stochastic:
+    if not state._is_stochastic:
         # Make a move to get to a stochastic state (after a move, we need to roll dice)
         legal_actions = jnp.where(state.legal_action_mask)[0]
         first_legal_action = legal_actions[0]
         state, _ = backgammon_step_fn(backgammon_env, state, first_legal_action, init_key)
     
-    assert state.is_stochastic, "State should be stochastic for this test"
+    assert state._is_stochastic, "State should be stochastic for this test"
     
     # Initialize tree and metadata
     eval_state = stochastic_mcts.init(template_embedding=state)
@@ -209,13 +209,13 @@ def test_stochastic_root_selection(stochastic_mcts, backgammon_env, key, mock_pa
     
     # Create a stochastic state (dice roll needed)
     state = backgammon_env.init(init_key)
-    if not state.is_stochastic:
+    if not state._is_stochastic:
         # Make a move to get to a stochastic state (after a move, we need to roll dice)
         legal_actions = jnp.where(state.legal_action_mask)[0]
         first_legal_action = legal_actions[0]
         state, _ = backgammon_step_fn(backgammon_env, state, first_legal_action, init_key)
     
-    assert state.is_stochastic, "State should be stochastic for this test"
+    assert state._is_stochastic, "State should be stochastic for this test"
     
     # Initialize tree and metadata
     eval_state = stochastic_mcts.init(template_embedding=state)
@@ -260,10 +260,10 @@ def test_stochastic_backpropagation(stochastic_mcts, backgammon_env, key, mock_p
     
     # Create a deterministic state
     state = backgammon_env.init(init_key)
-    if state.is_stochastic:
+    if state._is_stochastic:
         state = backgammon_env.stochastic_step(state, 0)  # Fixed dice roll
     
-    assert not state.is_stochastic, "State should be deterministic after setup"
+    assert not state._is_stochastic, "State should be deterministic after setup"
     
     # Initialize tree and metadata
     eval_state = stochastic_mcts.init(template_embedding=state)
@@ -301,9 +301,9 @@ def test_stochastic_backpropagation(stochastic_mcts, backgammon_env, key, mock_p
     # Check the actual state returned by the environment step function
     # Note: PGX Backgammon step might not immediately set is_stochastic=True after a move
     # Adjusting assertion based on observed behavior
-    print(f"State stochastic after step: {next_state.is_stochastic}") # Add print for debugging
-    # assert next_state.is_stochastic, "Next state should be stochastic (dice roll)" # Original assertion
-    assert not next_state.is_stochastic, "Next state is currently deterministic after env.step"
+    print(f"State stochastic after step: {next_state._is_stochastic}") # Add print for debugging
+    # assert next_state._is_stochastic, "Next state should be stochastic (dice roll)" # Original assertion
+    assert not next_state._is_stochastic, "Next state is currently deterministic after env.step"
     
     # Evaluate the stochastic state
     next_key = jax.random.fold_in(eval_key, 1)
@@ -344,7 +344,7 @@ def test_full_tree_edge_case(stochastic_mcts, backgammon_env, key, mock_params):
     
     # Create a deterministic state
     state = backgammon_env.init(init_key)
-    if state.is_stochastic:
+    if state._is_stochastic:
         state = backgammon_env.stochastic_step(state, 0)
     
     # Initialize tree and metadata
@@ -439,11 +439,11 @@ def test_node_type_detection(backgammon_env, key):
     state = backgammon_env.init(init_key)
     
     # Initial state in backgammon is stochastic (dice roll needed)
-    assert state.is_stochastic, "Initial state should be stochastic (dice roll needed)"
+    assert state._is_stochastic, "Initial state should be stochastic (dice roll needed)"
     
     # Roll dice to get a deterministic state
     det_state = backgammon_env.stochastic_step(state, 0)
-    assert not det_state.is_stochastic, "State should be deterministic after dice roll"
+    assert not det_state._is_stochastic, "State should be deterministic after dice roll"
     
     # Make a move to get back to a stochastic state
     legal_actions = jnp.where(det_state.legal_action_mask)[0]
@@ -454,9 +454,9 @@ def test_node_type_detection(backgammon_env, key):
     # Check the actual state returned by the environment step function
     # Note: PGX Backgammon step might not immediately set is_stochastic=True after a move
     # Adjusting assertion based on observed behavior
-    print(f"State stochastic after move: {next_state.is_stochastic}") # Add print for debugging
-    # assert next_state.is_stochastic, "State should be stochastic after move (dice roll needed)" # Original assertion
-    assert not next_state.is_stochastic, "State is currently deterministic after env.step"
+    print(f"State stochastic after move: {next_state._is_stochastic}") # Add print for debugging
+    # assert next_state._is_stochastic, "State should be stochastic after move (dice roll needed)" # Original assertion
+    assert not next_state._is_stochastic, "State is currently deterministic after env.step"
     
     print("test_node_type_detection PASSED")
 
@@ -577,7 +577,7 @@ def test_bg_pip_count_eval():
         #assert jnp.isfinite(value), "Value should be finite"
         #assert jnp.isclose(jnp.sum(policy), 1.0), "Policy should sum to 1"
 
-        if state.is_stochastic:
+        if state._is_stochastic:
             state = env.stochastic_step(state, 4)
         else:
             action_key, key = jax.random.split(key)
@@ -655,7 +655,7 @@ def test_evaluate_stochastic_root(stochastic_mcts, backgammon_env, key, mock_par
     
     # Create a stochastic state
     state = backgammon_env.init(init_key)  
-    assert state.is_stochastic, "State should be stochastic for this test"
+    assert state._is_stochastic, "State should be stochastic for this test"
     
     # Initialize tree and metadata
     eval_state = stochastic_mcts.init(template_embedding=state)
@@ -696,7 +696,7 @@ def test_step_deterministic(stochastic_mcts, backgammon_env, key, mock_params):
     
     # Create a deterministic state
     state = backgammon_env.init(init_key)
-    if state.is_stochastic:
+    if state._is_stochastic:
         state = backgammon_env.stochastic_step(state, 0)
     
     # Initialize tree and metadata

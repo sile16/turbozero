@@ -37,7 +37,7 @@ def test_backgammon_basics():
     
     # --- Test basic environment operations ---
     # 1. Initial state should be stochastic (need to roll dice)
-    assert init_state.is_stochastic
+    assert init_state._is_stochastic
     assert not init_state.terminated
     
     # 2. Test stochastic step (dice roll)
@@ -45,7 +45,7 @@ def test_backgammon_basics():
     after_roll_state = env.stochastic_step(init_state, stochastic_action)
     
     # After rolling dice, state should be deterministic
-    assert not after_roll_state.is_stochastic
+    assert not after_roll_state._is_stochastic
     assert not after_roll_state.terminated
     
     # 3. Test a regular move
@@ -86,7 +86,7 @@ def test_backgammon_evaluator():
     # --- Roll dice ---
     stochastic_action = 0
     after_roll_state = env.stochastic_step(init_state, stochastic_action)
-    assert not after_roll_state.is_stochastic
+    assert not after_roll_state._is_stochastic
     
     # --- Create metadata ---
     metadata = StepMetadata(

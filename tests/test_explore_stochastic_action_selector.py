@@ -17,8 +17,8 @@ def dummy_eval_fn(state, params, key):
 
 @dataclass
 class DummyEmbedding:
-    """JAX-compatible embedding with is_stochastic flag for testing."""
-    is_stochastic: bool = False
+    """JAX-compatible embedding with _is_stochastic flag for testing."""
+    _is_stochastic: bool = False
 
 
 def test_explore_stochastic_action_selector_manual():
@@ -86,7 +86,7 @@ def test_explore_stochastic_action_selector():
     key = jax.random.PRNGKey(42)
     
     # Create a template embedding
-    template_embedding = DummyEmbedding(is_stochastic=True)
+    template_embedding = DummyEmbedding(_is_stochastic=True)
     
     # Initialize a tree
     tree = evaluator.init(template_embedding=template_embedding)
@@ -123,7 +123,7 @@ def test_explore_stochastic_action_selector():
                 p=jnp.zeros((branching_factor,)),
                 q=jnp.array(0.0, dtype=jnp.float32),
                 terminated=jnp.array(False, dtype=jnp.bool_),
-                embedding=DummyEmbedding(is_stochastic=False)
+                embedding=DummyEmbedding(_is_stochastic=False)
             )
             tree = tree.add_node(parent_index=tree.ROOT_INDEX, edge_index=i, data=child_node)
     
@@ -167,7 +167,7 @@ def test_explore_stochastic_action_selector_with_missing_children():
     key = jax.random.PRNGKey(42)
     
     # Create a template embedding
-    template_embedding = DummyEmbedding(is_stochastic=True)
+    template_embedding = DummyEmbedding(_is_stochastic=True)
     
     # Initialize a tree
     tree = evaluator.init(template_embedding=template_embedding)
@@ -199,7 +199,7 @@ def test_explore_stochastic_action_selector_with_missing_children():
             p=jnp.zeros((branching_factor,)),
             q=jnp.array(0.0, dtype=jnp.float32),
             terminated=jnp.array(False, dtype=jnp.bool_),
-            embedding=DummyEmbedding(is_stochastic=False)
+            embedding=DummyEmbedding(_is_stochastic=False)
         )
         tree = tree.add_node(parent_index=tree.ROOT_INDEX, edge_index=edge_idx, data=child_node)
     

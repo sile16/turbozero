@@ -63,7 +63,7 @@ def step_fn_with_key(state: bg.State, action: int, key: chex.PRNGKey):
 
     # Use conditional to route to the appropriate branch
     new_state = jax.lax.cond(
-        state.is_stochastic,
+        state._is_stochastic,
         stochastic_branch,
         deterministic_branch,
         (state, action, key)
