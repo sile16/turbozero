@@ -76,19 +76,27 @@ class _AlphaZero:
         renorm_policy = jax.nn.softmax(policy)
 
         # update the root node
-        # OPTIMIZATION: Check if root already visited via direct array access
-        root_n = tree.data.n[tree.ROOT_INDEX]
+        # NOTE: The caller (MCTS.evaluate) already determines when update_root should be called
+        # based on persist_tree and root_n. We unconditionally update here to honor the caller's
+        # intent - this ensures Dirichlet noise is refreshed when persist_tree=False.
+        root_node = tree.data_at(tree.ROOT_INDEX)
+        updated_root = self._force_update_root_node(root_node, renorm_policy, root_value, root_embedding)
+        return tree.set_root(updated_root)
 
-        def do_update():
-            root_node = tree.data_at(tree.ROOT_INDEX)
-            updated_root = self.update_root_node(root_node, renorm_policy, root_value, root_embedding) #pylint: disable=no-member
-            return tree.set_root(updated_root)
+    @staticmethod
+    def _force_update_root_node(root_node, root_policy, root_value, root_embedding):
+        """Force update root node, ignoring visit count.
 
-        def skip_update():
-            return tree
-
-        # Only update if root hasn't been visited yet
-        return jax.lax.cond(root_n == 0, do_update, skip_update)
+        Unlike MCTS.update_root_node which preserves values if the node was visited,
+        this method always updates the node with new values. This is needed for
+        persist_tree=False semantics where each evaluate() should start fresh.
+        """
+        return root_node.replace(
+            p=root_policy,
+            q=root_value,
+            n=jnp.array(1, dtype=jnp.int32),  # Reset to 1 visit
+            embedding=root_embedding
+        )
     
 
 class AlphaZero(MCTS):
