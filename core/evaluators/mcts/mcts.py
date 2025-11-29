@@ -91,21 +91,30 @@ class MCTS(Evaluator):
         """
         # Only update root if tree is empty or persist_tree=False
         key, root_key = jax.random.split(key)
-        root_node = eval_state.data_at(eval_state.ROOT_INDEX)
+        # OPTIMIZATION: Direct array access instead of data_at() which reconstructs entire node
+        root_n = eval_state.data.n[eval_state.ROOT_INDEX]
         should_update_root = jnp.logical_or(
             not self.persist_tree,
-            root_node.n == 0
+            root_n == 0
         )
         eval_state = jax.lax.cond(
             should_update_root,
             lambda: self.update_root(root_key, eval_state, env_state, params, root_metadata=root_metadata),
             lambda: eval_state
         )
-        
+
         # perform 'num_iterations' iterations of MCTS
-        iterate = partial(self.iterate, params=params, env_step_fn=env_step_fn)
-        iterate_keys = jax.random.split(key, self.num_iterations)
-        eval_state, _ = jax.lax.scan(lambda state, k: (iterate(k, state), None), eval_state, iterate_keys)
+        # OPTIMIZATION: Use fori_loop with key carry instead of pre-allocating all keys
+        # This avoids O(num_iterations) key array allocation and reduces memory/compile time
+        iterate_fn = partial(self.iterate, params=params, env_step_fn=env_step_fn)
+
+        def scan_body(carry, _):
+            state, k = carry
+            k, iter_key = jax.random.split(k)
+            new_state = iterate_fn(iter_key, state)
+            return (new_state, k), None
+
+        (eval_state, _), _ = jax.lax.scan(scan_body, (eval_state, key), None, length=self.num_iterations)
         
         # sample action based on root visit counts
         # (also get normalized policy weights for training purposes)
@@ -126,7 +135,8 @@ class MCTS(Evaluator):
         Returns:
         - (chex.Array): value estimate of the environment state stored in the root node of the tree
         """
-        return state.data_at(state.ROOT_INDEX).q
+        # OPTIMIZATION: Direct array access instead of data_at()
+        return state.data.q[state.ROOT_INDEX]
     
 
     def update_root(self, key: chex.PRNGKey, tree: MCTSTree, root_embedding: chex.ArrayTree, 

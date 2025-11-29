@@ -109,9 +109,10 @@ class StochasticTrainer(Trainer):
 
         # Use jax.lax.cond to choose between handling deterministic or stochastic state
         # Check if the state has is_stochastic attribute, default to False if not present
-        is_stochastic = getattr(state.env_state, 'is_stochastic', False)
-        
-        
+        # OPTIMIZATION: Coerce to device scalar to avoid Python bool causing static branching/retracing
+        is_stochastic_attr = getattr(state.env_state, 'is_stochastic', None)
+        is_stochastic = jnp.asarray(is_stochastic_attr if is_stochastic_attr is not None else False, dtype=jnp.bool_)
+
         buffer_state = jax.lax.cond(
             is_stochastic,
             handle_stochastic_state,

@@ -117,10 +117,11 @@ class StochasticMCTS(AlphaZero(MCTS)):
         """
         # Only update root if tree is empty or persist_tree=False
         key, root_key = jax.random.split(key)
-        root_node = eval_state.data_at(eval_state.ROOT_INDEX)
+        # OPTIMIZATION: Direct array access instead of data_at() which reconstructs entire node
+        root_n = eval_state.data.n[eval_state.ROOT_INDEX]
         should_update_root = jnp.logical_or(
             not self.persist_tree,
-            root_node.n == 0
+            root_n == 0
         )
         eval_state = jax.lax.cond(
             should_update_root,
@@ -145,15 +146,15 @@ class StochasticMCTS(AlphaZero(MCTS)):
     def stochastic_action_sample(self, key: chex.PRNGKey, tree, node_idx, discount):
         """Select an action from the node, not use in exploring at this point so we just use the stochastic action probs.
         i.e. we are rolling the dice to get the next deterministic state.
-        
+
         Args:
+        - `key`: rng key (used directly, no split needed)
         - `tree`: MCTSTree to evaluate
         - `node_idx`: index of the node to select an action from
         """
-        # Properly handle the key for jax.random.choice which expects a single key
-        choice_key, _ = jax.random.split(key)
-        action = jax.random.choice(choice_key, len(self.stochastic_action_probs), p=self.stochastic_action_probs)
-            
+        # OPTIMIZATION: Use key directly instead of splitting and discarding half
+        action = jax.random.choice(key, len(self.stochastic_action_probs), p=self.stochastic_action_probs)
+
         return jnp.array(action, dtype=jnp.int32)
     
     
@@ -308,7 +309,8 @@ class StochasticMCTS(AlphaZero(MCTS)):
         traversal_state = self.traverse(key, tree)
         parent, action = traversal_state.parent, traversal_state.action
         # get env state (embedding) for leaf node
-        embedding = tree.data_at(parent).embedding
+        # OPTIMIZATION: Direct access to embedding instead of data_at() which reconstructs entire node
+        embedding = jax.tree_util.tree_map(lambda x: x[parent], tree.data.embedding)
         
         # Split key for step function and evaluation
         step_key, eval_key, key = jax.random.split(key, 3)
@@ -317,23 +319,22 @@ class StochasticMCTS(AlphaZero(MCTS)):
         player_reward = metadata.rewards[metadata.cur_player_id] # we need to check this, is correct.
         
         value, policy = self.value_policy(new_embedding, params, eval_key, metadata, player_reward)
-        
+
         # add leaf node to tree
         node_exists = tree.is_edge(parent, action)
         node_idx = tree.edge_map[parent, action]
 
-        # todo: combine these three branches
-        node_data = jax.lax.cond(
-            node_exists,
-            lambda: self.visit_node(node=tree.data_at(node_idx), value=value, p=policy, terminated=metadata.terminated, embedding=new_embedding),
-            lambda: self.new_node(policy=policy, value=value, embedding=new_embedding, terminated=metadata.terminated)
-        )
+        # OPTIMIZATION: For existing nodes, only update n/q stats (not the full node with embedding)
+        # For new nodes, create the full node and add to tree
+        def update_existing_node():
+            # Only update n and q - embedding/policy/terminated are unchanged for revisits
+            return StochasticMCTS._update_node_stats(tree, node_idx, value)
 
-        tree = jax.lax.cond(
-            node_exists,
-            lambda: tree.update_node(index=node_idx, data = node_data),
-            lambda: tree.add_node(parent_index=parent, edge_index=action, data=node_data)
-        )
+        def add_new_node():
+            node_data = self.new_node(policy=policy, value=value, embedding=new_embedding, terminated=metadata.terminated)
+            return tree.add_node(parent_index=parent, edge_index=action, data=node_data)
+
+        tree = jax.lax.cond(node_exists, update_existing_node, add_new_node)
 
         # Get the correct node index after adding/updating
         # OPTIMIZATION: Use jnp.where instead of jax.lax.cond for simple scalar selection
