@@ -86,11 +86,23 @@ class TwoPlayerTester(BaseTester):
         results, frames, p_ids = jax.vmap(game_fn)(keys)
         frames = jax.tree.map(lambda x: x[0], frames)
         p_ids = p_ids[0]
-        
-        avg = results[:, 0].mean()
+
+        # results[:, 0] contains outcome for player 0 (our agent)
+        # Outcome is typically: 1 = win, 0 = draw, -1 = loss
+        player_outcomes = results[:, 0]
+        avg = player_outcomes.mean()
+
+        # Compute win/loss/draw breakdown
+        num_games = player_outcomes.shape[0]
+        wins = jnp.sum(player_outcomes > 0.5)  # > 0.5 to handle numerical precision
+        losses = jnp.sum(player_outcomes < -0.5)
+        draws = num_games - wins - losses
 
         metrics = {
-            f"{self.name}_avg_outcome": avg
+            f"{self.name}_avg_outcome": avg,
+            f"{self.name}_win_rate": wins / num_games,
+            f"{self.name}_loss_rate": losses / num_games,
+            f"{self.name}_draw_rate": draws / num_games,
         }
 
         best_params = jax.lax.cond(

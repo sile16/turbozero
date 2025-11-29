@@ -24,14 +24,14 @@ def entropy(probs: jnp.ndarray) -> jnp.ndarray:
     return -jnp.sum(safe_probs * jnp.log(safe_probs), axis=-1)
 
 
-def az_default_loss_fn(params: chex.ArrayTree, train_state: TrainState, experience: BaseExperience, 
+def az_default_loss_fn(params: chex.ArrayTree, train_state: TrainState, experience: BaseExperience,
                        l2_reg_lambda: float = 0.0001) -> Tuple[chex.Array, Tuple[chex.ArrayTree, optax.OptState]]:
     """ Implements the default AlphaZero loss function.
-    
+
     = Policy Loss + Value Loss + L2 Regularization
     Policy Loss: Cross-entropy loss between predicted policy and target policy
     Value Loss: L2 loss between predicted value and target value
-    
+
     Args:
     - `params`: the parameters of the neural network
     - `train_state`: flax TrainState (holds optimizer and other state)
@@ -53,7 +53,7 @@ def az_default_loss_fn(params: chex.ArrayTree, train_state: TrainState, experien
 
     # get predictions
     (pred_policy, pred_value), updates = train_state.apply_fn(
-        variables, 
+        variables,
         x=experience.observation_nn,
         train=True,
         mutable=mutables
@@ -85,10 +85,39 @@ def az_default_loss_fn(params: chex.ArrayTree, train_state: TrainState, experien
 
     # total loss
     loss = policy_loss + value_loss + l2_reg
+
+    # Compute predicted and target policy distributions for metrics
+    pred_policy_probs = jax.nn.softmax(pred_policy, axis=-1)
+
+    # Policy accuracy: top-1 match between predicted and target
+    pred_top1 = jnp.argmax(pred_policy_probs, axis=-1)
+    target_top1 = jnp.argmax(experience.policy_weights, axis=-1)
+    policy_accuracy = jnp.mean(pred_top1 == target_top1)
+
+    # Policy KL divergence: KL(target || predicted)
+    # Add small epsilon for numerical stability
+    eps = 1e-8
+    target_probs_safe = jnp.clip(experience.policy_weights, eps, 1.0)
+    pred_probs_safe = jnp.clip(pred_policy_probs, eps, 1.0)
+    # Only compute KL for valid actions (where target > 0)
+    kl_per_sample = jnp.sum(
+        jnp.where(experience.policy_weights > eps,
+                  experience.policy_weights * (jnp.log(target_probs_safe) - jnp.log(pred_probs_safe)),
+                  0.0),
+        axis=-1
+    )
+    policy_kl = jnp.mean(kl_per_sample)
+
+    # Value prediction error (absolute)
+    value_abs_error = jnp.mean(jnp.abs(pred_value.squeeze() - target_value))
+
     aux_metrics = {
         'policy_loss': policy_loss,
         'value_loss': value_loss,
         'l2_reg': l2_reg,
-        'policy_entropy': entropy(jax.nn.softmax(pred_policy, axis=-1)).mean()
+        'policy_entropy': entropy(pred_policy_probs).mean(),
+        'policy_accuracy': policy_accuracy,
+        'policy_kl': policy_kl,
+        'value_abs_error': value_abs_error,
     }
     return loss, (aux_metrics, updates)

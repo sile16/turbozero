@@ -108,8 +108,8 @@ class StochasticTrainer(Trainer):
             return state.buffer_state
 
         # Use jax.lax.cond to choose between handling deterministic or stochastic state
-        # Check if the state has _is_stochastic attribute, default to False if not present
-        is_stochastic = getattr(state.env_state, '_is_stochastic', getattr(state.env_state, 'is_stochastic', False))
+        # Check if the state has is_stochastic attribute, default to False if not present
+        is_stochastic = getattr(state.env_state, 'is_stochastic', False)
         
         
         buffer_state = jax.lax.cond(
@@ -277,7 +277,14 @@ class StochasticTrainer(Trainer):
             metrics["buffer/trainable_pct"] = 100.0 * trainable_samples / total_capacity
             metrics["buffer/games_completed"] = total_games_completed
             metrics["buffer/avg_game_length"] = avg_game_length
-            
+
+            # Add MCTS tree statistics (sample from first device, first batch element)
+            if hasattr(self.evaluator_train, 'get_tree_stats'):
+                # eval_state is sharded across devices, get first device's first element
+                eval_state_sample = jax.tree.map(lambda x: x[0, 0], collection_state.eval_state)
+                mcts_stats = self.evaluator_train.get_tree_stats(eval_state_sample)
+                metrics.update(mcts_stats)
+
             metrics["perf/epoch_time_sec"] = time.time() - epoch_start_time
             # Log metrics
             self.log_metrics(metrics, cur_epoch, step=collection_steps)

@@ -383,10 +383,10 @@ class Trainer:
     @partial(jax.pmap, axis_name='d', static_broadcasted_argnums=(0,))
     def one_train_step(self, ts: TrainState, batch: BaseExperience) -> Tuple[TrainState, dict]:
         """Make a single training step.
-        
+
         Args:
         - `ts`: TrainState
-        - `batch`: minibatch of experiences 
+        - `batch`: minibatch of experiences
 
         Returns:
         - (TrainState, dict): updated TrainState and metrics
@@ -394,16 +394,32 @@ class Trainer:
         # calculate loss, get gradients
         grad_fn = jax.value_and_grad(self.loss_fn, has_aux=True)
         (loss, (metrics, updates)), grads = grad_fn(ts.params, ts, batch)
+
+        # Compute gradient norm before averaging across devices
+        grad_norm = jnp.sqrt(jax.tree_util.tree_reduce(
+            lambda x, y: x + y,
+            jax.tree.map(lambda x: jnp.sum(x ** 2), grads)
+        ))
+
         # apply gradients
         grads = jax.lax.pmean(grads, axis_name='d')
         ts = ts.apply_gradients(grads=grads)
+
+        # Compute parameter norm
+        param_norm = jnp.sqrt(jax.tree_util.tree_reduce(
+            lambda x, y: x + y,
+            jax.tree.map(lambda x: jnp.sum(x ** 2), ts.params)
+        ))
+
         # update batchnorm stats
         if hasattr(ts, 'batch_stats'):
             ts = ts.replace(batch_stats=jax.lax.pmean(updates['batch_stats'], axis_name='d'))
         # return updated train state and metrics
         metrics = {
             **metrics,
-            'loss': loss
+            'loss': loss,
+            'grad_norm': grad_norm,
+            'param_norm': param_norm,
         }
         return ts, metrics
 
@@ -416,24 +432,24 @@ class Trainer:
     ) -> Tuple[CollectionState, TrainState, dict]:
         """Performs `num_steps` training steps.
         Each step consists of sampling a minibatch from the replay buffer and updating the parameters.
-        
+
         Args:
         - `key`: rng
         - `collection_state`: current collection state
         - `train_state`: current training state
         - `num_steps`: number of training steps to perform
-        
+
         Returns:
-        - (CollectionState, TrainState, dict): 
+        - (CollectionState, TrainState, dict):
             - updated collection state
             - updated training state
             - metrics
         """
-        # get replay memory buffer 
+        # get replay memory buffer
         buffer_state = collection_state.buffer_state
-        
+
         batch_metrics = []
-        
+
         for _ in range(num_steps):
             step_key, key = jax.random.split(key)
             # sample from replay memory
@@ -445,21 +461,28 @@ class Trainer:
             # append metrics from step
             if metrics:
                 batch_metrics.append(metrics)
-                
-        # take mean of metrics across all training steps
+
+        # Compute mean and std of metrics across all training steps
         if batch_metrics:
-            metrics = {k: jnp.stack([m[k] for m in batch_metrics]).mean() for k in batch_metrics[0].keys()}
+            aggregated_metrics = {}
+            for k in batch_metrics[0].keys():
+                stacked = jnp.stack([m[k] for m in batch_metrics])
+                aggregated_metrics[k] = stacked.mean()
+                # Add std for key metrics to detect training instability
+                if k in ['loss', 'policy_loss', 'value_loss', 'grad_norm']:
+                    aggregated_metrics[f'{k}_std'] = stacked.std()
+            metrics = aggregated_metrics
         else:
             metrics = {}
-        
-        
+
+
         # return updated collection state, train state, and metrics
         return collection_state, train_state, metrics
     
     
     def log_metrics(self, metrics: dict, epoch: int, step: Optional[int] = None):
         """Logs metrics to console and wandb.
-        
+
         Args:
         - `metrics`: dictionary of metrics
         - `epoch`: current epoch
@@ -473,61 +496,49 @@ class Trainer:
                     flat_metrics[f"{k}/{sub_k}"] = sub_v
             else:
                 flat_metrics[k] = v
-                
-        # Extract key metrics for console display
+
+        # Extract key metrics for console display (only show important ones)
+        console_keys = ['loss', 'policy_loss', 'value_loss', 'policy_accuracy', 'grad_norm']
         console_metrics = {}
         for k, v in flat_metrics.items():
-            # Only show scalar values in console output
+            # Only show important scalar values in console output
+            base_key = k.split('/')[-1] if '/' in k else k
+            if base_key not in console_keys and not k.endswith('_avg_outcome'):
+                continue
             if hasattr(v, 'item') and callable(getattr(v, 'item')):
                 console_metrics[k] = f"{v.item():.4f}"
             elif isinstance(v, (int, float)):
                 console_metrics[k] = f"{v:.4f}"
-        
+
         # log to console
         print(f"Epoch {epoch}: {console_metrics}")
-        
+
         # log to wandb
         if self.use_wandb:
-            # Add epoch as a metric
-            wandb_metrics = {k: v for k, v in flat_metrics.items()}
-            wandb_metrics['epoch'] = epoch
-            
-            # Add training metrics with better organization
-            if 'loss' in wandb_metrics:
-                wandb_metrics['training/loss'] = wandb_metrics.pop('loss')
-            if 'policy_loss' in wandb_metrics:
-                wandb_metrics['training/policy_loss'] = wandb_metrics.pop('policy_loss')
-            if 'value_loss' in wandb_metrics:
-                wandb_metrics['training/value_loss'] = wandb_metrics.pop('value_loss')
-            if 'l2_reg' in wandb_metrics:
-                wandb_metrics['training/l2_reg'] = wandb_metrics.pop('l2_reg')
-            if 'policy_entropy' in wandb_metrics:
-                wandb_metrics['training/policy_entropy'] = wandb_metrics.pop('policy_entropy')
-                
-            # Add evaluation metrics with better organization
-            if 'greedy_avg_outcome' in wandb_metrics:
-                wandb_metrics['evaluation/greedy_avg_outcome'] = wandb_metrics.pop('greedy_avg_outcome')
-                
-            # Organize performance metrics
-            perf_keys = [k for k in list(wandb_metrics.keys()) if k.startswith('perf/')]
-            for k in perf_keys:
-                wandb_metrics[k] = wandb_metrics[k]  # Keep the same but organized in wandb
-                
-            # Organize buffer metrics
-            buffer_keys = [k for k in list(wandb_metrics.keys()) if k.startswith('buffer/')]
-            for k in buffer_keys:
-                wandb_metrics[k] = wandb_metrics[k]  # Keep the same but organized in wandb
-                
-            # Organize MCTS metrics
-            mcts_keys = [k for k in list(wandb_metrics.keys()) if k.startswith('mcts/')]
-            for k in mcts_keys:
-                wandb_metrics[k] = wandb_metrics[k]  # Keep the same but organized in wandb
-                
-            # Organize game metrics
-            game_keys = [k for k in list(wandb_metrics.keys()) if k.startswith('game/')]
-            for k in game_keys:
-                wandb_metrics[k] = wandb_metrics[k]  # Keep the same but organized in wandb
-                
+            wandb_metrics = {}
+
+            # Training metrics (loss, policy, value, etc.)
+            training_keys = ['loss', 'policy_loss', 'value_loss', 'l2_reg', 'policy_entropy',
+                           'policy_accuracy', 'policy_kl', 'value_abs_error',
+                           'loss_std', 'policy_loss_std', 'value_loss_std',
+                           'grad_norm', 'grad_norm_std', 'param_norm']
+            for k in training_keys:
+                if k in flat_metrics:
+                    wandb_metrics[f'training/{k}'] = flat_metrics[k]
+
+            # Copy metrics that already have proper namespacing
+            for k, v in flat_metrics.items():
+                if k.startswith(('buffer/', 'mcts/', 'game/', 'collect/', 'train/', 'eval/')):
+                    wandb_metrics[k] = v
+                # Handle tester metrics (e.g., pretrained_avg_outcome -> eval/pretrained_avg_outcome)
+                elif k.endswith('_avg_outcome'):
+                    wandb_metrics[f'eval/{k}'] = v
+                elif k.endswith('_win_rate') or k.endswith('_loss_rate') or k.endswith('_draw_rate'):
+                    wandb_metrics[f'eval/{k}'] = v
+                # Handle perf/ namespace (legacy, keep for compatibility)
+                elif k.startswith('perf/'):
+                    wandb_metrics[k] = v
+
             wandb.log(wandb_metrics, step)
 
 
@@ -709,13 +720,13 @@ class Trainer:
             collection_state, train_state, metrics = self.train_steps(train_key, collection_state, train_state, self.train_steps_per_epoch)
             print("Training Done")
             train_duration = time.time() - train_start_time
-            metrics["perf/train_time_sec"] = train_duration
-            metrics["perf/train_steps_per_sec"] = self.train_steps_per_epoch * self.train_batch_size / jnp.maximum(train_duration, 1e-6)
-            
+            metrics["train/train_time_sec"] = train_duration
+            metrics["train/train_steps_per_sec"] = self.train_steps_per_epoch * self.train_batch_size / jnp.maximum(train_duration, 1e-6)
+
            # Add performance metrics
             collection_steps = self.batch_size * (cur_epoch+1) * self.collection_steps_per_epoch
-            metrics["perf/collect_time_sec"] = collect_duration
-            metrics["perf/collect_steps_per_sec"] = self.collection_steps_per_epoch / max(collect_duration, 1e-6)
+            metrics["collect/collect_time_sec"] = collect_duration
+            metrics["collect/collect_steps_per_sec"] = self.batch_size * self.collection_steps_per_epoch / max(collect_duration, 1e-6)
             # we don't know how many games, 
             #metrics["perf/collect_game_steps_per_sec"] = (self.collection_steps_per_epoch * self.batch_size) / max(collect_duration, 1e-6)
 
@@ -723,10 +734,20 @@ class Trainer:
            # Add replay buffer statistics
             buffer_state = collection_state.buffer_state
             populated = jnp.sum(buffer_state.populated)
+            trainable_samples = jnp.sum(jnp.logical_and(buffer_state.populated, buffer_state.has_reward))
+            total_capacity = buffer_state.populated.size
             metrics["buffer/populated"] = populated
-            metrics["buffer/has_reward"] = jnp.sum(buffer_state.has_reward)
-            metrics["buffer/fullness_pct"] = 100.0 * populated / buffer_state.populated.size
-            
+            metrics["buffer/trainable_samples"] = trainable_samples
+            metrics["buffer/fullness_pct"] = 100.0 * populated / total_capacity
+            metrics["buffer/trainable_pct"] = 100.0 * trainable_samples / total_capacity
+
+            # Add MCTS tree statistics (sample from first device, first batch element)
+            if hasattr(self.evaluator_train, 'get_tree_stats'):
+                # eval_state is sharded across devices, get first device's first element
+                eval_state_sample = jax.tree.map(lambda x: x[0, 0], collection_state.eval_state)
+                mcts_stats = self.evaluator_train.get_tree_stats(eval_state_sample)
+                metrics.update(mcts_stats)
+
             metrics["perf/epoch_time_sec"] = time.time() - epoch_start_time
             # Log metrics
             self.log_metrics(metrics, cur_epoch, step=collection_steps)

@@ -135,6 +135,24 @@ The codebase supports stochastic games (like backgammon) via `StochasticMCTS`:
 - Stochastic node values are computed as weighted sums of leaf values
 - The `step` function handles both player actions and stochastic actions
 
+### Known Limitation: Global Discount in deterministic_action_selector
+
+**Location**: `stochastic_mcts.py:160-191`
+
+The `deterministic_action_selector` applies a single discount factor to ALL children based on whether ANY child has a different player:
+
+```python
+has_diff_player = jnp.any(jnp.abs(child_players - current_player))
+discount = jnp.where(has_diff_player, -1.0, 1.0)
+```
+
+**Why this is acceptable for backgammon**: In backgammon, within a single turn, all moves at the same tree depth will have the same player transition behavior. Either all children keep the turn (same player) or all children pass the turn (different player). There's no scenario where Action A keeps the turn while Action B passes it at the same decision point.
+
+**For other games**: If adapting this code for games where different actions at the same node could result in different player transitions, the action selector interface would need to be extended to accept per-child discount arrays instead of a scalar. This would require:
+1. Modifying `MCTSActionSelector.__call__` to accept `discount: Union[float, chex.Array]`
+2. Updating `deterministic_action_selector` to compute per-child discounts
+3. Ensuring the PUCT calculation handles array discounts correctly
+
 ## Code Style
 
 - Make minimal, targeted edits - avoid unnecessary diffs
