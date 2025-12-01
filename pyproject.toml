@@ -13,22 +13,17 @@ packages = [
 name = "PyPI"
 priority = "primary"
 
-
-[[tool.poetry.source]]
-name = "jax"
-url = "https://storage.googleapis.com/jax-releases/jax_cuda_releases.html"
-priority = "primary"
-
 [tool.poetry.dependencies]
 python = ">=3.10,<4.0"  # support 3.10, 3.11, 3.12 but not 4.0
 graphviz = ">=0.20.1"
 wandb = ">=0.18.6"
-jax = {extras = ["cuda12"], version = "^0.6.1"}
-jaxlib = ">=0.5.0"
-flax = ">=0.10.5"
-optax = ">=0.1.8"
-orbax-checkpoint = ">=0.10.1"
-chex = ">=0.1.85"
+jax = ">=0.4.34"
+jaxlib = ">=0.4.34"
+jax-metal = ">=0.1.0"
+flax = ">=0.8.5,<0.10.0"
+optax = ">=0.1.8,<0.3.0"
+orbax-checkpoint = ">=0.5.0,<0.10.0"
+chex = ">=0.1.85,<0.2.0"
 pytest = "^8.3.5"
 cairosvg = "^2.8.2"
 svgwrite = "^1.4.3"
