@@ -135,23 +135,21 @@ The codebase supports stochastic games (like backgammon) via `StochasticMCTS`:
 - Stochastic node values are computed as weighted sums of leaf values
 - The `step` function handles both player actions and stochastic actions
 
-### Known Limitation: Global Discount in deterministic_action_selector
+### Per-Child Discount in deterministic_action_selector
 
-**Location**: `stochastic_mcts.py:160-191`
+**Location**: `stochastic_mcts.py:161-188`
 
-The `deterministic_action_selector` applies a single discount factor to ALL children based on whether ANY child has a different player:
+The `deterministic_action_selector` computes per-child discount factors based on player transitions:
 
 ```python
-has_diff_player = jnp.any(jnp.abs(child_players - current_player))
-discount = jnp.where(has_diff_player, -1.0, 1.0)
+discounts = 1.0 - 2.0 * jnp.abs(current_player - child_players)
 ```
 
-**Why this is acceptable for backgammon**: In backgammon, within a single turn, all moves at the same tree depth will have the same player transition behavior. Either all children keep the turn (same player) or all children pass the turn (different player). There's no scenario where Action A keeps the turn while Action B passes it at the same decision point.
+This formula produces:
+- `1.0` when players are the same (0 vs 0 or 1 vs 1) - keep value
+- `-1.0` when players differ (0 vs 1 or 1 vs 0) - invert value
 
-**For other games**: If adapting this code for games where different actions at the same node could result in different player transitions, the action selector interface would need to be extended to accept per-child discount arrays instead of a scalar. This would require:
-1. Modifying `MCTSActionSelector.__call__` to accept `discount: Union[float, chex.Array]`
-2. Updating `deterministic_action_selector` to compute per-child discounts
-3. Ensuring the PUCT calculation handles array discounts correctly
+JAX broadcasting handles the vector of discounts correctly when multiplied with Q-values in the PUCT selector. This correctly handles games where different actions at the same node can result in different player transitions.
 
 ## Code Style
 

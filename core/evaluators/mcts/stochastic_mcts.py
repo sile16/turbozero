@@ -173,23 +173,19 @@ class StochasticMCTS(AlphaZero(MCTS)):
         # Get child players - direct array slice
         child_indices = tree.edge_map[node_idx]
 
-        # Safe access to child players
+        # Safe access to child players (handling NULL_INDEX)
         safe_indices = jnp.maximum(child_indices, 0)
         child_players = tree.data.embedding.current_player[safe_indices]
 
-        # Create a discount mask for each child based on player difference
-        # We want discount = -1.0 when players differ, 1.0 when same
-        # The PUCT selector will use this to adjust Q-values
+        # Calculate per-child discount based on player transitions
+        # Formula: 1.0 - 2.0 * |current_player - child_player|
+        # - Same player (0 vs 0 or 1 vs 1): 1.0 - 2.0 * 0 = 1.0 (keep value)
+        # - Different player (0 vs 1 or 1 vs 0): 1.0 - 2.0 * 1 = -1.0 (invert value)
+        # This produces a vector of discounts (one per child), which JAX broadcasting
+        # handles correctly when multiplied with Q-values in the action selector.
+        discounts = 1.0 - 2.0 * jnp.abs(current_player - child_players)
 
-        # LIMITATION: This applies the same discount to ALL children if ANY child has a different player.
-        # This is incorrect - discount should be applied per-child, not globally.
-        # However, current action selector interface expects a single discount value.
-        # For now, this works for backgammon where all children at same level have same player transitions.
-
-        has_diff_player = jnp.any(jnp.abs(child_players - current_player))
-        discount = jnp.where(has_diff_player, -1.0, 1.0)
-
-        return self.action_selector(tree, node_idx, discount)
+        return self.action_selector(tree, node_idx, discounts)
     
     def stochastic_action_selector(self, key: chex.PRNGKey, tree, node_idx) -> int:
         """Called when traversing the tree and exploring possibilities.
