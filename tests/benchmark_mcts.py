@@ -18,6 +18,7 @@ from core.types import StepMetadata
 from core.evaluators.evaluation_fns import make_nn_eval_fn
 from core.evaluators.mcts.action_selection import PUCTSelector
 from core.evaluators.mcts.stochastic_mcts import StochasticMCTS
+from core.bgcommon import scalar_value_to_probs
 import flax.linen as nn
 
 # Print JAX device info
@@ -44,10 +45,9 @@ class SimpleMLP(nn.Module):
         policy_logits = nn.Dense(features=self.num_actions)(x)
         
         # Value head 
-        value = nn.Dense(features=1)(x)
-        value = jnp.tanh(value)
+        value = nn.Dense(features=6)(x)
         
-        return policy_logits, jnp.squeeze(value, axis=-1)
+        return policy_logits, value
 
 
 # --- Environment Interface Functions ---
@@ -102,7 +102,7 @@ def backgammon_pip_count_eval(state: chex.ArrayTree, params: chex.ArrayTree, key
     value = jnp.where(state.current_player == 0, value_p0_perspective, -value_p0_perspective)
     # Uniform policy over legal actions for greedy baseline
     policy_logits = jnp.where(state.legal_action_mask, 0.0, -jnp.inf)
-    return policy_logits, jnp.array(value)
+    return policy_logits, scalar_value_to_probs(value)
 
 
 def run_stochastic_mcts_benchmark(evaluator, env_state, num_runs=5, iterations_per_run=100, params=None):

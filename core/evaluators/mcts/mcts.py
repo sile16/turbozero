@@ -1,11 +1,12 @@
 from functools import partial
-from typing import Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 import jax
 import chex
 import jax.numpy as jnp
 from core.evaluators.evaluator import Evaluator
 from core.evaluators.mcts.action_selection import MCTSActionSelector
 from core.evaluators.mcts.state import BackpropState, MCTSNode, MCTSTree, TraversalState, MCTSOutput
+from core.evaluators.mcts.equity import normalize_value_probs, probs_to_equity, terminal_value_probs_from_reward
 from core.trees.tree import init_tree
 from core.types import EnvStepFn, EvalFn, StepMetadata
 
@@ -24,11 +25,12 @@ class MCTS(Evaluator):
         discount: float = -1.0,
         temperature: float = 1.0,
         tiebreak_noise: float = 1e-8,
-        persist_tree: bool = True
+        persist_tree: bool = True,
+        value_equity_fn: Optional[Callable[[chex.Array, StepMetadata], chex.Array]] = None
     ):
         """
         Args:
-        - `eval_fn`: leaf node evaluation function (env_state -> (policy_logits, value))
+        - `eval_fn`: leaf node evaluation function (env_state -> (policy_logits, value_probs[6]))
         - `action_selector`: action selection function (eval_state -> action)
         - `branching_factor`: max number of actions (== children per node)
         - `max_nodes`: allocated size of MCTS tree, any additional nodes will not be created, 
@@ -40,6 +42,7 @@ class MCTS(Evaluator):
         - `temperature`: temperature for root action selection (default: 1.0)
         - `tiebreak_noise`: magnitude of noise to add to policy weights for breaking ties (default: 1e-8)
         - `persist_tree`: whether to persist search tree state between calls to `evaluate` (default: True)
+        - `value_equity_fn`: function mapping a 6-way outcome distribution + metadata to a scalar equity in [0, 1]
         """
         super().__init__(discount=discount)
         self.eval_fn = eval_fn
@@ -50,6 +53,13 @@ class MCTS(Evaluator):
         self.temperature = temperature
         self.tiebreak_noise = tiebreak_noise
         self.persist_tree = persist_tree
+        self.value_equity_fn = value_equity_fn or (
+            lambda value_probs, metadata: probs_to_equity(
+                value_probs,
+                getattr(metadata, "match_score", None),
+                getattr(metadata, "cube_value", 1.0),
+            )
+        )
 
 
     def get_config(self) -> Dict:
@@ -63,7 +73,8 @@ class MCTS(Evaluator):
             "discount": self.discount,
             "temperature": self.temperature,
             "tiebreak_noise": self.tiebreak_noise,
-            "persist_tree": self.persist_tree
+            "persist_tree": self.persist_tree,
+            "value_equity_fn": getattr(self.value_equity_fn, "__name__", "custom")
         }
 
 
@@ -99,7 +110,7 @@ class MCTS(Evaluator):
         )
         eval_state = jax.lax.cond(
             should_update_root,
-            lambda: self.update_root(root_key, eval_state, env_state, params, root_metadata=root_metadata),
+            lambda: self.update_root(root_key, eval_state, env_state, params, root_metadata),
             lambda: eval_state
         )
 
@@ -140,7 +151,7 @@ class MCTS(Evaluator):
     
 
     def update_root(self, key: chex.PRNGKey, tree: MCTSTree, root_embedding: chex.ArrayTree, 
-                    params: chex.ArrayTree, **kwargs) -> MCTSTree: #pylint: disable=unused-argument
+                    params: chex.ArrayTree, root_metadata: StepMetadata) -> MCTSTree: #pylint: disable=unused-argument
         """Populates the root node of an MCTSTree.
         
         Args:
@@ -153,11 +164,19 @@ class MCTS(Evaluator):
         - (MCTSTree): updated MCTSTree
         """
         # evaluate root state
-        root_policy_logits, root_value = self.eval_fn(root_embedding, params, key)
-        root_policy = jax.nn.softmax(root_policy_logits)
+        root_policy_logits, root_value_probs = self.eval_fn(root_embedding, params, key)
+        masked_logits = jnp.where(root_metadata.action_mask, root_policy_logits, jnp.finfo(root_policy_logits).min)
+        root_policy = jax.nn.softmax(masked_logits)
+        normalized_value_probs = normalize_value_probs(root_value_probs)
+        normalized_value_probs = jax.lax.cond(
+            root_metadata.terminated,
+            lambda: terminal_value_probs_from_reward(root_metadata.rewards[root_metadata.cur_player_id]),
+            lambda: normalized_value_probs
+        )
+        root_value = self.value_equity_fn(normalized_value_probs, root_metadata)
         # update root node
         root_node = tree.data_at(tree.ROOT_INDEX)
-        root_node = self.update_root_node(root_node, root_policy, root_value, root_embedding)
+        root_node = self.update_root_node(root_node, root_policy, root_value, normalized_value_probs, root_embedding)
         return tree.set_root(root_node)
     
     
@@ -189,10 +208,16 @@ class MCTS(Evaluator):
         player_reward = metadata.rewards[metadata.cur_player_id]
         # evaluate leaf node
 
-        policy_logits, value = self.eval_fn(new_embedding, params, eval_key)
+        policy_logits, value_probs = self.eval_fn(new_embedding, params, eval_key)
         policy_logits = jnp.where(metadata.action_mask, policy_logits, jnp.finfo(policy_logits).min)
         policy = jax.nn.softmax(policy_logits)
-        value = jnp.where(metadata.terminated, player_reward, value)
+        normalized_value_probs = normalize_value_probs(value_probs)
+        normalized_value_probs = jax.lax.cond(
+            metadata.terminated,
+            lambda: terminal_value_probs_from_reward(player_reward),
+            lambda: normalized_value_probs
+        )
+        value = self.value_equity_fn(normalized_value_probs, metadata)
         # add leaf node to tree
         node_exists = tree.is_edge(parent, action)
         node_idx = tree.edge_map[parent, action]
@@ -200,10 +225,16 @@ class MCTS(Evaluator):
         # OPTIMIZATION: For existing nodes, only update n/q stats (not the full node with embedding)
         # For new nodes, create the full node and add to tree
         def update_existing_node():
-            return MCTS._update_node_stats(tree, node_idx, value)
+            return MCTS._update_node_stats(tree, node_idx, value, normalized_value_probs)
 
         def add_new_node():
-            node_data = self.new_node(policy=policy, value=value, embedding=new_embedding, terminated=metadata.terminated)
+            node_data = self.new_node(
+                policy=policy,
+                value=value,
+                value_probs=normalized_value_probs,
+                embedding=new_embedding,
+                terminated=metadata.terminated
+            )
             return tree.add_node(parent_index=parent, edge_index=action, data=node_data)
 
         tree = jax.lax.cond(node_exists, update_existing_node, add_new_node)
@@ -328,7 +359,8 @@ class MCTS(Evaluator):
         value: float,
         p: Optional[chex.Array] = None,
         terminated: Optional[bool] = None,
-        embedding: Optional[chex.ArrayTree] = None
+        embedding: Optional[chex.ArrayTree] = None,
+        value_probs: Optional[chex.Array] = None
     ) -> MCTSNode:
         """ Update the visit counts and value estimate of a node.
 
@@ -353,17 +385,20 @@ class MCTS(Evaluator):
             terminated = node.terminated
         if embedding is None:
             embedding = node.embedding
+        if value_probs is None:
+            value_probs = node.value_probs
         return node.replace(
             n=node.n + 1, # increment visit count
             q=q_value,
             p=p,
+            value_probs=value_probs,
             terminated=terminated,
             embedding=embedding
         )
 
     @staticmethod
-    def _update_node_stats(tree: MCTSTree, node_idx: int, value: float) -> MCTSTree:
-        """Update only n and q for a node (optimized partial update).
+    def _update_node_stats(tree: MCTSTree, node_idx: int, value: float, value_probs: chex.Array | None = None) -> MCTSTree:
+        """Update only n/q (and optionally value_probs) for a node (optimized partial update).
 
         OPTIMIZATION: Instead of reconstructing the entire node with data_at() and
         updating all fields including the heavy embedding, we directly update only
@@ -386,20 +421,26 @@ class MCTS(Evaluator):
         new_q = (old_q * old_n + value) / new_n
 
         # Update only n and q arrays (not the entire node)
+        updated_value_probs = tree.data.value_probs
+        if value_probs is not None:
+            updated_value_probs = updated_value_probs.at[node_idx].set(value_probs)
+
         new_data = tree.data.replace(
             n=tree.data.n.at[node_idx].set(new_n),
-            q=tree.data.q.at[node_idx].set(new_q)
+            q=tree.data.q.at[node_idx].set(new_q),
+            value_probs=updated_value_probs
         )
 
         return tree.replace(data=new_data)
 
     @staticmethod
-    def new_node(policy: chex.Array, value: float, embedding: chex.ArrayTree, terminated: bool) -> MCTSNode:
+    def new_node(policy: chex.Array, value: float, value_probs: chex.Array, embedding: chex.ArrayTree, terminated: bool) -> MCTSNode:
         """Create a new MCTSNode.
         
         Args:
         - `policy`: policy weights
         - `value`: value estimate
+        - `value_probs`: value head probabilities (6-way outcome distribution)
         - `embedding`: environment state embedding
             - 'embedding' because in some MCTS use-cases, e.g. MuZero, we store an embedding of the state 
                rather than the state itself. In AlphaZero, this is just the entire environment state.
@@ -411,6 +452,7 @@ class MCTS(Evaluator):
         return MCTSNode(
             n=jnp.array(1, dtype=jnp.int32), # init visit count to 1
             p=policy,
+            value_probs=value_probs,
             q=jnp.array(value, dtype=jnp.float32),
             terminated=jnp.array(terminated, dtype=jnp.bool_),
             embedding=embedding
@@ -418,13 +460,14 @@ class MCTS(Evaluator):
     
 
     @staticmethod
-    def update_root_node(root_node: MCTSNode, root_policy: chex.Array, root_value: float, root_embedding: chex.ArrayTree) -> MCTSNode:
+    def update_root_node(root_node: MCTSNode, root_policy: chex.Array, root_value: float, root_value_probs: chex.Array, root_embedding: chex.ArrayTree) -> MCTSNode:
         """Update the root node of the search tree.
         
         Args:
         - `root_node`: node to update
         - `root_policy`: policy weights
         - `root_value`: value estimate
+        - `root_value_probs`: value head probabilities
         - `root_embedding`: environment state embedding
         
         Returns:
@@ -434,6 +477,11 @@ class MCTS(Evaluator):
         # For arrays (policy, value, visit count), use jnp.where
         new_policy = jnp.where(visited, root_node.p, root_policy)
         new_value = jnp.where(visited, root_node.q, root_value)
+        new_value_probs = jnp.where(
+            visited,
+            root_node.value_probs,
+            root_value_probs
+        )
         new_visits = jnp.where(visited, root_node.n, 1)
         
         # For the embedding, use jax.lax.cond to handle the state object
@@ -447,6 +495,7 @@ class MCTS(Evaluator):
         return root_node.replace(
             p=new_policy,
             q=new_value,
+            value_probs=new_value_probs,
             n=new_visits,
             embedding=new_embedding
         )
@@ -527,6 +576,7 @@ class MCTS(Evaluator):
         return init_tree(self.max_nodes, self.branching_factor, self.new_node(
             policy=jnp.zeros((self.branching_factor,)),
             value=0.0,
+            value_probs=jnp.zeros((6,)),
             embedding=template_embedding,
             terminated=False
         ))

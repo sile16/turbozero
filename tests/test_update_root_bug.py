@@ -256,10 +256,12 @@ def test_update_root_node_preserves_visited_node(backgammon_env, key):
 
     # Create a "visited" root node (n > 0)
     old_policy = jax.nn.softmax(jnp.ones(branching_factor))  # Uniform
+    old_value_probs = jnp.ones(6, dtype=jnp.float32) / 6.0
     visited_root = MCTSNode(
         n=jnp.array(5, dtype=jnp.int32),  # Already visited!
         p=old_policy,
         q=jnp.array(0.5, dtype=jnp.float32),
+        value_probs=old_value_probs,
         terminated=jnp.array(False, dtype=jnp.bool_),
         embedding=initial_state
     )
@@ -267,10 +269,11 @@ def test_update_root_node_preserves_visited_node(backgammon_env, key):
     # Create new policy/value that we want to update to
     new_policy = jax.nn.softmax(jnp.arange(branching_factor, dtype=jnp.float32))  # Non-uniform
     new_value = 0.9
+    new_value_probs = jnp.array([0.7, 0.15, 0.05, 0.05, 0.03, 0.02], dtype=jnp.float32)
     new_embedding = initial_state  # Same for simplicity
 
     # Call update_root_node
-    updated_root = MCTS.update_root_node(visited_root, new_policy, new_value, new_embedding)
+    updated_root = MCTS.update_root_node(visited_root, new_policy, new_value, new_value_probs, new_embedding)
 
     # The issue: when n > 0 (visited), update_root_node preserves the OLD values
     # This is by design for persist_tree=True, but breaks persist_tree=False semantics

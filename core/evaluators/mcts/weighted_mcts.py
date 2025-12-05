@@ -41,7 +41,7 @@ class WeightedMCTS(MCTS):
 
 
     @staticmethod
-    def new_node(policy: chex.Array, value: float, embedding: chex.ArrayTree, terminated: bool) -> WeightedMCTSNode:
+    def new_node(policy: chex.Array, value: float, value_probs: chex.Array, embedding: chex.ArrayTree, terminated: bool) -> WeightedMCTSNode:
         """Create a new WeightedMCTSNode.
         
         Args:
@@ -58,13 +58,14 @@ class WeightedMCTS(MCTS):
             p=policy,
             q=jnp.array(value, dtype=jnp.float32),
             r=jnp.array(value, dtype=jnp.float32),
+            value_probs=value_probs,
             terminated=jnp.array(terminated, dtype=jnp.bool_),
             embedding=embedding
         )
 
 
     @staticmethod
-    def update_root_node(root_node: MCTSNode, root_policy: chex.Array, root_value: float, root_embedding: chex.ArrayTree) -> WeightedMCTSNode:
+    def update_root_node(root_node: MCTSNode, root_policy: chex.Array, root_value: float, root_value_probs: chex.Array, root_embedding: chex.ArrayTree) -> WeightedMCTSNode:
         """ Updates the root node
         - if the tree is empty, create a new node
         - otherwise, update the existing root node
@@ -73,6 +74,7 @@ class WeightedMCTS(MCTS):
         - `root_node`: root node
         - `root_policy`: root policy
         - `root_value`: root value
+        - `root_value_probs`: root value distribution
         - `root_embedding`: root environment state
         
         Returns:
@@ -82,6 +84,7 @@ class WeightedMCTS(MCTS):
             p=root_policy,
             q=jnp.where(visited, root_node.q, root_value),
             r=jnp.where(visited, root_node.r, root_value),
+            value_probs=jnp.where(visited, root_node.value_probs, root_value_probs),
             n=jnp.where(visited, root_node.n, 1),
             embedding=root_embedding
         )

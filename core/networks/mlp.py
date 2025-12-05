@@ -8,7 +8,7 @@ class MLPConfig:
     """Configuration for the MLP network."""
     hidden_dims: Sequence[int]
     policy_head_out_size: int
-    value_head_out_size: int = 1 # Typically 1 for scalar value
+    value_head_out_size: int = 6 # 6-way outcome head by default
 
 class MLP(nn.Module):
     """Simple Multi-Layer Perceptron for policy-value tasks."""
@@ -23,7 +23,7 @@ class MLP(nn.Module):
             train: Boolean indicating if the model is in training mode (unused here, but kept for interface compatibility).
 
         Returns:
-            Tuple containing (policy_logits, value).
+            Tuple containing (policy_logits, value head output).
         """
         # Ensure input is flattened and has a batch dimension
         if x.ndim == 1:
@@ -43,6 +43,6 @@ class MLP(nn.Module):
         value = nn.Dense(features=self.config.value_head_out_size, name='value_head')(x)
         # Squeeze the value output if it's size 1
         if self.config.value_head_out_size == 1:
-             value = jnp.squeeze(value, axis=-1)
+            value = jnp.squeeze(value, axis=-1)
 
         return policy_logits, value 

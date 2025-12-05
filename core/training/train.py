@@ -519,7 +519,7 @@ class Trainer:
 
             # Training metrics (loss, policy, value, etc.)
             training_keys = ['loss', 'policy_loss', 'value_loss', 'l2_reg', 'policy_entropy',
-                           'policy_accuracy', 'policy_kl', 'value_abs_error',
+                           'policy_accuracy', 'policy_kl', 'value_accuracy', 'value_entropy',
                            'loss_std', 'policy_loss_std', 'value_loss_std',
                            'grad_norm', 'grad_norm_std', 'param_norm']
             for k in training_keys:

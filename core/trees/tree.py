@@ -5,6 +5,16 @@ from chex import dataclass
 import jax
 import jax.numpy as jnp
 
+# Compatibility shim for JAX 0.8+ where jax.util was removed but chex still references it.
+if not hasattr(jax, "util"):  # pragma: no cover - defensive
+    import types
+    def _unzip2(seq):
+        if not seq:
+            return (), ()
+        first, second = zip(*seq)
+        return first, second
+    jax.util = types.SimpleNamespace(unzip2=_unzip2)
+
 NodeType = TypeVar('NodeType')
 
 @dataclass(frozen=True)

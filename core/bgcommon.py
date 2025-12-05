@@ -16,6 +16,12 @@ from core.types import EnvStepFn
 from pgx._src.types import Array
 import flax.linen as nn
 
+def scalar_value_to_probs(value: chex.Array) -> chex.Array:
+    """Project a scalar value in [-1, 1] to a 6-way outcome distribution."""
+    win_prob = jnp.clip(0.5 + 0.5 * value, 0.0, 1.0)
+    loss_prob = 1.0 - win_prob
+    return jnp.array([win_prob, 0.0, 0.0, loss_prob, 0.0, 0.0], dtype=jnp.float32)
+
 def bg_simple_step_fn(env: Env, state, action, key=None):
     """Simple step function for testing does not know about stochastic nodes."""
     # MCTS step_fn expects a key parameter, use it if provided, otherwise use fixed key
@@ -108,12 +114,13 @@ def bg_pip_count_eval(state: chex.ArrayTree, params: chex.ArrayTree, key: chex.P
     # Positive value means current player is ahead
     value = (current_pips + current_born_off + current_bar - opponent_pips - opponent_born_off - opponent_bar) / 200
     value = jnp.clip(value, -1.0, 1.0) # Clip to [-1, 1]
+    value_probs = scalar_value_to_probs(value)
     #jax.debug.print(f"[DEBUG-BG_PIP_COUNT_EVAL] Value: {value}")
     
     # Uniform policy over legal actions for greedy baseline
     policy_logits = jnp.where(state.legal_action_mask, 0.0, -jnp.inf)
     
-    return policy_logits, jnp.array(value)
+    return policy_logits, value_probs
 
 
 # --- Random Evaluator ---
@@ -218,9 +225,9 @@ def bg_hit2_eval(state: bg.State, params: chex.ArrayTree, key: chex.PRNGKey) -> 
     # cannot be a hit (hit_score=0.0) and will be selected if legal_action_mask allows it.
     # If no moves are legal at all, all logits will be -inf, which is also correct.
 
-    _, value = bg_pip_count_eval(state, params, key)
+    _, value_probs = bg_pip_count_eval(state, params, key)
 
-    return policy_logits, value
+    return policy_logits, value_probs
 
 
 # Pre‑activation ResNet‑V2 block

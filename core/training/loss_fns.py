@@ -8,6 +8,7 @@ import optax
 from flax.training.train_state import TrainState
 
 from core.memory.replay_memory import BaseExperience
+from core.evaluators.mcts.equity import terminal_value_probs_from_reward
 
 
 def entropy(probs: jnp.ndarray) -> jnp.ndarray:
@@ -52,7 +53,7 @@ def az_default_loss_fn(params: chex.ArrayTree, train_state: TrainState, experien
     mutables = ['batch_stats'] if hasattr(train_state, 'batch_stats') else []
 
     # get predictions
-    (pred_policy, pred_value), updates = train_state.apply_fn(
+    (pred_policy_logits, pred_value_logits), updates = train_state.apply_fn(
         variables,
         x=experience.observation_nn,
         train=True,
@@ -60,19 +61,21 @@ def az_default_loss_fn(params: chex.ArrayTree, train_state: TrainState, experien
     )
 
     # set invalid actions in policy to -inf
-    pred_policy = jnp.where(
+    pred_policy_logits = jnp.where(
         experience.policy_mask,
-        pred_policy,
+        pred_policy_logits,
         jnp.finfo(jnp.float32).min
     )
 
     # compute policy loss
-    policy_loss = optax.softmax_cross_entropy(pred_policy, experience.policy_weights).mean()
+    policy_loss = optax.softmax_cross_entropy(pred_policy_logits, experience.policy_weights).mean()
     # select appropriate value from experience.reward
     current_player = experience.cur_player_id
-    target_value = experience.reward[jnp.arange(experience.reward.shape[0]), current_player]
-    # compute MSE value loss
-    value_loss = optax.l2_loss(pred_value.squeeze(), target_value).mean()
+    batch_indices = jnp.arange(experience.reward.shape[0])
+    target_reward = experience.reward[batch_indices, current_player]
+    target_value_probs = terminal_value_probs_from_reward(target_reward)
+    pred_value_log_probs = jax.nn.log_softmax(pred_value_logits, axis=-1)
+    value_loss = -(target_value_probs * pred_value_log_probs).sum(axis=-1).mean()
 
     # compute L2 regularization
     l2_reg = l2_reg_lambda * jax.tree_util.tree_reduce(
@@ -87,7 +90,7 @@ def az_default_loss_fn(params: chex.ArrayTree, train_state: TrainState, experien
     loss = policy_loss + value_loss + l2_reg
 
     # Compute predicted and target policy distributions for metrics
-    pred_policy_probs = jax.nn.softmax(pred_policy, axis=-1)
+    pred_policy_probs = jax.nn.softmax(pred_policy_logits, axis=-1)
 
     # Policy accuracy: top-1 match between predicted and target
     pred_top1 = jnp.argmax(pred_policy_probs, axis=-1)
@@ -108,8 +111,12 @@ def az_default_loss_fn(params: chex.ArrayTree, train_state: TrainState, experien
     )
     policy_kl = jnp.mean(kl_per_sample)
 
-    # Value prediction error (absolute)
-    value_abs_error = jnp.mean(jnp.abs(pred_value.squeeze() - target_value))
+    # Value calibration metrics
+    pred_value_probs = jax.nn.softmax(pred_value_logits, axis=-1)
+    value_top1 = jnp.argmax(pred_value_probs, axis=-1)
+    target_top1 = jnp.argmax(target_value_probs, axis=-1)
+    value_accuracy = jnp.mean(value_top1 == target_top1)
+    value_entropy = entropy(pred_value_probs).mean()
 
     aux_metrics = {
         'policy_loss': policy_loss,
@@ -118,6 +125,7 @@ def az_default_loss_fn(params: chex.ArrayTree, train_state: TrainState, experien
         'policy_entropy': entropy(pred_policy_probs).mean(),
         'policy_accuracy': policy_accuracy,
         'policy_kl': policy_kl,
-        'value_abs_error': value_abs_error,
+        'value_accuracy': value_accuracy,
+        'value_entropy': value_entropy,
     }
     return loss, (aux_metrics, updates)

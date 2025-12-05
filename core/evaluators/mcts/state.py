@@ -13,12 +13,14 @@ class MCTSNode:
     """Base MCTS node data strucutre.
     - `n`: visit count
     - `p`: policy vector
+    - `value_probs`: distribution over terminal outcomes (e.g., backgammon result buckets)
     - `q`: cumulative value estimate / visit count
     - `terminated`: whether the environment state is terminal
     - `embedding`: environment state
     """
     n: jnp.number
     p: chex.Array
+    value_probs: chex.Array
     q: jnp.number
     terminated: jnp.number
     embedding: chex.ArrayTree

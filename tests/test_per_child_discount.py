@@ -101,10 +101,13 @@ def create_mock_tree_with_mixed_player_transitions(
     )
 
     # Create MCTSNode data
+    value_probs = jnp.zeros((max_nodes, 6))
+
     node_data = MCTSNode(
         n=n_values,
         q=q_values,
         p=p_values,
+        value_probs=value_probs,
         embedding=batched_embedding,
         terminated=terminated
     )

@@ -16,19 +16,23 @@ class StepMetadata:
     - `terminated`: whether the environment is terminated
     - `cur_player_id`: current player id
     - `step`: step number
+    - `match_score`: optional match score context (e.g., (player_score, opp_score, match_length))
+    - `cube_value`: current cube value for backgammon-style games
     """
     rewards: chex.Array
     action_mask: chex.Array
     terminated: bool
     cur_player_id: int
     step: int
+    match_score: chex.ArrayTree | None = None
+    cube_value: float = 1.0
     
 
 EnvStepFn = Callable[[chex.ArrayTree, int], Tuple[chex.ArrayTree, StepMetadata]]
 EnvInitFn = Callable[[jax.random.PRNGKey], Tuple[chex.ArrayTree, StepMetadata]]  
 DataTransformFn = Callable[[chex.Array, chex.Array, chex.ArrayTree], Tuple[chex.Array, chex.Array, chex.ArrayTree]]
 Params = chex.ArrayTree
-EvalFn = Callable[[chex.ArrayTree, Params, jax.random.PRNGKey], Tuple[chex.Array, float]]
+EvalFn = Callable[[chex.ArrayTree, Params, jax.random.PRNGKey], Tuple[chex.Array, chex.Array]]
 LossFn = Callable[[chex.ArrayTree, TrainState, BaseExperience], Tuple[chex.Array, Tuple[chex.ArrayTree, optax.OptState]]]
 ExtractModelParamsFn = Callable[[TrainState], chex.ArrayTree]
 StateToNNInputFn = Callable[[chex.ArrayTree], chex.Array]

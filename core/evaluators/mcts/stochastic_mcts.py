@@ -6,6 +6,7 @@ from core.evaluators.mcts.action_selection import MCTSActionSelector
 from core.evaluators.mcts.state import BackpropState, MCTSNode, MCTSTree, TraversalState, MCTSOutput
 from core.evaluators.mcts.mcts import MCTS
 from core.evaluators.alphazero import AlphaZero
+from core.evaluators.mcts.equity import normalize_value_probs, terminal_value_probs_from_reward
 from core.types import EnvStepFn, EvalFn, StepMetadata
 
 
@@ -33,7 +34,7 @@ class StochasticMCTS(AlphaZero(MCTS)):
     ):
         """
         Args:
-        - `eval_fn`: leaf node evaluation function (env_state -> (policy_logits, value))
+        - `eval_fn`: leaf node evaluation function (env_state -> (policy_logits, value_probs[6]))
         - `action_selector`: action selection function (eval_state -> action)
         - `branching_factor`: max number of actions (== children per node)
         - `max_nodes`: allocated size of MCTS tree, any additional nodes will not be created, 
@@ -125,7 +126,7 @@ class StochasticMCTS(AlphaZero(MCTS)):
         )
         eval_state = jax.lax.cond(
             should_update_root,
-            lambda: self.update_root(root_key, eval_state, env_state, params, root_metadata=root_metadata),
+            lambda: self.update_root(root_key, eval_state, env_state, params, root_metadata),
             lambda: eval_state
         )
 
@@ -275,15 +276,21 @@ class StochasticMCTS(AlphaZero(MCTS)):
         )
     
     
-    def value_policy(self, embedding, params, eval_key, metadata, player_reward) -> Tuple[float, chex.Array]:
+    def value_policy(self, embedding, params, eval_key, metadata, player_reward) -> Tuple[float, chex.Array, chex.Array]:
         """Get value and policy for deterministic nodes."""
         # Get policy and value from eval_fn for deterministic states
-        policy_logits, value = self.eval_fn(embedding, params, eval_key)
+        policy_logits, value_probs = self.eval_fn(embedding, params, eval_key)
         policy_logits = jnp.where(metadata.action_mask, policy_logits, jnp.finfo(policy_logits).min)
         policy = jax.nn.softmax(policy_logits)
-        value = jnp.where(metadata.terminated, player_reward, value)
+        normalized_value_probs = normalize_value_probs(value_probs)
+        normalized_value_probs = jax.lax.cond(
+            metadata.terminated,
+            lambda: terminal_value_probs_from_reward(player_reward),
+            lambda: normalized_value_probs
+        )
+        value = self.value_equity_fn(normalized_value_probs, metadata)
         
-        return value, policy
+        return value, policy, normalized_value_probs
 
 
     def iterate(self, key: chex.PRNGKey, tree: MCTSTree, params: chex.ArrayTree, env_step_fn: EnvStepFn) -> MCTSTree:
@@ -314,7 +321,7 @@ class StochasticMCTS(AlphaZero(MCTS)):
         new_embedding, metadata = env_step_fn(embedding, action, step_key)
         player_reward = metadata.rewards[metadata.cur_player_id] # we need to check this, is correct.
         
-        value, policy = self.value_policy(new_embedding, params, eval_key, metadata, player_reward)
+        value, policy, value_probs = self.value_policy(new_embedding, params, eval_key, metadata, player_reward)
 
         # add leaf node to tree
         node_exists = tree.is_edge(parent, action)
@@ -324,10 +331,16 @@ class StochasticMCTS(AlphaZero(MCTS)):
         # For new nodes, create the full node and add to tree
         def update_existing_node():
             # Only update n and q - embedding/policy/terminated are unchanged for revisits
-            return StochasticMCTS._update_node_stats(tree, node_idx, value)
+            return StochasticMCTS._update_node_stats(tree, node_idx, value, value_probs)
 
         def add_new_node():
-            node_data = self.new_node(policy=policy, value=value, embedding=new_embedding, terminated=metadata.terminated)
+            node_data = self.new_node(
+                policy=policy,
+                value=value,
+                value_probs=value_probs,
+                embedding=new_embedding,
+                terminated=metadata.terminated
+            )
             return tree.add_node(parent_index=parent, edge_index=action, data=node_data)
 
         tree = jax.lax.cond(node_exists, update_existing_node, add_new_node)
@@ -456,8 +469,8 @@ class StochasticMCTS(AlphaZero(MCTS)):
         return expected_value
 
     @staticmethod
-    def _update_node_stats(tree: MCTSTree, node_idx: int, value: float) -> MCTSTree:
-        """Update only n and q for a node (optimized partial update).
+    def _update_node_stats(tree: MCTSTree, node_idx: int, value: float, value_probs: chex.Array | None = None) -> MCTSTree:
+        """Update only n/q (and optionally value_probs) for a node (optimized partial update).
 
         OPTIMIZATION: Instead of reconstructing the entire node with data_at() and
         updating all fields including the heavy embedding, we directly update only
@@ -480,9 +493,14 @@ class StochasticMCTS(AlphaZero(MCTS)):
         new_q = (old_q * old_n + value) / new_n
 
         # Update only n and q arrays (not the entire node)
+        updated_value_probs = tree.data.value_probs
+        if value_probs is not None:
+            updated_value_probs = updated_value_probs.at[node_idx].set(value_probs)
+
         new_data = tree.data.replace(
             n=tree.data.n.at[node_idx].set(new_n),
-            q=tree.data.q.at[node_idx].set(new_q)
+            q=tree.data.q.at[node_idx].set(new_q),
+            value_probs=updated_value_probs
         )
 
         return tree.replace(data=new_data)
