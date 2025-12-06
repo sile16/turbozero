@@ -265,8 +265,7 @@ class ResNetTurboZero(nn.Module):
         # 3) Value head
         v = nn.LayerNorm()(x)
         v = nn.relu(v)
-        v = nn.Dense(1)(v)
-        v = jnp.squeeze(v, -1)
+        v = nn.Dense(6)(v)
 
         return policy_logits, v
     

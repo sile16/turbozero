@@ -522,9 +522,10 @@ def test_get_value(stochastic_mcts, backgammon_env, key, mock_params):
     root_value = stochastic_mcts.get_value(mcts_output.eval_state)
     is_stochastic = StochasticMCTS.is_node_idx_stochastic(mcts_output.eval_state, mcts_output.eval_state.ROOT_INDEX)
 
-    value, policy = stochastic_mcts.value_policy(state, None, None, metadata, 0)
+    value, policy, value_probs = stochastic_mcts.value_policy(state, None, None, metadata, 0)
     # make sure the value is finite
     assert jnp.isfinite(value), "Value should be finite"
+    assert value_probs.shape == (6,)
     
     
     state = backgammon_env.stochastic_step(state, 0)

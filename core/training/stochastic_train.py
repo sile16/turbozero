@@ -316,13 +316,15 @@ class StochasticTrainer(Trainer):
                 
             # save checkpoint
             # make sure previous save task has finished 
-            self.checkpoint_manager.wait_until_finished()
-            self.save_checkpoint(train_state, cur_epoch)
+            if self.checkpoint_manager is not None:
+                self.checkpoint_manager.wait_until_finished()
+                self.save_checkpoint(train_state, cur_epoch)
             # next epoch
             cur_epoch += 1
             
         # make sure last save task has finished
-        self.checkpoint_manager.wait_until_finished() #
+        if self.checkpoint_manager is not None:
+            self.checkpoint_manager.wait_until_finished() #
         # return state so that training can be continued!
         return TrainLoopOutput(
             collection_state=collection_state,

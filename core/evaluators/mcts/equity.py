@@ -16,6 +16,7 @@ def normalize_value_probs(value_head_output: chex.Array) -> chex.Array:
 
 def terminal_value_probs_from_reward(reward: chex.Array) -> chex.Array:
     """Map a signed reward (money play-style points) to a one-hot outcome vector."""
+    reward = jnp.asarray(reward)
     magnitude = jnp.clip(jnp.rint(jnp.abs(reward)), 0, 3)
     outcome_bucket = jnp.minimum(magnitude - 1, 2).astype(jnp.int32)
     base = jax.nn.one_hot(outcome_bucket, 3, dtype=jnp.float32)
