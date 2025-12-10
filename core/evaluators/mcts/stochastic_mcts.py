@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Tuple, Literal
 import jax
 import jax.numpy as jnp
 import chex
@@ -6,7 +6,11 @@ from core.evaluators.mcts.action_selection import MCTSActionSelector
 from core.evaluators.mcts.state import BackpropState, MCTSNode, MCTSTree, TraversalState, MCTSOutput
 from core.evaluators.mcts.mcts import MCTS
 from core.evaluators.alphazero import AlphaZero
-from core.evaluators.mcts.equity import normalize_value_probs, terminal_value_probs_from_reward
+from core.evaluators.mcts.equity import (
+    normalize_value_probs, terminal_value_probs_from_reward,
+    normalize_value_probs_4way, terminal_value_probs_from_reward_4way,
+    probs_to_equity_4way
+)
 from core.types import EnvStepFn, EvalFn, StepMetadata
 
 
@@ -30,14 +34,15 @@ class StochasticMCTS(AlphaZero(MCTS)):
         noise_scale: float = 0.05,
         dirichlet_alpha: float = 0.3,
         dirichlet_epsilon: float = 0.25,
-        min_num_iterations: int = 300
+        min_num_iterations: int = 300,
+        value_head_type: Literal["6way", "4way"] = "6way"
     ):
         """
         Args:
-        - `eval_fn`: leaf node evaluation function (env_state -> (policy_logits, value_probs[6]))
+        - `eval_fn`: leaf node evaluation function (env_state -> (policy_logits, value_probs))
         - `action_selector`: action selection function (eval_state -> action)
         - `branching_factor`: max number of actions (== children per node)
-        - `max_nodes`: allocated size of MCTS tree, any additional nodes will not be created, 
+        - `max_nodes`: allocated size of MCTS tree, any additional nodes will not be created,
                 but values from out-of-bounds leaf nodes will still backpropagate
         - `num_iterations`: number of MCTS iterations to perform per evaluate call
         - `discount`: discount factor for MCTS (default: -1.0)
@@ -49,13 +54,25 @@ class StochasticMCTS(AlphaZero(MCTS)):
         - `noise_scale`: scale of noise to add to delta values in stochastic action selection (default: 0.05)
         - `dirichlet_alpha`: magnitude of Dirichlet noise for AlphaZero (default: 0.3)
         - `dirichlet_epsilon`: proportion of root policy composed of Dirichlet noise (default: 0.25)
+        - `value_head_type`: "6way" for 6-way categorical softmax, "4way" for 4-way conditional sigmoid
         """
-        super().__init__(dirichlet_alpha=dirichlet_alpha, dirichlet_epsilon=dirichlet_epsilon, eval_fn=eval_fn, action_selector=action_selector, branching_factor=branching_factor, max_nodes=max_nodes, num_iterations=num_iterations, discount=discount, temperature=temperature, tiebreak_noise=tiebreak_noise, persist_tree=persist_tree)
+        # Set value_equity_fn based on value_head_type
+        if value_head_type == "4way":
+            value_equity_fn = lambda value_probs, metadata: probs_to_equity_4way(
+                value_probs,
+                getattr(metadata, "match_score", None),
+                getattr(metadata, "cube_value", 1.0),
+            )
+        else:
+            value_equity_fn = None  # Use default 6-way
+
+        super().__init__(dirichlet_alpha=dirichlet_alpha, dirichlet_epsilon=dirichlet_epsilon, eval_fn=eval_fn, action_selector=action_selector, branching_factor=branching_factor, max_nodes=max_nodes, num_iterations=num_iterations, discount=discount, temperature=temperature, tiebreak_noise=tiebreak_noise, persist_tree=persist_tree, value_equity_fn=value_equity_fn)
 
         self.stochastic_action_probs = stochastic_action_probs
         self.noise_scale = noise_scale
         self.max_num_iterations = self.num_iterations
         self.min_num_iterations = min(min_num_iterations, self.max_num_iterations)
+        self.value_head_type = value_head_type
         
 
 
@@ -279,17 +296,27 @@ class StochasticMCTS(AlphaZero(MCTS)):
     def value_policy(self, embedding, params, eval_key, metadata, player_reward) -> Tuple[float, chex.Array, chex.Array]:
         """Get value and policy for deterministic nodes."""
         # Get policy and value from eval_fn for deterministic states
-        policy_logits, value_probs = self.eval_fn(embedding, params, eval_key)
+        policy_logits, value_logits = self.eval_fn(embedding, params, eval_key)
         policy_logits = jnp.where(metadata.action_mask, policy_logits, jnp.finfo(policy_logits).min)
         policy = jax.nn.softmax(policy_logits)
-        normalized_value_probs = normalize_value_probs(value_probs)
-        normalized_value_probs = jax.lax.cond(
-            metadata.terminated,
-            lambda: terminal_value_probs_from_reward(player_reward),
-            lambda: normalized_value_probs
-        )
+
+        # Handle 4-way vs 6-way value head
+        if self.value_head_type == "4way":
+            normalized_value_probs = normalize_value_probs_4way(value_logits)
+            normalized_value_probs = jax.lax.cond(
+                metadata.terminated,
+                lambda: terminal_value_probs_from_reward_4way(player_reward),
+                lambda: normalized_value_probs
+            )
+        else:
+            normalized_value_probs = normalize_value_probs(value_logits)
+            normalized_value_probs = jax.lax.cond(
+                metadata.terminated,
+                lambda: terminal_value_probs_from_reward(player_reward),
+                lambda: normalized_value_probs
+            )
         value = self.value_equity_fn(normalized_value_probs, metadata)
-        
+
         return value, policy, normalized_value_probs
 
 
