@@ -17,10 +17,16 @@ from pgx._src.types import Array
 import flax.linen as nn
 
 def scalar_value_to_probs(value: chex.Array) -> chex.Array:
-    """Project a scalar value in [-1, 1] to a 6-way outcome distribution."""
+    """Project a scalar value in [-1, 1] to a 4-way conditional distribution.
+
+    Returns [win, gam_win_cond, gam_loss_cond, bg_rate] where:
+    - win: P(win) based on value
+    - gam_win_cond: P(gammon | win) = 0 for simple heuristic
+    - gam_loss_cond: P(gammon | loss) = 0 for simple heuristic
+    - bg_rate: P(backgammon | gammon) = 0 for simple heuristic
+    """
     win_prob = jnp.clip(0.5 + 0.5 * value, 0.0, 1.0)
-    loss_prob = 1.0 - win_prob
-    return jnp.array([win_prob, 0.0, 0.0, loss_prob, 0.0, 0.0], dtype=jnp.float32)
+    return jnp.array([win_prob, 0.0, 0.0, 0.0], dtype=jnp.float32)
 
 def bg_simple_step_fn(env: Env, state, action, key=None):
     """Simple step function for testing does not know about stochastic nodes."""

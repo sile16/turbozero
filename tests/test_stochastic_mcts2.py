@@ -525,7 +525,7 @@ def test_get_value(stochastic_mcts, backgammon_env, key, mock_params):
     value, policy, value_probs = stochastic_mcts.value_policy(state, None, None, metadata, 0)
     # make sure the value is finite
     assert jnp.isfinite(value), "Value should be finite"
-    assert value_probs.shape == (6,)
+    assert value_probs.shape == (4,)  # 4-way value head
     
     
     state = backgammon_env.stochastic_step(state, 0)

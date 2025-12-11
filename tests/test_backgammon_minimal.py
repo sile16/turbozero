@@ -8,7 +8,7 @@ import jax.numpy as jnp
 import pgx.backgammon as bg
 
 from core.bgcommon import  bg_simple_step_fn, bg_pip_count_eval, bg_hit2_eval
-from core.evaluators.mcts.equity import probs_to_equity
+from core.evaluators.mcts.equity import probs_to_equity_4way
 
 from core.types import StepMetadata
 from core.evaluators.mcts.action_selection import PUCTSelector
@@ -147,20 +147,19 @@ def test_bg_pip_count_eval():
     state = env.set_dice(state, dice)
 
     policy0, value_probs0 = bg_pip_count_eval(state, None, None)
-    assert value_probs0.shape == (6,)
-    assert jnp.isclose(jnp.sum(value_probs0), 1.0)
-    equity0 = probs_to_equity(value_probs0, None)
+    assert value_probs0.shape == (4,)  # 4-way value head
+    equity0 = probs_to_equity_4way(value_probs0, None)
     assert jnp.isclose(equity0, 0.5, atol=1e-2)
 
     new_state = env.step(state, 122, jax.random.PRNGKey(0))
     _, value_probs1 = bg_pip_count_eval(new_state, None, None)
-    equity1 = probs_to_equity(value_probs1, None)
+    equity1 = probs_to_equity_4way(value_probs1, None)
     assert equity1 > 0.5
     new_new_state = env.step(new_state, 135, jax.random.PRNGKey(0))
 
-    # this changes player perspective, so we want to mkae sure count2 
+    # this changes player perspective, so we want to mkae sure count2
     _, value_probs2 = bg_pip_count_eval(new_new_state, None, None)
-    equity2 = probs_to_equity(value_probs2, None)
+    equity2 = probs_to_equity_4way(value_probs2, None)
     
     print(f"Equity1: {equity1}, Equity2: {equity2}")
     assert (1.0 - equity2) > equity1

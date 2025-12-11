@@ -6,7 +6,9 @@ import jax.numpy as jnp
 from core.evaluators.evaluator import Evaluator
 from core.evaluators.mcts.action_selection import MCTSActionSelector
 from core.evaluators.mcts.state import BackpropState, MCTSNode, MCTSTree, TraversalState, MCTSOutput
-from core.evaluators.mcts.equity import normalize_value_probs, probs_to_equity, terminal_value_probs_from_reward
+from core.evaluators.mcts.equity import (
+    normalize_value_probs_4way, probs_to_equity_4way, terminal_value_probs_from_reward_4way
+)
 from core.trees.tree import init_tree
 from core.types import EnvStepFn, EvalFn, StepMetadata
 
@@ -54,7 +56,7 @@ class MCTS(Evaluator):
         self.tiebreak_noise = tiebreak_noise
         self.persist_tree = persist_tree
         self.value_equity_fn = value_equity_fn or (
-            lambda value_probs, metadata: probs_to_equity(
+            lambda value_probs, metadata: probs_to_equity_4way(
                 value_probs,
                 getattr(metadata, "match_score", None),
                 getattr(metadata, "cube_value", 1.0),
@@ -167,10 +169,11 @@ class MCTS(Evaluator):
         root_policy_logits, root_value_probs = self.eval_fn(root_embedding, params, key)
         masked_logits = jnp.where(root_metadata.action_mask, root_policy_logits, jnp.finfo(root_policy_logits).min)
         root_policy = jax.nn.softmax(masked_logits)
-        normalized_value_probs = normalize_value_probs(root_value_probs)
+        # 4-way value head
+        normalized_value_probs = normalize_value_probs_4way(root_value_probs)
         normalized_value_probs = jax.lax.cond(
             root_metadata.terminated,
-            lambda: terminal_value_probs_from_reward(root_metadata.rewards[root_metadata.cur_player_id]),
+            lambda: terminal_value_probs_from_reward_4way(root_metadata.rewards[root_metadata.cur_player_id]),
             lambda: normalized_value_probs
         )
         root_value = self.value_equity_fn(normalized_value_probs, root_metadata)
@@ -211,10 +214,11 @@ class MCTS(Evaluator):
         policy_logits, value_probs = self.eval_fn(new_embedding, params, eval_key)
         policy_logits = jnp.where(metadata.action_mask, policy_logits, jnp.finfo(policy_logits).min)
         policy = jax.nn.softmax(policy_logits)
-        normalized_value_probs = normalize_value_probs(value_probs)
+        # 4-way value head
+        normalized_value_probs = normalize_value_probs_4way(value_probs)
         normalized_value_probs = jax.lax.cond(
             metadata.terminated,
-            lambda: terminal_value_probs_from_reward(player_reward),
+            lambda: terminal_value_probs_from_reward_4way(player_reward),
             lambda: normalized_value_probs
         )
         value = self.value_equity_fn(normalized_value_probs, metadata)
@@ -576,7 +580,7 @@ class MCTS(Evaluator):
         return init_tree(self.max_nodes, self.branching_factor, self.new_node(
             policy=jnp.zeros((self.branching_factor,)),
             value=0.0,
-            value_probs=jnp.zeros((6,)),
+            value_probs=jnp.zeros((4,)),  # 4-way value head
             embedding=template_embedding,
             terminated=False
         ))

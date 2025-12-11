@@ -7,7 +7,7 @@ import jax.numpy as jnp
 
 from core.evaluators.mcts.state import MCTSTree
 from core.evaluators.mcts.mcts import MCTS
-from core.evaluators.mcts.equity import normalize_value_probs, terminal_value_probs_from_reward
+from core.evaluators.mcts.equity import normalize_value_probs_4way, terminal_value_probs_from_reward_4way
 from core.types import StepMetadata
 
 
@@ -59,10 +59,11 @@ class _AlphaZero:
         root_policy_logits, root_value_probs = self.eval_fn(root_embedding, params, root_key) #pylint: disable=no-member
         masked_logits = jnp.where(root_metadata.action_mask, root_policy_logits, jnp.finfo(root_policy_logits).min)
         root_policy = jax.nn.softmax(masked_logits)
-        normalized_value_probs = normalize_value_probs(root_value_probs)
+        # 4-way value head
+        normalized_value_probs = normalize_value_probs_4way(root_value_probs)
         normalized_value_probs = jax.lax.cond(
             root_metadata.terminated,
-            lambda: terminal_value_probs_from_reward(root_metadata.rewards[root_metadata.cur_player_id]),
+            lambda: terminal_value_probs_from_reward_4way(root_metadata.rewards[root_metadata.cur_player_id]),
             lambda: normalized_value_probs
         )
         root_value = self.value_equity_fn(normalized_value_probs, root_metadata) #pylint: disable=no-member

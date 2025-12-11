@@ -1,4 +1,4 @@
-from typing import Tuple, Literal
+from typing import Tuple
 import jax
 import jax.numpy as jnp
 import chex
@@ -7,7 +7,6 @@ from core.evaluators.mcts.state import BackpropState, MCTSNode, MCTSTree, Traver
 from core.evaluators.mcts.mcts import MCTS
 from core.evaluators.alphazero import AlphaZero
 from core.evaluators.mcts.equity import (
-    normalize_value_probs, terminal_value_probs_from_reward,
     normalize_value_probs_4way, terminal_value_probs_from_reward_4way,
     probs_to_equity_4way
 )
@@ -35,11 +34,10 @@ class StochasticMCTS(AlphaZero(MCTS)):
         dirichlet_alpha: float = 0.3,
         dirichlet_epsilon: float = 0.25,
         min_num_iterations: int = 300,
-        value_head_type: Literal["6way", "4way"] = "6way"
     ):
         """
         Args:
-        - `eval_fn`: leaf node evaluation function (env_state -> (policy_logits, value_probs))
+        - `eval_fn`: leaf node evaluation function (env_state -> (policy_logits, value_logits[4]))
         - `action_selector`: action selection function (eval_state -> action)
         - `branching_factor`: max number of actions (== children per node)
         - `max_nodes`: allocated size of MCTS tree, any additional nodes will not be created,
@@ -54,17 +52,13 @@ class StochasticMCTS(AlphaZero(MCTS)):
         - `noise_scale`: scale of noise to add to delta values in stochastic action selection (default: 0.05)
         - `dirichlet_alpha`: magnitude of Dirichlet noise for AlphaZero (default: 0.3)
         - `dirichlet_epsilon`: proportion of root policy composed of Dirichlet noise (default: 0.25)
-        - `value_head_type`: "6way" for 6-way categorical softmax, "4way" for 4-way conditional sigmoid
         """
-        # Set value_equity_fn based on value_head_type
-        if value_head_type == "4way":
-            value_equity_fn = lambda value_probs, metadata: probs_to_equity_4way(
-                value_probs,
-                getattr(metadata, "match_score", None),
-                getattr(metadata, "cube_value", 1.0),
-            )
-        else:
-            value_equity_fn = None  # Use default 6-way
+        # 4-way value equity function
+        value_equity_fn = lambda value_probs, metadata: probs_to_equity_4way(
+            value_probs,
+            getattr(metadata, "match_score", None),
+            getattr(metadata, "cube_value", 1.0),
+        )
 
         super().__init__(dirichlet_alpha=dirichlet_alpha, dirichlet_epsilon=dirichlet_epsilon, eval_fn=eval_fn, action_selector=action_selector, branching_factor=branching_factor, max_nodes=max_nodes, num_iterations=num_iterations, discount=discount, temperature=temperature, tiebreak_noise=tiebreak_noise, persist_tree=persist_tree, value_equity_fn=value_equity_fn)
 
@@ -72,8 +66,58 @@ class StochasticMCTS(AlphaZero(MCTS)):
         self.noise_scale = noise_scale
         self.max_num_iterations = self.num_iterations
         self.min_num_iterations = min(min_num_iterations, self.max_num_iterations)
-        self.value_head_type = value_head_type
-        
+
+
+    def update_root(self, key: chex.PRNGKey, tree: MCTSTree, root_embedding: chex.ArrayTree, params: chex.ArrayTree, root_metadata: StepMetadata) -> MCTSTree:
+        """Populates the root node of the search tree using 4-way value head. Adds Dirichlet noise to the root policy.
+
+        Args:
+        - `key`: rng
+        - `tree`: The search tree.
+        - `root_embedding`: root environment state.
+        - `params`: nn parameters.
+        - `root_metadata`: metadata of the root environment state
+
+        Returns:
+        - `tree`: The updated search tree.
+        """
+        # evaluate the root state
+        root_key, dir_key = jax.random.split(key, 2)
+        root_policy_logits, root_value_logits = self.eval_fn(root_embedding, params, root_key)
+        masked_logits = jnp.where(root_metadata.action_mask, root_policy_logits, jnp.finfo(root_policy_logits).min)
+        root_policy = jax.nn.softmax(masked_logits)
+
+        # 4-way value head: sigmoid normalization
+        player_reward = root_metadata.rewards[root_metadata.cur_player_id]
+        normalized_value_probs = normalize_value_probs_4way(root_value_logits)
+        normalized_value_probs = jax.lax.cond(
+            root_metadata.terminated,
+            lambda: terminal_value_probs_from_reward_4way(player_reward),
+            lambda: normalized_value_probs
+        )
+        root_value = self.value_equity_fn(normalized_value_probs, root_metadata)
+
+        # add Dirichlet noise to the root policy
+        dirichlet_noise = jax.random.dirichlet(
+            dir_key,
+            alpha=jnp.full(
+                [tree.branching_factor],
+                fill_value=self.dirichlet_alpha
+            )
+        )
+        noisy_policy = (
+            ((1-self.dirichlet_epsilon) * root_policy) +
+            (self.dirichlet_epsilon * dirichlet_noise)
+        )
+        # re-normalize the policy
+        new_logits = jnp.log(jnp.maximum(noisy_policy, jnp.finfo(noisy_policy).tiny))
+        policy = jnp.where(root_metadata.action_mask, new_logits, jnp.finfo(noisy_policy).min)
+        renorm_policy = jax.nn.softmax(policy)
+
+        # update the root node
+        root_node = tree.data_at(tree.ROOT_INDEX)
+        updated_root = self._force_update_root_node(root_node, renorm_policy, root_value, normalized_value_probs, root_embedding)
+        return tree.set_root(updated_root)
 
 
     def evaluate(self, #pylint: disable=arguments-differ
@@ -294,27 +338,19 @@ class StochasticMCTS(AlphaZero(MCTS)):
     
     
     def value_policy(self, embedding, params, eval_key, metadata, player_reward) -> Tuple[float, chex.Array, chex.Array]:
-        """Get value and policy for deterministic nodes."""
+        """Get value and policy for deterministic nodes using 4-way value head."""
         # Get policy and value from eval_fn for deterministic states
         policy_logits, value_logits = self.eval_fn(embedding, params, eval_key)
         policy_logits = jnp.where(metadata.action_mask, policy_logits, jnp.finfo(policy_logits).min)
         policy = jax.nn.softmax(policy_logits)
 
-        # Handle 4-way vs 6-way value head
-        if self.value_head_type == "4way":
-            normalized_value_probs = normalize_value_probs_4way(value_logits)
-            normalized_value_probs = jax.lax.cond(
-                metadata.terminated,
-                lambda: terminal_value_probs_from_reward_4way(player_reward),
-                lambda: normalized_value_probs
-            )
-        else:
-            normalized_value_probs = normalize_value_probs(value_logits)
-            normalized_value_probs = jax.lax.cond(
-                metadata.terminated,
-                lambda: terminal_value_probs_from_reward(player_reward),
-                lambda: normalized_value_probs
-            )
+        # 4-way value head: sigmoid normalization
+        normalized_value_probs = normalize_value_probs_4way(value_logits)
+        normalized_value_probs = jax.lax.cond(
+            metadata.terminated,
+            lambda: terminal_value_probs_from_reward_4way(player_reward),
+            lambda: normalized_value_probs
+        )
         value = self.value_equity_fn(normalized_value_probs, metadata)
 
         return value, policy, normalized_value_probs

@@ -12,7 +12,7 @@ from core.trees.tree import init_tree
 
 def dummy_eval_fn(state, params, key):
     """Dummy evaluation function."""
-    return jnp.zeros((10,)), jnp.zeros((6,))
+    return jnp.zeros((10,)), jnp.zeros((4,))  # 4-way value head
 
 
 @dataclass
@@ -97,7 +97,7 @@ def test_explore_stochastic_action_selector():
         n=jnp.array(10, dtype=jnp.int32),  # Root visit count
         p=jnp.zeros((branching_factor,)),  # Policy 
         q=jnp.array(0.5, dtype=jnp.float32),  # Value
-        value_probs=jnp.zeros((6,)),
+        value_probs=jnp.zeros((4,)),
         terminated=jnp.array(False, dtype=jnp.bool_),
         embedding=template_embedding
     )
@@ -123,7 +123,7 @@ def test_explore_stochastic_action_selector():
                 n=jnp.array(child_visit_counts[i], dtype=jnp.int32),
                 p=jnp.zeros((branching_factor,)),
                 q=jnp.array(0.0, dtype=jnp.float32),
-                value_probs=jnp.zeros((6,)),
+                value_probs=jnp.zeros((4,)),
                 terminated=jnp.array(False, dtype=jnp.bool_),
                 embedding=DummyEmbedding(_is_stochastic=False)
             )
@@ -179,7 +179,7 @@ def test_explore_stochastic_action_selector_with_missing_children():
         n=jnp.array(10, dtype=jnp.int32),
         p=jnp.zeros((branching_factor,)),
         q=jnp.array(0.5, dtype=jnp.float32),
-        value_probs=jnp.zeros((6,)),
+        value_probs=jnp.zeros((4,)),
         terminated=jnp.array(False, dtype=jnp.bool_),
         embedding=template_embedding
     )
@@ -201,7 +201,7 @@ def test_explore_stochastic_action_selector_with_missing_children():
             n=jnp.array(visit_count, dtype=jnp.int32),
             p=jnp.zeros((branching_factor,)),
             q=jnp.array(0.0, dtype=jnp.float32),
-            value_probs=jnp.zeros((6,)),
+            value_probs=jnp.zeros((4,)),
             terminated=jnp.array(False, dtype=jnp.bool_),
             embedding=DummyEmbedding(_is_stochastic=False)
         )
