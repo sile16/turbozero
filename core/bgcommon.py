@@ -268,10 +268,10 @@ class ResNetTurboZero(nn.Module):
         # 2) Policy head: single Dense into 156 logits
         policy_logits = nn.Dense(self.num_actions)(x)
 
-        # 3) Value head
+        # 3) Value head (4-way conditional logits)
         v = nn.LayerNorm()(x)
         v = nn.relu(v)
-        v = nn.Dense(6)(v)
+        v = nn.Dense(4)(v)
 
         return policy_logits, v
     

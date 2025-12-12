@@ -10,10 +10,12 @@ from core.evaluators.mcts.equity import (
 
 def test_probs_to_equity_4way_boundaries():
     win_probs = jnp.array([1.0, 0.0, 0.0, 0.0])
-    assert jnp.isclose(probs_to_equity_4way(win_probs, None, cube_value=2.0), 1.0)
+    # Single win equity = +1, scaled by cube=2 => +2, normalized to (2+3)/6
+    assert jnp.isclose(probs_to_equity_4way(win_probs, None, cube_value=2.0), jnp.array(5.0 / 6.0))
 
     loss_probs = jnp.array([0.0, 0.0, 0.0, 0.0])
-    assert jnp.isclose(probs_to_equity_4way(loss_probs, None, cube_value=1.0), 0.0)
+    # Single loss equity = -1, normalized to (-1+3)/6
+    assert jnp.isclose(probs_to_equity_4way(loss_probs, None, cube_value=1.0), jnp.array(2.0 / 6.0))
 
 
 def test_value_outputs_to_equity_mixed_distribution():
