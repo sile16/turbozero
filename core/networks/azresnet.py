@@ -11,14 +11,14 @@ class AZResnetConfig:
     - `policy_head_out_size`: output size of the policy head (number of actions)
     - `num_blocks`: number of residual blocks
     - `num_channels`: number of channels in each residual block
-    - `value_head_out_size`: output size of value head (1 for scalar, 4 for 4-way, 6 for 6-way)
-    - `value_head_type`: "scalar" for single tanh output, "4way" for 4-way sigmoid, "6way" for 6-way softmax
+    - `value_head_out_size`: output size of value head (1 for scalar, 4 for 4-way conditional)
+    - `value_head_type`: "scalar" for single tanh output, "4way" for 4-way conditional logits
     """
     policy_head_out_size: int
     num_blocks: int
     num_channels: int
     value_head_out_size: int = 1
-    value_head_type: Literal["scalar", "4way", "6way"] = "scalar"
+    value_head_type: Literal["scalar", "4way"] = "scalar"
 
 
 class ResidualBlock(nn.Module):
@@ -67,10 +67,10 @@ class AZResnet(nn.Module):
         value = nn.Dense(features=self.config.value_head_out_size)(value)
 
         # Apply activation based on value_head_type
-        # Note: For "4way" and "6way", we return logits (activation applied in loss/equity functions)
+        # Note: For "4way", we return logits (activation applied in loss/equity functions)
         # For "scalar", we apply tanh for backwards compatibility
         if self.config.value_head_type == "scalar":
             value = nn.tanh(value)
-        # For "4way" and "6way", return raw logits (sigmoid/softmax applied downstream)
+        # For "4way", return raw logits (sigmoid applied downstream)
 
         return policy, value

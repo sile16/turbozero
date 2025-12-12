@@ -8,7 +8,7 @@ class MLPConfig:
     """Configuration for the MLP network."""
     hidden_dims: Sequence[int]
     policy_head_out_size: int
-    value_head_out_size: int = 6 # 6-way outcome head by default
+    value_head_out_size: int = 4  # 4-way conditional head by default
 
 class MLP(nn.Module):
     """Simple Multi-Layer Perceptron for policy-value tasks."""

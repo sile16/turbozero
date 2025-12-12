@@ -32,7 +32,7 @@ class MCTS(Evaluator):
     ):
         """
         Args:
-        - `eval_fn`: leaf node evaluation function (env_state -> (policy_logits, value_probs[6]))
+        - `eval_fn`: leaf node evaluation function (env_state -> (policy_logits, value_probs[4]))
         - `action_selector`: action selection function (eval_state -> action)
         - `branching_factor`: max number of actions (== children per node)
         - `max_nodes`: allocated size of MCTS tree, any additional nodes will not be created, 
@@ -44,7 +44,7 @@ class MCTS(Evaluator):
         - `temperature`: temperature for root action selection (default: 1.0)
         - `tiebreak_noise`: magnitude of noise to add to policy weights for breaking ties (default: 1e-8)
         - `persist_tree`: whether to persist search tree state between calls to `evaluate` (default: True)
-        - `value_equity_fn`: function mapping a 6-way outcome distribution + metadata to a scalar equity in [0, 1]
+        - `value_equity_fn`: function mapping a 4-way conditional distribution + metadata to scalar equity
         """
         super().__init__(discount=discount)
         self.eval_fn = eval_fn
@@ -444,7 +444,7 @@ class MCTS(Evaluator):
         Args:
         - `policy`: policy weights
         - `value`: value estimate
-        - `value_probs`: value head probabilities (6-way outcome distribution)
+        - `value_probs`: value head probabilities (4-way conditional distribution)
         - `embedding`: environment state embedding
             - 'embedding' because in some MCTS use-cases, e.g. MuZero, we store an embedding of the state 
                rather than the state itself. In AlphaZero, this is just the entire environment state.

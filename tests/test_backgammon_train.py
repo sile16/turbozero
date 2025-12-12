@@ -82,7 +82,7 @@ class SimpleMLP(nn.Module):
         policy_logits = nn.Dense(features=self.num_actions)(x)
         
         # Value head 
-        value = nn.Dense(features=6)(x)
+        value = nn.Dense(features=4)(x)
         
         return policy_logits, value
 
@@ -247,5 +247,4 @@ def test_train_step_test_large_nn():
     trainer2.train_loop(seed=42, num_epochs=1)
 
     
-
 
