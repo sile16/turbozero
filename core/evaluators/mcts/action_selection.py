@@ -45,7 +45,7 @@ class MCTSActionSelector:
         self.epsilon = epsilon
 
 
-    def __call__(self, tree: MCTSTree, index: int, discount: float) -> int:
+    def __call__(self, tree: MCTSTree, index: int) -> int:
         """Selects an action given a search tree state. Implemented by subclasses."""
         raise NotImplementedError()
 
@@ -87,26 +87,43 @@ class PUCTSelector(MCTSActionSelector):
         }
 
 
-    def __call__(self, tree: MCTSTree, index: int, discount: float) -> int:
+    def __call__(self, tree: MCTSTree, index: int) -> int:
         """Selects an action given a search tree state.
 
         Args:
         - `tree`: search tree
         - `index`: index of the node in the search tree to select an action to take from
-        - `discount`: discount factor
 
         Returns:
         - (int): id of action to take
         """
-        # get child q-values
+        # get parent node and its current player
         node = tree.data_at(index)
+        parent_player = node.embedding.current_player
+
+        # get child q-values and visit counts
         q_values = tree.get_child_data('q', index)
-        # apply discount to q-values
-        discounted_q_values = q_values * discount
-        # get child visit counts
         n_values = tree.get_child_data('n', index)
+
+        # get child node indices and their current players
+        child_indices = tree.edge_map[index]
+        # For valid children, get their current_player; for NULL_INDEX use parent_player (no flip)
+        safe_indices = jnp.maximum(child_indices, 0)
+        child_players = tree.data.embedding.current_player[safe_indices]
+        # Mask: only apply player comparison for existing children
+        child_exists = child_indices != tree.NULL_INDEX
+
+        # Calculate per-child discount: 1.0 if same player, -1.0 if different
+        player_diff = jnp.abs(parent_player - child_players)
+        per_child_discount = 1.0 - 2.0 * player_diff
+        # For non-existent children (n=0, q=0), discount doesn't matter, but use 1.0 to be safe
+        per_child_discount = jnp.where(child_exists, per_child_discount, 1.0)
+
+        # Apply per-child discount to convert Q-values to parent's perspective
+        adjusted_q_values = q_values * per_child_discount
+
         # normalize/transform q-values
-        q_values = self.q_transform(discounted_q_values, n_values, node.q, self.epsilon)
+        q_values = self.q_transform(adjusted_q_values, n_values, node.q, self.epsilon)
         # calculate U-values
         u_values = self.c * node.p * jnp.sqrt(node.n) / (n_values + 1)
         # PUCT = Q-value + U-value
@@ -155,26 +172,40 @@ class MuZeroPUCTSelector(MCTSActionSelector):
             **super().get_config()
         }
 
-    def __call__(self, tree: MCTSTree, index: int, discount: float) -> int:
+    def __call__(self, tree: MCTSTree, index: int) -> int:
         """Selects an action given a search tree state.
 
         Args:
         - `tree`: search tree
         - `index`: index of the node in the search tree to select an action to take from
-        - `discount`: discount factor
 
         Returns:
         - (int): id of action to take
         """
-        # get child q-values
+        # get parent node and its current player
         node = tree.data_at(index)
+        parent_player = node.embedding.current_player
+
+        # get child q-values and visit counts
         q_values = tree.get_child_data('q', index)
-        # apply discount to q-values
-        discounted_q_values = q_values * discount
-        # get child visit counts
         n_values = tree.get_child_data('n', index)
-        # normalize/transform q-values
-        q_values = self.q_transform(discounted_q_values, q_values, n_values, node.q, self.epsilon)
+
+        # get child node indices and their current players
+        child_indices = tree.edge_map[index]
+        safe_indices = jnp.maximum(child_indices, 0)
+        child_players = tree.data.embedding.current_player[safe_indices]
+        child_exists = child_indices != tree.NULL_INDEX
+
+        # Calculate per-child discount: 1.0 if same player, -1.0 if different
+        player_diff = jnp.abs(parent_player - child_players)
+        per_child_discount = 1.0 - 2.0 * player_diff
+        per_child_discount = jnp.where(child_exists, per_child_discount, 1.0)
+
+        # Apply per-child discount to convert Q-values to parent's perspective
+        adjusted_q_values = q_values * per_child_discount
+
+        # normalize/transform q-values (passing adjusted and raw q_values for MuZero compat)
+        q_values = self.q_transform(adjusted_q_values, q_values, n_values, node.q, self.epsilon)
         # calculate U-values
         base_term = node.p * jnp.sqrt(node.n) / (n_values + 1)
         log_term = jnp.log((node.n + self.c2 + 1) / self.c2) + self.c1

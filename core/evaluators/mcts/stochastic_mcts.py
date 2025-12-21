@@ -6,18 +6,45 @@ from core.evaluators.mcts.action_selection import MCTSActionSelector
 from core.evaluators.mcts.state import BackpropState, MCTSNode, MCTSTree, TraversalState, MCTSOutput
 from core.evaluators.mcts.mcts import MCTS
 from core.evaluators.alphazero import AlphaZero
-from core.evaluators.mcts.equity import (
-    normalize_value_probs_4way, terminal_value_probs_from_reward_4way,
-    probs_to_equity_4way
-)
 from core.types import EnvStepFn, EvalFn, StepMetadata
 
 
 class StochasticMCTS(AlphaZero(MCTS)):
-    """Batched implementation of Monte Carlo Tree Search (MCTS).
-    
-    Not stateful. This class operates on 'MCTSTree' state objects.
-    
+    """MCTS for games with stochastic transitions (e.g., Pig, backgammon).
+
+    This class handles games where `is_stochastic=True` indicates a CHANCE NODE - a state
+    where the environment determines the next outcome randomly, not the player.
+
+    IMPORTANT: Your `env_step_fn` must handle both decision and chance nodes:
+    - For decision nodes (is_stochastic=False): call `env.step(state, action, key)`
+    - For chance nodes (is_stochastic=True): call `env.stochastic_step(state, outcome)`
+
+    Example for pgx Pig (JAX-compatible):
+    ```python
+    def make_pig_step_fn(env):
+        def step_fn(state, action, key):
+            is_stochastic = getattr(state, '_is_stochastic', jnp.array(False))
+            new_state = jax.lax.cond(
+                is_stochastic,
+                lambda _: env.stochastic_step(state, action),  # Chance node
+                lambda _: env.step(state, action, key),        # Decision node
+                operand=None
+            )
+            metadata = StepMetadata(...)
+            return new_state, metadata
+        return step_fn
+    ```
+
+    When the root node is a chance node (is_stochastic=True), this class:
+    - Skips MCTS search (no player decision to make)
+    - Samples an action from `stochastic_action_probs`
+    - Returns a dummy policy (zeros) - not used for training at chance nodes
+
+    When traversing the tree:
+    - At decision nodes: uses neural network policy with PUCT selection
+    - At chance nodes: explores outcomes proportionally to `stochastic_action_probs`
+    - Backpropagation uses expectimax at chance nodes (weighted average by probability)
+
     Compatible with `jax.vmap`, `jax.pmap`, `jax.jit`, etc."""
     def __init__(self,
         eval_fn: EvalFn,
@@ -26,26 +53,22 @@ class StochasticMCTS(AlphaZero(MCTS)):
         branching_factor: int,
         max_nodes: int,
         num_iterations: int,
-        discount: float = -1.0,
         temperature: float = 1.0,
         tiebreak_noise: float = 1e-8,
         persist_tree: bool = True,
         noise_scale: float = 0.05,
         dirichlet_alpha: float = 0.3,
         dirichlet_epsilon: float = 0.25,
-        min_num_iterations: int = 300,
+        min_num_iterations: int = 300
     ):
         """
         Args:
-        - `eval_fn`: leaf node evaluation function (env_state -> (policy_logits, value_logits[4]))
+        - `eval_fn`: leaf node evaluation function (env_state -> (policy_logits, value))
         - `action_selector`: action selection function (eval_state -> action)
         - `branching_factor`: max number of actions (== children per node)
         - `max_nodes`: allocated size of MCTS tree, any additional nodes will not be created,
                 but values from out-of-bounds leaf nodes will still backpropagate
         - `num_iterations`: number of MCTS iterations to perform per evaluate call
-        - `discount`: discount factor for MCTS (default: -1.0)
-            - use a negative discount in two-player games (e.g. -1.0)
-            - use a positive discount in single-player games (e.g. 1.0)
         - `temperature`: temperature for root action selection (default: 1.0)
         - `tiebreak_noise`: magnitude of noise to add to policy weights for breaking ties (default: 1e-8)
         - `persist_tree`: whether to persist search tree state between calls to `evaluate` (default: True)
@@ -53,71 +76,13 @@ class StochasticMCTS(AlphaZero(MCTS)):
         - `dirichlet_alpha`: magnitude of Dirichlet noise for AlphaZero (default: 0.3)
         - `dirichlet_epsilon`: proportion of root policy composed of Dirichlet noise (default: 0.25)
         """
-        # 4-way value equity function
-        value_equity_fn = lambda value_probs, metadata: probs_to_equity_4way(
-            value_probs,
-            getattr(metadata, "match_score", None),
-            getattr(metadata, "cube_value", 1.0),
-        )
-
-        super().__init__(dirichlet_alpha=dirichlet_alpha, dirichlet_epsilon=dirichlet_epsilon, eval_fn=eval_fn, action_selector=action_selector, branching_factor=branching_factor, max_nodes=max_nodes, num_iterations=num_iterations, discount=discount, temperature=temperature, tiebreak_noise=tiebreak_noise, persist_tree=persist_tree, value_equity_fn=value_equity_fn)
+        super().__init__(dirichlet_alpha=dirichlet_alpha, dirichlet_epsilon=dirichlet_epsilon, eval_fn=eval_fn, action_selector=action_selector, branching_factor=branching_factor, max_nodes=max_nodes, num_iterations=num_iterations, temperature=temperature, tiebreak_noise=tiebreak_noise, persist_tree=persist_tree)
 
         self.stochastic_action_probs = stochastic_action_probs
         self.noise_scale = noise_scale
         self.max_num_iterations = self.num_iterations
         self.min_num_iterations = min(min_num_iterations, self.max_num_iterations)
-
-
-    def update_root(self, key: chex.PRNGKey, tree: MCTSTree, root_embedding: chex.ArrayTree, params: chex.ArrayTree, root_metadata: StepMetadata) -> MCTSTree:
-        """Populates the root node of the search tree using 4-way value head. Adds Dirichlet noise to the root policy.
-
-        Args:
-        - `key`: rng
-        - `tree`: The search tree.
-        - `root_embedding`: root environment state.
-        - `params`: nn parameters.
-        - `root_metadata`: metadata of the root environment state
-
-        Returns:
-        - `tree`: The updated search tree.
-        """
-        # evaluate the root state
-        root_key, dir_key = jax.random.split(key, 2)
-        root_policy_logits, root_value_logits = self.eval_fn(root_embedding, params, root_key)
-        masked_logits = jnp.where(root_metadata.action_mask, root_policy_logits, jnp.finfo(root_policy_logits).min)
-        root_policy = jax.nn.softmax(masked_logits)
-
-        # 4-way value head: sigmoid normalization
-        player_reward = root_metadata.rewards[root_metadata.cur_player_id]
-        normalized_value_probs = normalize_value_probs_4way(root_value_logits)
-        normalized_value_probs = jax.lax.cond(
-            root_metadata.terminated,
-            lambda: terminal_value_probs_from_reward_4way(player_reward),
-            lambda: normalized_value_probs
-        )
-        root_value = self.value_equity_fn(normalized_value_probs, root_metadata)
-
-        # add Dirichlet noise to the root policy
-        dirichlet_noise = jax.random.dirichlet(
-            dir_key,
-            alpha=jnp.full(
-                [tree.branching_factor],
-                fill_value=self.dirichlet_alpha
-            )
-        )
-        noisy_policy = (
-            ((1-self.dirichlet_epsilon) * root_policy) +
-            (self.dirichlet_epsilon * dirichlet_noise)
-        )
-        # re-normalize the policy
-        new_logits = jnp.log(jnp.maximum(noisy_policy, jnp.finfo(noisy_policy).tiny))
-        policy = jnp.where(root_metadata.action_mask, new_logits, jnp.finfo(noisy_policy).min)
-        renorm_policy = jax.nn.softmax(policy)
-
-        # update the root node
-        root_node = tree.data_at(tree.ROOT_INDEX)
-        updated_root = self._force_update_root_node(root_node, renorm_policy, root_value, normalized_value_probs, root_embedding)
-        return tree.set_root(updated_root)
+        
 
 
     def evaluate(self, #pylint: disable=arguments-differ
@@ -143,8 +108,9 @@ class StochasticMCTS(AlphaZero(MCTS)):
         - (MCTSOutput): contains new tree state, selected action, root value, and policy weights
         """
         tree = eval_state
-        self.num_iterations = max(int(self.max_num_iterations * (1 - self.temperature)), self.min_num_iterations)
-        
+        # NOTE: Don't modify self.num_iterations here - it breaks JAX tracing/JIT compilation
+        # The num_iterations is set in __init__ and should remain constant
+
         # Store super class reference for use in nested function
         super_evaluate = super().evaluate
         
@@ -163,7 +129,7 @@ class StochasticMCTS(AlphaZero(MCTS)):
 
     def stochastic_evaluate(self, #pylint: disable=arguments-differ
         key: chex.PRNGKey,
-        eval_state: MCTSTree, 
+        eval_state: MCTSTree,
         env_state: chex.ArrayTree,
         root_metadata: StepMetadata,
         params: chex.ArrayTree,
@@ -172,14 +138,27 @@ class StochasticMCTS(AlphaZero(MCTS)):
     ) -> MCTSOutput:
         """.
         Samples an action to take from the root based on it's stochastic actions.
-        
+
         Args:
         - `eval_state`: `MCTSTree` to evaluate, could be empty or partially complete
 
         """
-        # Only update root if tree is empty or persist_tree=False
+        # Reset tree if persist_tree=False to clear stale child nodes
         key, root_key = jax.random.split(key)
+
         # OPTIMIZATION: Direct array access instead of data_at() which reconstructs entire node
+        root_n = eval_state.data.n[eval_state.ROOT_INDEX]
+        should_reset = jnp.logical_and(
+            not self.persist_tree,
+            root_n > 0  # Only reset if tree has been used
+        )
+        eval_state = jax.lax.cond(
+            should_reset,
+            lambda: eval_state.reset(),
+            lambda: eval_state
+        )
+
+        # Update root if tree is empty (after reset or first call) or persist_tree=False
         root_n = eval_state.data.n[eval_state.ROOT_INDEX]
         should_update_root = jnp.logical_or(
             not self.persist_tree,
@@ -187,12 +166,12 @@ class StochasticMCTS(AlphaZero(MCTS)):
         )
         eval_state = jax.lax.cond(
             should_update_root,
-            lambda: self.update_root(root_key, eval_state, env_state, params, root_metadata),
+            lambda: self.update_root(root_key, eval_state, env_state, params, root_metadata=root_metadata),
             lambda: eval_state
         )
 
         # Get the action using stochastic_action_selector
-        action = self.stochastic_action_sample(key, eval_state, eval_state.ROOT_INDEX, self.discount)
+        action = self.stochastic_action_sample(key, eval_state, eval_state.ROOT_INDEX)
         
         # Create a dummy policy with the correct shape (branching_factor)
         # This will be ignored during training since we're in a stochastic state
@@ -205,7 +184,7 @@ class StochasticMCTS(AlphaZero(MCTS)):
         )
     
 
-    def stochastic_action_sample(self, key: chex.PRNGKey, tree, node_idx, discount):
+    def stochastic_action_sample(self, key: chex.PRNGKey, tree, node_idx):
         """Select an action from the node, not use in exploring at this point so we just use the stochastic action probs.
         i.e. we are rolling the dice to get the next deterministic state.
 
@@ -221,47 +200,37 @@ class StochasticMCTS(AlphaZero(MCTS)):
     
     
     def deterministic_action_selector(self, key: chex.PRNGKey, tree: MCTSTree, node_idx: int) -> int:
-        """called when traversing the tree and exploring possibilities, a wrapper to remove the key
+        """Called when traversing the tree and exploring possibilities, a wrapper to remove the key.
 
         Args:
+        - `key`: rng key (unused for deterministic action selection)
         - `tree`: MCTSTree to evaluate
         - `node_idx`: index of the node to select an action from
 
-        Optimized: Direct array access instead of data_at() to avoid full node reconstruction.
+        Note: The action_selector dynamically calculates the discount by comparing
+        parent's current_player with each child's current_player, so no explicit
+        discount parameter is needed.
         """
-        # Direct access to current_player array
-        current_player = tree.data.embedding.current_player[node_idx]
-
-        # Get child players - direct array slice
-        child_indices = tree.edge_map[node_idx]
-
-        # Safe access to child players (handling NULL_INDEX)
-        safe_indices = jnp.maximum(child_indices, 0)
-        child_players = tree.data.embedding.current_player[safe_indices]
-
-        # Calculate per-child discount based on player transitions
-        # Formula: 1.0 - 2.0 * |current_player - child_player|
-        # - Same player (0 vs 0 or 1 vs 1): 1.0 - 2.0 * 0 = 1.0 (keep value)
-        # - Different player (0 vs 1 or 1 vs 0): 1.0 - 2.0 * 1 = -1.0 (invert value)
-        # This produces a vector of discounts (one per child), which JAX broadcasting
-        # handles correctly when multiplied with Q-values in the action selector.
-        discounts = 1.0 - 2.0 * jnp.abs(current_player - child_players)
-
-        return self.action_selector(tree, node_idx, discounts)
+        return self.action_selector(tree, node_idx)
     
     def stochastic_action_selector(self, key: chex.PRNGKey, tree, node_idx) -> int:
         """Called when traversing the tree and exploring possibilities.
-        
+
+        Expansion strategy:
+        - If any stochastic outcomes have not been expanded yet at this node, expand them first
+          (highest-probability unexpanded outcome, with small noise for tie-breaking).
+        - Once all outcomes exist, select the action with the largest discrepancy between the child's
+          observed visit frequency and its theoretical stochastic probability (probability-matching).
+
         Selects the action with the largest discrepancy between the child's observed
         visit frequency and its theoretical stochastic probability.  This works when probabilities
-        are fairly similar and there isn't some very unlikely action that results in a large reward. 
-        
+        are fairly similar and there isn't some very unlikely action that results in a large reward.
+
         Args:
         - `key`: rng
         - `tree`: MCTSTree to evaluate
         - `node_idx`: index of the node to select an action from
-        - `discount`: discount factor (not used in this selector)
-        
+
         Returns:
         - The action with the largest delta between observed visit frequency and stochastic probability
         """
@@ -273,49 +242,58 @@ class StochasticMCTS(AlphaZero(MCTS)):
         
         # Create a mask for edges that exist (not NULL_INDEX)
         child_exists_mask = child_indices != tree.NULL_INDEX
-        
-        # For vectorized child visit count retrieval, we need to handle NULL_INDEX
-        # We'll replace NULL_INDEX with 0 for array access, then mask the result
-        safe_indices = jnp.maximum(child_indices, 0)  # Replace -1 with 0 for safe access
-        
-        # Vectorized access to visit counts - get n for all safe_indices
-        # Shape: (num_stochastic_actions,)
-        all_n = tree.data.n[safe_indices]
-        
-        # Apply mask to zero out non-existent children
-        # Shape: (num_stochastic_actions,)
-        child_visits = jnp.where(child_exists_mask, all_n, 0)
-        
-        # Calculate total visits
-        total_visits = jnp.sum(child_visits)
-        
-        # Normalize visit counts; handle the case where total_visits=0
-        normalized_visits = jnp.where(
-            total_visits > 0,
-            child_visits / total_visits,
-            # If total_visits=0, use a uniform distribution
-            jnp.ones_like(child_visits, dtype=jnp.float32) / num_stochastic_actions
-        )
-        
-        # Calculate deltas between actual visit frequencies and theoretical probabilities
-        # Now both arrays have shape (num_stochastic_actions,)
-        # NOTE: This selects actions that are under-visited relative to their probability.
-        # LIMITATION: This approach may miss low-probability but high-reward actions.
-        # If some stochastic outcomes have small probabilities but lead to significantly
-        # better rewards, this selector will under-explore them since it only balances
-        # visit frequency with theoretical probability.
-        # POTENTIAL IMPROVEMENT: Could incorporate value estimates or UCB-like exploration
-        # bonus for high-value but low-probability actions, e.g.:
-        # delta = (self.stochastic_action_probs - normalized_visits) + exploration_bonus
-        # where exploration_bonus considers both probability and estimated value.
-        delta = self.stochastic_action_probs - normalized_visits 
-        
-        # Add some noise to break ties
-        key, noise_key = jax.random.split(key)
-        delta = delta + jax.random.normal(noise_key, delta.shape) * self.noise_scale
-        
-        # Return the action with the biggest delta
-        return jnp.argmax(delta)
+        unexpanded_mask = ~child_exists_mask
+        has_unexpanded = jnp.any(unexpanded_mask)
+
+        def expand_unexpanded(k):
+            # Prefer higher-probability outcomes first (reduces early expectimax bias),
+            # but still guarantees all outcomes get expanded before probability-matching.
+            masked_probs = jnp.where(unexpanded_mask, self.stochastic_action_probs, -jnp.inf)
+            k, noise_key = jax.random.split(k)
+            masked_probs = masked_probs + jax.random.normal(noise_key, masked_probs.shape) * self.noise_scale
+            return jnp.argmax(masked_probs)
+
+        def probability_match(k):
+            # For vectorized child visit count retrieval, we need to handle NULL_INDEX
+            # We'll replace NULL_INDEX with 0 for array access, then mask the result
+            safe_indices = jnp.maximum(child_indices, 0)  # Replace -1 with 0 for safe access
+            
+            # Vectorized access to visit counts - get n for all safe_indices
+            # Shape: (num_stochastic_actions,)
+            all_n = tree.data.n[safe_indices]
+            
+            # Apply mask to zero out non-existent children
+            # Shape: (num_stochastic_actions,)
+            child_visits = jnp.where(child_exists_mask, all_n, 0)
+            
+            # Calculate total visits
+            total_visits = jnp.sum(child_visits)
+            
+            # Normalize visit counts; handle the case where total_visits=0
+            normalized_visits = jnp.where(
+                total_visits > 0,
+                child_visits / total_visits,
+                # If total_visits=0, use a uniform distribution
+                jnp.ones_like(child_visits, dtype=jnp.float32) / num_stochastic_actions
+            )
+            
+            # Calculate deltas between actual visit frequencies and theoretical probabilities
+            # Now both arrays have shape (num_stochastic_actions,)
+            # NOTE: This selects actions that are under-visited relative to their probability.
+            # LIMITATION: This approach may miss low-probability but high-reward actions.
+            # If some stochastic outcomes have small probabilities but lead to significantly
+            # better rewards, this selector will under-explore them since it only balances
+            # visit frequency with theoretical probability.
+            delta = self.stochastic_action_probs - normalized_visits
+            
+            # Add some noise to break ties
+            k, noise_key = jax.random.split(k)
+            delta = delta + jax.random.normal(noise_key, delta.shape) * self.noise_scale
+            
+            # Return the action with the biggest delta
+            return jnp.argmax(delta)
+
+        return jax.lax.cond(has_unexpanded, expand_unexpanded, probability_match, key)
     
     
 
@@ -337,23 +315,15 @@ class StochasticMCTS(AlphaZero(MCTS)):
         )
     
     
-    def value_policy(self, embedding, params, eval_key, metadata, player_reward) -> Tuple[float, chex.Array, chex.Array]:
-        """Get value and policy for deterministic nodes using 4-way value head."""
+    def value_policy(self, embedding, params, eval_key, metadata, player_reward) -> Tuple[float, chex.Array]:
+        """Get value and policy for deterministic nodes."""
         # Get policy and value from eval_fn for deterministic states
-        policy_logits, value_logits = self.eval_fn(embedding, params, eval_key)
+        policy_logits, value = self.eval_fn(embedding, params, eval_key)
         policy_logits = jnp.where(metadata.action_mask, policy_logits, jnp.finfo(policy_logits).min)
         policy = jax.nn.softmax(policy_logits)
-
-        # 4-way value head: sigmoid normalization
-        normalized_value_probs = normalize_value_probs_4way(value_logits)
-        normalized_value_probs = jax.lax.cond(
-            metadata.terminated,
-            lambda: terminal_value_probs_from_reward_4way(player_reward),
-            lambda: normalized_value_probs
-        )
-        value = self.value_equity_fn(normalized_value_probs, metadata)
-
-        return value, policy, normalized_value_probs
+        value = jnp.where(metadata.terminated, player_reward, value)
+        
+        return value, policy
 
 
     def iterate(self, key: chex.PRNGKey, tree: MCTSTree, params: chex.ArrayTree, env_step_fn: EnvStepFn) -> MCTSTree:
@@ -380,40 +350,107 @@ class StochasticMCTS(AlphaZero(MCTS)):
         
         # Split key for step function and evaluation
         step_key, eval_key, key = jax.random.split(key, 3)
-        
-        new_embedding, metadata = env_step_fn(embedding, action, step_key)
-        player_reward = metadata.rewards[metadata.cur_player_id] # we need to check this, is correct.
-        
-        value, policy, value_probs = self.value_policy(new_embedding, params, eval_key, metadata, player_reward)
 
-        # add leaf node to tree
-        node_exists = tree.is_edge(parent, action)
-        node_idx = tree.edge_map[parent, action]
+        is_parent_stochastic = StochasticMCTS.is_node_idx_stochastic(tree, parent)
 
-        # OPTIMIZATION: For existing nodes, only update n/q stats (not the full node with embedding)
-        # For new nodes, create the full node and add to tree
-        def update_existing_node():
-            # Only update n and q - embedding/policy/terminated are unchanged for revisits
-            return StochasticMCTS._update_node_stats(tree, node_idx, value, value_probs)
+        def deterministic_parent_branch():
+            new_embedding, metadata = env_step_fn(embedding, action, step_key)
+            player_reward = metadata.rewards[metadata.cur_player_id]
 
-        def add_new_node():
-            node_data = self.new_node(
-                policy=policy,
-                value=value,
-                value_probs=value_probs,
-                embedding=new_embedding,
-                terminated=metadata.terminated
-            )
-            return tree.add_node(parent_index=parent, edge_index=action, data=node_data)
+            value, policy = self.value_policy(new_embedding, params, eval_key, metadata, player_reward)
 
-        tree = jax.lax.cond(node_exists, update_existing_node, add_new_node)
+            # add leaf node to tree
+            node_exists = tree.is_edge(parent, action)
+            node_idx = tree.edge_map[parent, action]
 
-        # Get the correct node index after adding/updating
-        # OPTIMIZATION: Use jnp.where instead of jax.lax.cond for simple scalar selection
-        node_idx = jnp.where(node_exists, node_idx, tree.next_free_idx - 1)
-        
-        # backpropagate
-        return self.backpropagate(key, tree, parent, node_idx, value) 
+            # OPTIMIZATION: For existing nodes, only update n/q stats (not the full node with embedding)
+            # For new nodes, create the full node and add to tree
+            def update_existing_node():
+                # Only update n and q - embedding/policy/terminated are unchanged for revisits
+                return StochasticMCTS._update_node_stats(tree, node_idx, value)
+
+            def add_new_node():
+                node_data = self.new_node(policy=policy, value=value, embedding=new_embedding, terminated=metadata.terminated)
+                return tree.add_node(parent_index=parent, edge_index=action, data=node_data)
+
+            updated_tree = jax.lax.cond(node_exists, update_existing_node, add_new_node)
+
+            # Get the correct node index after adding/updating
+            node_idx2 = jnp.where(node_exists, node_idx, updated_tree.next_free_idx - 1)
+
+            # backpropagate
+            return self.backpropagate(key, updated_tree, parent, node_idx2, value)
+
+        def stochastic_parent_branch():
+            num_stochastic_actions = len(self.stochastic_action_probs)
+            child_indices = tree.edge_map[parent, :num_stochastic_actions]
+            child_exists_mask = child_indices != tree.NULL_INDEX
+            has_unexpanded = jnp.any(~child_exists_mask)
+
+            def expand_all_children():
+                actions = jnp.arange(num_stochastic_actions, dtype=jnp.int32)
+                step_keys = jax.random.split(step_key, num_stochastic_actions)
+                eval_keys = jax.random.split(eval_key, num_stochastic_actions)
+
+                new_embeddings, metadatas = jax.vmap(env_step_fn, in_axes=(None, 0, 0))(embedding, actions, step_keys)
+
+                batch_idx = jnp.arange(num_stochastic_actions, dtype=jnp.int32)
+                player_rewards = metadatas.rewards[batch_idx, metadatas.cur_player_id]
+
+                values, policies = jax.vmap(self.value_policy, in_axes=(0, None, 0, 0, 0))(
+                    new_embeddings, params, eval_keys, metadatas, player_rewards
+                )
+
+                node_datas = jax.vmap(
+                    lambda pol, val, emb, term: self.new_node(policy=pol, value=val, embedding=emb, terminated=term),
+                    in_axes=(0, 0, 0, 0),
+                )(policies, values, new_embeddings, metadatas.terminated)
+
+                def add_one(i, t):
+                    edge_exists = t.is_edge(parent, i)
+
+                    def add_missing():
+                        node_i = jax.tree_util.tree_map(lambda x: x[i], node_datas)
+                        return t.add_node(parent_index=parent, edge_index=i, data=node_i)
+
+                    return jax.lax.cond(edge_exists, lambda: t, add_missing)
+
+                expanded_tree = jax.lax.fori_loop(0, num_stochastic_actions, add_one, tree)
+
+                # Update the stochastic parent with the expectimax value now that all outcomes exist.
+                expected_value = self.compute_expectimax_value(expanded_tree, parent)
+                expanded_tree = StochasticMCTS._update_node_stats(expanded_tree, parent, expected_value)
+
+                parent_idx = expanded_tree.parents[parent]
+
+                def propagate_to_ancestors():
+                    return self.backpropagate(key, expanded_tree, parent_idx, parent, expected_value)
+
+                return jax.lax.cond(parent == expanded_tree.ROOT_INDEX, lambda: expanded_tree, propagate_to_ancestors)
+
+            def single_outcome():
+                # All chance outcomes already exist: follow the selected outcome as a normal iteration.
+                new_embedding, metadata = env_step_fn(embedding, action, step_key)
+                player_reward = metadata.rewards[metadata.cur_player_id]
+                value, policy = self.value_policy(new_embedding, params, eval_key, metadata, player_reward)
+
+                node_exists = tree.is_edge(parent, action)
+                node_idx = tree.edge_map[parent, action]
+
+                def update_existing_node():
+                    return StochasticMCTS._update_node_stats(tree, node_idx, value)
+
+                def add_new_node():
+                    node_data = self.new_node(policy=policy, value=value, embedding=new_embedding, terminated=metadata.terminated)
+                    return tree.add_node(parent_index=parent, edge_index=action, data=node_data)
+
+                updated_tree = jax.lax.cond(node_exists, update_existing_node, add_new_node)
+                node_idx2 = jnp.where(node_exists, node_idx, updated_tree.next_free_idx - 1)
+                return self.backpropagate(key, updated_tree, parent, node_idx2, value)
+
+            return jax.lax.cond(has_unexpanded, expand_all_children, single_outcome)
+
+        return jax.lax.cond(is_parent_stochastic, stochastic_parent_branch, deterministic_parent_branch)
 
 
     def traverse(self, key: chex.PRNGKey, tree: MCTSTree) -> TraversalState:
@@ -532,8 +569,8 @@ class StochasticMCTS(AlphaZero(MCTS)):
         return expected_value
 
     @staticmethod
-    def _update_node_stats(tree: MCTSTree, node_idx: int, value: float, value_probs: chex.Array | None = None) -> MCTSTree:
-        """Update only n/q (and optionally value_probs) for a node (optimized partial update).
+    def _update_node_stats(tree: MCTSTree, node_idx: int, value: float) -> MCTSTree:
+        """Update only n and q for a node (optimized partial update).
 
         OPTIMIZATION: Instead of reconstructing the entire node with data_at() and
         updating all fields including the heavy embedding, we directly update only
@@ -556,14 +593,9 @@ class StochasticMCTS(AlphaZero(MCTS)):
         new_q = (old_q * old_n + value) / new_n
 
         # Update only n and q arrays (not the entire node)
-        updated_value_probs = tree.data.value_probs
-        if value_probs is not None:
-            updated_value_probs = updated_value_probs.at[node_idx].set(value_probs)
-
         new_data = tree.data.replace(
             n=tree.data.n.at[node_idx].set(new_n),
-            q=tree.data.q.at[node_idx].set(new_q),
-            value_probs=updated_value_probs
+            q=tree.data.q.at[node_idx].set(new_q)
         )
 
         return tree.replace(data=new_data)

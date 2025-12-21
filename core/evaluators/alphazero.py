@@ -7,7 +7,6 @@ import jax.numpy as jnp
 
 from core.evaluators.mcts.state import MCTSTree
 from core.evaluators.mcts.mcts import MCTS
-from core.evaluators.mcts.equity import normalize_value_probs_4way, terminal_value_probs_from_reward_4way
 from core.types import StepMetadata
 
 
@@ -56,17 +55,8 @@ class _AlphaZero:
         """
         # evaluate the root state 
         root_key, dir_key = jax.random.split(key, 2)
-        root_policy_logits, root_value_probs = self.eval_fn(root_embedding, params, root_key) #pylint: disable=no-member
-        masked_logits = jnp.where(root_metadata.action_mask, root_policy_logits, jnp.finfo(root_policy_logits).min)
-        root_policy = jax.nn.softmax(masked_logits)
-        # 4-way value head
-        normalized_value_probs = normalize_value_probs_4way(root_value_probs)
-        normalized_value_probs = jax.lax.cond(
-            root_metadata.terminated,
-            lambda: terminal_value_probs_from_reward_4way(root_metadata.rewards[root_metadata.cur_player_id]),
-            lambda: normalized_value_probs
-        )
-        root_value = self.value_equity_fn(normalized_value_probs, root_metadata) #pylint: disable=no-member
+        root_policy_logits, root_value = self.eval_fn(root_embedding, params, root_key) #pylint: disable=no-member
+        root_policy = jax.nn.softmax(root_policy_logits)
 
         # add Dirichlet noise to the root policy
         dirichlet_noise = jax.random.dirichlet(
@@ -90,11 +80,11 @@ class _AlphaZero:
         # based on persist_tree and root_n. We unconditionally update here to honor the caller's
         # intent - this ensures Dirichlet noise is refreshed when persist_tree=False.
         root_node = tree.data_at(tree.ROOT_INDEX)
-        updated_root = self._force_update_root_node(root_node, renorm_policy, root_value, normalized_value_probs, root_embedding)
+        updated_root = self._force_update_root_node(root_node, renorm_policy, root_value, root_embedding)
         return tree.set_root(updated_root)
 
     @staticmethod
-    def _force_update_root_node(root_node, root_policy, root_value, root_value_probs, root_embedding):
+    def _force_update_root_node(root_node, root_policy, root_value, root_embedding):
         """Force update root node, ignoring visit count.
 
         Unlike MCTS.update_root_node which preserves values if the node was visited,
@@ -104,7 +94,6 @@ class _AlphaZero:
         return root_node.replace(
             p=root_policy,
             q=root_value,
-            value_probs=root_value_probs,
             n=jnp.array(1, dtype=jnp.int32),  # Reset to 1 visit
             embedding=root_embedding
         )
