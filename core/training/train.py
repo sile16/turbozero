@@ -388,20 +388,22 @@ class Trainer:
         )
     
 
-    @partial(jax.pmap, axis_name='d', static_broadcasted_argnums=(0,))
-    def one_train_step(self, ts: TrainState, batch: BaseExperience) -> Tuple[TrainState, dict]:
-        """Make a single training step.
+    def _one_train_step_inner(self, ts: TrainState, batch: BaseExperience) -> Tuple[TrainState, chex.Array]:
+        """Inner training step logic without pmap decorator.
+
+        Used inside fori_loop where pmap is applied at the outer level.
+        Returns metrics as a stacked array for JAX compatibility.
 
         Args:
         - `ts`: TrainState
         - `batch`: minibatch of experiences
 
         Returns:
-        - (TrainState, dict): updated TrainState and metrics
+        - (TrainState, Array): updated TrainState and metrics array
         """
         # calculate loss, get gradients
         grad_fn = jax.value_and_grad(self.loss_fn, has_aux=True)
-        (loss, (metrics, updates)), grads = grad_fn(ts.params, ts, batch)
+        (loss, (metrics_dict, updates)), grads = grad_fn(ts.params, ts, batch)
 
         # Compute gradient norm before averaging across devices
         grad_norm = jnp.sqrt(jax.tree_util.tree_reduce(
@@ -419,18 +421,74 @@ class Trainer:
             jax.tree.map(lambda x: jnp.sum(x ** 2), ts.params)
         ))
 
-        # update batchnorm stats
-        if hasattr(ts, 'batch_stats'):
-            ts = ts.replace(batch_stats=jax.lax.pmean(updates['batch_stats'], axis_name='d'))
-        # return updated train state and metrics
-        metrics = {
-            **metrics,
-            'loss': loss,
-            'grad_norm': grad_norm,
-            'param_norm': param_norm,
-        }
-        return ts, metrics
+        # update batchnorm stats using lax.cond for JAX compatibility
+        def update_batch_stats(t):
+            return t.replace(batch_stats=jax.lax.pmean(updates.get('batch_stats', {}), axis_name='d'))
 
+        def no_update(t):
+            return t
+
+        # Check if batch_stats exists - this is static so okay to use Python if
+        if hasattr(ts, 'batch_stats') and 'batch_stats' in updates:
+            ts = update_batch_stats(ts)
+
+        # Stack metrics into array for JAX compatibility inside fori_loop
+        # Order: loss, policy_loss, value_loss, policy_entropy, policy_accuracy, grad_norm, param_norm
+        metrics_array = jnp.array([
+            loss,
+            metrics_dict.get('policy_loss', 0.0),
+            metrics_dict.get('value_loss', 0.0),
+            metrics_dict.get('policy_entropy', 0.0),
+            metrics_dict.get('policy_accuracy', 0.0),
+            grad_norm,
+            param_norm,
+        ])
+
+        return ts, metrics_array
+
+    @partial(jax.pmap, axis_name='d', static_broadcasted_argnums=(0,))
+    def _train_steps_pmap(self,
+        batches: BaseExperience,
+        train_state: TrainState,
+    ) -> Tuple[TrainState, chex.Array]:
+        """JIT-compiled training steps using fori_loop.
+
+        This is pmapped and uses fori_loop internally for full JIT compilation.
+        Batches are pre-sampled outside pmap for correct buffer access.
+
+        Args:
+        - `batches`: pre-sampled batches, shape (num_steps, per_device_batch_size, ...)
+        - `train_state`: current training state
+
+        Returns:
+        - (TrainState, Array): updated train state and metrics array (num_steps, num_metrics)
+        """
+        num_steps = jax.tree_util.tree_leaves(batches)[0].shape[0]
+        num_metrics = 7  # loss, policy_loss, value_loss, policy_entropy, policy_accuracy, grad_norm, param_norm
+
+        def loop_body(i, carry):
+            ts, metrics_acc = carry
+
+            # Get batch for this step
+            batch = jax.tree.map(lambda x: x[i], batches)
+
+            # Run training step
+            ts, step_metrics = self._one_train_step_inner(ts, batch)
+
+            # Store metrics for this step
+            metrics_acc = metrics_acc.at[i].set(step_metrics)
+
+            return ts, metrics_acc
+
+        # Initialize metrics accumulator
+        metrics_acc = jnp.zeros((num_steps, num_metrics))
+
+        # Run the training loop
+        train_state, all_metrics = jax.lax.fori_loop(
+            0, num_steps, loop_body, (train_state, metrics_acc)
+        )
+
+        return train_state, all_metrics
 
     def train_steps(self,
         key: chex.PRNGKey,
@@ -438,7 +496,7 @@ class Trainer:
         train_state: TrainState,
         num_steps: int
     ) -> Tuple[CollectionState, TrainState, dict]:
-        """Performs `num_steps` training steps.
+        """Performs `num_steps` training steps using JIT-compiled fori_loop.
         Each step consists of sampling a minibatch from the replay buffer and updating the parameters.
 
         Args:
@@ -453,36 +511,50 @@ class Trainer:
             - updated training state
             - metrics
         """
-        # get replay memory buffer
+        if num_steps == 0:
+            return collection_state, train_state, {}
+
+        # Get buffer state
         buffer_state = collection_state.buffer_state
 
-        batch_metrics = []
+        # Pre-sample all batches (sampling happens outside pmap for correct buffer access)
+        keys = jax.random.split(key, num_steps)
 
-        for _ in range(num_steps):
-            step_key, key = jax.random.split(key)
-            # sample from replay memory
-            batch = self.memory_buffer.sample(buffer_state, step_key, self.train_batch_size)
-            # reshape into minibatch
-            batch = jax.tree.map(lambda x: x.reshape((self.num_devices, -1, *x.shape[1:])), batch)
-            # make training step
-            train_state, metrics = self.one_train_step(train_state, batch)
-            # append metrics from step
-            if metrics:
-                batch_metrics.append(metrics)
+        # Sample all batches at once using vmap
+        all_batches = jax.vmap(
+            lambda k: self.memory_buffer.sample(buffer_state, k, self.train_batch_size)
+        )(keys)
+        # all_batches shape: (num_steps, train_batch_size, ...)
 
-        # Compute mean and std of metrics across all training steps
-        if batch_metrics:
-            aggregated_metrics = {}
-            for k in batch_metrics[0].keys():
-                stacked = jnp.stack([m[k] for m in batch_metrics])
-                aggregated_metrics[k] = stacked.mean()
-                # Add std for key metrics to detect training instability
-                if k in ['loss', 'policy_loss', 'value_loss', 'grad_norm']:
-                    aggregated_metrics[f'{k}_std'] = stacked.std()
-            metrics = aggregated_metrics
-        else:
-            metrics = {}
+        # Reshape batches for pmap: (num_steps, devices, per_device_batch, ...)
+        all_batches = jax.tree.map(
+            lambda x: x.reshape((num_steps, self.num_devices, -1) + x.shape[2:]),
+            all_batches
+        )
+        # Transpose to (devices, num_steps, per_device_batch, ...)
+        all_batches = jax.tree.map(
+            lambda x: jnp.transpose(x, (1, 0) + tuple(range(2, x.ndim))),
+            all_batches
+        )
 
+        # Run JIT-compiled training loop
+        train_state, all_metrics = self._train_steps_pmap(all_batches, train_state)
+
+        # Aggregate metrics across steps (all_metrics shape: (devices, num_steps, num_metrics))
+        # Take first device's metrics (they should be same after pmean)
+        metrics_array = all_metrics[0]  # (num_steps, num_metrics)
+
+        # Compute mean and std
+        mean_metrics = metrics_array.mean(axis=0)
+        std_metrics = metrics_array.std(axis=0)
+
+        # Convert back to dict
+        metric_names = ['loss', 'policy_loss', 'value_loss', 'policy_entropy', 'policy_accuracy', 'grad_norm', 'param_norm']
+        metrics = {}
+        for i, name in enumerate(metric_names):
+            metrics[name] = mean_metrics[i]
+            if name in ['loss', 'policy_loss', 'value_loss', 'grad_norm']:
+                metrics[f'{name}_std'] = std_metrics[i]
 
         # return updated collection state, train state, and metrics
         return collection_state, train_state, metrics

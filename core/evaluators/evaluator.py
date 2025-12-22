@@ -25,13 +25,9 @@ class Evaluator:
     Evaluators may maintain an internal state, which is updated by the `step` method.
     """
 
-    def __init__(self, discount: float, *args, **kwargs):  # pylint: disable=unused-argument
-        """Initializes an Evaluator.
-
-        Args:
-        - `discount`: The discount factor applied to future rewards/value estimates.
-        """
-        self.discount = discount
+    def __init__(self, *args, **kwargs):  # pylint: disable=unused-argument
+        """Initializes an Evaluator."""
+        pass
 
 
     def init(self, *args, **kwargs) -> chex.ArrayTree:
@@ -94,4 +90,4 @@ class Evaluator:
 
     def get_config(self) -> Dict:
         """Returns the configuration of the Evaluator. Used for logging."""
-        return {'discount': self.discount}
+        return {}

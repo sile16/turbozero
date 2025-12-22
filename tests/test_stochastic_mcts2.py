@@ -57,7 +57,6 @@ def mcts_config(branching_factor, stochastic_action_probs):
         "branching_factor": branching_factor,
         "max_nodes": 50, # Keep small for tests
         "num_iterations": 20, # Reduced iterations for faster tests
-        "discount": -1.0, # For two-player games
         "temperature": 0.0, # Greedy selection for testing
         "persist_tree": True,
         "stochastic_action_probs": stochastic_action_probs
@@ -71,9 +70,7 @@ def stochastic_mcts(branching_factor, stochastic_action_probs):
         action_selector=PUCTSelector(),
         branching_factor=branching_factor,
         max_nodes=50, # Keep small for tests
-        num_iterations=20, # Reduced iterations for faster tests
-        discount=-1.0, # For two-player games
-        temperature=0.0, # Greedy selection for testing
+        num_iterations=20, # Reduced iterations for faster tests        temperature=0.0, # Greedy selection for testing
         persist_tree=True,
         stochastic_action_probs=stochastic_action_probs
     )
@@ -86,9 +83,7 @@ def non_persistent_mcts(branching_factor, stochastic_action_probs):
         action_selector=PUCTSelector(),
         branching_factor=branching_factor,
         max_nodes=50, # Keep small for tests
-        num_iterations=20, # Reduced iterations for faster tests
-        discount=-1.0, # For two-player games
-        temperature=0.0, # Greedy selection for testing
+        num_iterations=20, # Reduced iterations for faster tests        temperature=0.0, # Greedy selection for testing
         persist_tree=False, # Non-persistent
         stochastic_action_probs=stochastic_action_probs
     )
@@ -335,7 +330,6 @@ def test_full_tree_edge_case(stochastic_mcts, backgammon_env, key, mock_params):
         max_nodes=10,  # Very small max_nodes to reach capacity quickly
         num_iterations=50,  # Run many iterations to fill the tree
         stochastic_action_probs=stochastic_mcts.stochastic_action_probs,
-        discount=stochastic_mcts.discount,
         temperature=stochastic_mcts.temperature,
         persist_tree=stochastic_mcts.persist_tree
     )
@@ -479,13 +473,11 @@ def test_get_config(stochastic_mcts):
     assert "num_iterations" in config
     assert "branching_factor" in config
     assert "max_nodes" in config
-    assert "discount" in config
     assert "persist_tree" in config
-    
+
     # Check values
     assert config["num_iterations"] == 20
     assert config["branching_factor"] == stochastic_mcts.branching_factor
-    assert config["discount"] == -1.0
     
     print("test_get_config PASSED")
 

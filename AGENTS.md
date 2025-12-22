@@ -157,3 +157,152 @@ JAX broadcasting handles the vector of discounts correctly when multiplied with 
 - Preserve existing formatting, comments, and whitespace
 - Add new functions at end of files when possible
 - Do not refactor existing code unless necessary for correctness
+
+## JAX GPU Performance (2025-12-16)
+
+### Critical: JIT Compilation Required
+
+**Without JIT**: Each `env.step()` call triggers recompilation - 100 steps takes ~42 seconds
+**With JIT**: Same 100 steps takes ~0.04 seconds (1000x speedup)
+
+```python
+# WRONG - triggers recompilation each call
+for i in range(100):
+    state = env.step(state, action, key)
+
+# CORRECT - JIT compile once, reuse
+step_jit = jax.jit(env.step)
+_ = step_jit(state, 0, key)  # Warmup
+for i in range(100):
+    state = step_jit(state, action, key)
+```
+
+### Do NOT Force CPU Mode
+
+Remove any `os.environ['JAX_PLATFORMS'] = 'cpu'` from test scripts. The RTX 4090 provides massive speedups.
+
+### Vectorized Game Evaluation Pattern
+
+For batch evaluation, use `jax.vmap` + `jax.lax.scan`:
+
+```python
+v_init = jax.vmap(env.init)
+v_step = jax.vmap(env.step)
+
+@jax.jit
+def play_batch(key):
+    keys = jax.random.split(key, batch_size)
+    states = v_init(keys)
+    final_rewards = jnp.zeros((batch_size, 2))
+
+    def game_step(carry, _):
+        states, final_rewards, key = carry
+        key, step_key = jax.random.split(key)
+        step_keys = jax.random.split(step_key, batch_size)
+
+        actions = jax.vmap(policy_fn)(states)
+        new_states = v_step(states, actions, step_keys)
+
+        # IMPORTANT: Preserve rewards when games terminate
+        # (pgx resets rewards to 0 when stepping terminated states)
+        newly_terminated = (~states.terminated) & new_states.terminated
+        final_rewards = jnp.where(
+            newly_terminated[:, None],
+            new_states.rewards,
+            final_rewards
+        )
+        return (new_states, final_rewards, key), None
+
+    (_, final_rewards, _), _ = jax.lax.scan(
+        game_step, (states, final_rewards, key), None, length=300
+    )
+    return final_rewards
+```
+
+### pgx Terminated State Behavior
+
+pgx environments reset `rewards` to `[0, 0]` when you step a terminated state. The state stays terminated but rewards are lost. You should call `env.init()` to start a new game.
+
+**Why this matters:** With `jax.lax.scan` running fixed-length loops on batched games, some games finish early but keep getting stepped.
+
+**Solution 1: Track rewards at termination**
+```python
+newly_terminated = (~states.terminated) & new_states.terminated
+final_rewards = jnp.where(newly_terminated[:, None], new_states.rewards, final_rewards)
+```
+
+**Solution 2: Auto-reset wrapper (preferred)**
+```python
+def auto_reset_step(env):
+    @jax.jit
+    def wrapped_step(state, action, key):
+        key, reset_key = jax.random.split(key)
+        next_state = env.step(state, action, key)
+        # If was already terminated, reset instead
+        next_state = jax.lax.cond(
+            state.terminated,
+            lambda: env.init(reset_key),
+            lambda: next_state
+        )
+        return next_state
+    return wrapped_step
+```
+
+The auto-reset wrapper allows continuous `jax.lax.scan` loops where games automatically restart when they end. See also `pgx/pgx/experimental/wrappers.py` for pgx's wrapper implementations.
+
+## pgx Pig Game Notes
+
+### Action Space
+
+- `num_actions = 6` but only actions 0-1 are meaningful for decisions
+- Action 0 = Roll
+- Action 1 = Hold (only legal when `legal_action_mask[1] = True`)
+
+### State Machine
+
+1. **Start of turn**: `_turn_total=0`, only Roll is legal
+2. **After rolling**: `_is_stochastic=True`, both Roll and Hold become legal
+3. **Hold action**: Banks `_turn_total` to `_scores[current_player]`, switches player
+4. **Roll a 1**: Loses all `_turn_total`, switches player (resolved via random key)
+
+### Stochastic States
+
+When `_is_stochastic=True`:
+- The state is a "chance node" where die outcome is pending
+- Both Roll (continue) and Hold (bank points) are legal
+- The random `key` passed to `env.step()` determines the die outcome
+- Action choice (0 or 1) determines whether to continue rolling or hold
+
+### Optimal Strategy
+
+Precomputed optimal strategy available at `/tmp/pig_optimal_strategy.npz`:
+- `V[i,j,k]` = win probability with my_score=i, opp_score=j, turn_total=k
+- `policy[i,j,k]` = 1 if should hold, 0 if should roll
+- Optimal first-player win rate: 52.7%
+
+### Hold-20 Baseline
+
+Simple but effective strategy:
+```python
+def hold20_action(turn_total, legal_mask):
+    should_hold = (turn_total >= 20) & legal_mask[1]
+    return jnp.where(should_hold, 1, 0)
+```
+
+## MCTS Parameters
+
+### `persist_tree` Parameter
+
+- **`persist_tree=True`** (default): Reuses tree between `evaluate()` calls. After taking action A, the subtree at A becomes the new root. More efficient for gameplay.
+
+- **`persist_tree=False`**: Rebuilds tree from scratch each call. Use when you create new tree objects with `mcts.init()` anyway.
+
+### MCTS with Untrained Network
+
+An untrained network will make poor decisions (e.g., holding at turn_total=2 instead of 20). This is expected - the network needs training to learn good policies.
+
+## Test Files
+
+- `tests/jax_pig_eval.py` - Vectorized Hold-20 vs Optimal evaluation (GPU, ~seconds for 5000 games)
+- `tests/jax_mcts_pig_eval.py` - MCTS agent evaluation vs strategies
+- `tests/test_stochastic_pig.py` - StochasticMCTS correctness tests

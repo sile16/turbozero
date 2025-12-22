@@ -67,7 +67,6 @@ def mcts_config(branching_factor, stochastic_action_probs):
         "branching_factor": branching_factor,
         "max_nodes": 50, # Keep small for tests
         "num_iterations": 20, # Reduced iterations for faster tests
-        "discount": -1.0, # For two-player games
         "temperature": 0.0, # Greedy selection for testing
         "persist_tree": True,
         "stochastic_action_probs": stochastic_action_probs
@@ -278,7 +277,6 @@ def test_sample_root_action(stochastic_mcts, backgammon_env, mock_params, key):
         max_nodes=stochastic_mcts.max_nodes,
         num_iterations=stochastic_mcts.num_iterations,
         stochastic_action_probs=stochastic_mcts.stochastic_action_probs,
-        discount=stochastic_mcts.discount,
         temperature=0.0, # Set temp to 0
         persist_tree=stochastic_mcts.persist_tree
     )
@@ -296,7 +294,6 @@ def test_sample_root_action(stochastic_mcts, backgammon_env, mock_params, key):
         max_nodes=stochastic_mcts.max_nodes,
         num_iterations=stochastic_mcts.num_iterations,
         stochastic_action_probs=stochastic_mcts.stochastic_action_probs,
-        discount=stochastic_mcts.discount,
         temperature=1.0, # Set temp to 1.0
         persist_tree=stochastic_mcts.persist_tree
     )
@@ -373,10 +370,9 @@ def test_terminal_node_handling(stochastic_mcts, backgammon_env, mock_params, ke
     print(f"Root data terminated: {root_data.terminated}")
     print(f"Terminal state terminated: {terminal_state.terminated}")
     
-    # The q-value is affected by the discount factor (typically -1.0 for two-player games)
+    # The q-value is from the perspective of the root node's current player
     print(f"Root data q-value: {root_data.q}")
     print(f"Expected reward: {terminal_state.rewards[terminal_state.current_player]}")
-    print(f"Discount factor: {stochastic_mcts.discount}")
     print(f"Sign of q-value: {jnp.sign(root_data.q)}")
     print(f"Sign of reward: {jnp.sign(terminal_state.rewards[terminal_state.current_player])}")
     
@@ -414,7 +410,6 @@ def test_low_iteration_count(stochastic_mcts, backgammon_env, mock_params, key):
         max_nodes=stochastic_mcts.max_nodes,
         num_iterations=1, # Set iterations to 1
         stochastic_action_probs=stochastic_mcts.stochastic_action_probs,
-        discount=stochastic_mcts.discount,
         temperature=stochastic_mcts.temperature,
         persist_tree=stochastic_mcts.persist_tree
     )
@@ -868,9 +863,7 @@ def stochastic_mcts(branching_factor, stochastic_action_probs):
         action_selector=PUCTSelector(),
         branching_factor=branching_factor,
         max_nodes=50, # Keep small for tests
-        num_iterations=20, # Reduced iterations for faster tests
-        discount=-1.0, # For two-player games
-        temperature=0.0, # Greedy selection for testing
+        num_iterations=20, # Reduced iterations for faster tests        temperature=0.0, # Greedy selection for testing
         persist_tree=True,
         stochastic_action_probs=stochastic_action_probs
     )
@@ -883,9 +876,7 @@ def non_persistent_mcts(branching_factor, stochastic_action_probs):
         action_selector=PUCTSelector(),
         branching_factor=branching_factor,
         max_nodes=50, # Keep small for tests
-        num_iterations=20, # Reduced iterations for faster tests
-        discount=-1.0, # For two-player games
-        temperature=0.0, # Greedy selection for testing
+        num_iterations=20, # Reduced iterations for faster tests        temperature=0.0, # Greedy selection for testing
         persist_tree=False, # Non-persistent
         stochastic_action_probs=stochastic_action_probs
     )

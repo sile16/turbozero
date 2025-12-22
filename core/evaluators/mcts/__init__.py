@@ -1,7 +1,8 @@
 from core.evaluators.mcts.mcts import MCTS
 from core.evaluators.mcts.action_selection import MCTSActionSelector
 from core.evaluators.mcts.state import MCTSTree, MCTSNode, MCTSOutput
-from core.evaluators.mcts.stochastic_mcts import StochasticMCTS
+# Note: StochasticMCTS should be imported directly from core.evaluators.mcts.stochastic_mcts
+# to avoid circular import issues
 
 # Configuration class for MCTS
 class MCTSConfig:

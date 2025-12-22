@@ -2,11 +2,20 @@ from typing import Tuple
 import jax
 import jax.numpy as jnp
 import chex
+from chex import dataclass
 from core.evaluators.mcts.action_selection import MCTSActionSelector
 from core.evaluators.mcts.state import BackpropState, MCTSNode, MCTSTree, TraversalState, MCTSOutput
 from core.evaluators.mcts.mcts import MCTS
 from core.evaluators.alphazero import AlphaZero
 from core.types import EnvStepFn, EvalFn, StepMetadata
+
+
+@dataclass(frozen=True)
+class ExpandResult:
+    """Result of expanding child node(s)."""
+    tree: MCTSTree
+    child_idx: int
+    value: float
 
 
 class StochasticMCTS(AlphaZero(MCTS)):
@@ -87,7 +96,7 @@ class StochasticMCTS(AlphaZero(MCTS)):
 
     def evaluate(self, #pylint: disable=arguments-differ
         key: chex.PRNGKey,
-        eval_state: MCTSTree, 
+        eval_state: MCTSTree,
         env_state: chex.ArrayTree,
         root_metadata: StepMetadata,
         params: chex.ArrayTree,
@@ -96,7 +105,7 @@ class StochasticMCTS(AlphaZero(MCTS)):
     ) -> MCTSOutput:
         """Performs `self.num_iterations` MCTS iterations on an `MCTSTree`.
         Samples an action to take from the root node after search is completed.
-        
+
         Args:
         - `eval_state`: `MCTSTree` to evaluate, could be empty or partially complete
         - `env_state`: current environment state
@@ -108,23 +117,18 @@ class StochasticMCTS(AlphaZero(MCTS)):
         - (MCTSOutput): contains new tree state, selected action, root value, and policy weights
         """
         tree = eval_state
-        # NOTE: Don't modify self.num_iterations here - it breaks JAX tracing/JIT compilation
-        # The num_iterations is set in __init__ and should remain constant
+        is_root_stochastic = StochasticMCTS.is_node_idx_stochastic(tree, tree.ROOT_INDEX)
 
-        # Store super class reference for use in nested function
-        super_evaluate = super().evaluate
-        
-        # Define lambda functions that capture all required parameters
-        def true_fn():
-            return self.stochastic_evaluate(key, eval_state, env_state, root_metadata, params, env_step_fn)
-        
-        def false_fn():
-            return super_evaluate(key, eval_state, env_state, root_metadata, params, env_step_fn)
-        
-        return jax.lax.cond(
-            StochasticMCTS.is_node_idx_stochastic(tree, tree.ROOT_INDEX),
-            true_fn,
-            false_fn
+        # Compute both outputs and select based on root stochastic status
+        # This avoids jax.lax.cond which can cause tracing issues with vmap
+        stochastic_output = self.stochastic_evaluate(key, eval_state, env_state, root_metadata, params, env_step_fn)
+        standard_output = super().evaluate(key, eval_state, env_state, root_metadata, params, env_step_fn)
+
+        # Select output using tree_map with where
+        return jax.tree_util.tree_map(
+            lambda a, b: jnp.where(is_root_stochastic, a, b),
+            stochastic_output,
+            standard_output
         )
 
     def stochastic_evaluate(self, #pylint: disable=arguments-differ
@@ -234,85 +238,78 @@ class StochasticMCTS(AlphaZero(MCTS)):
         Returns:
         - The action with the largest delta between observed visit frequency and stochastic probability
         """
-        
+
         num_stochastic_actions = len(self.stochastic_action_probs)
-        
+
         # Get the mapping from edge indices to child node indices, but only for stochastic actions
         child_indices = tree.edge_map[node_idx, :num_stochastic_actions]
-        
+
         # Create a mask for edges that exist (not NULL_INDEX)
         child_exists_mask = child_indices != tree.NULL_INDEX
         unexpanded_mask = ~child_exists_mask
         has_unexpanded = jnp.any(unexpanded_mask)
 
-        def expand_unexpanded(k):
-            # Prefer higher-probability outcomes first (reduces early expectimax bias),
-            # but still guarantees all outcomes get expanded before probability-matching.
-            masked_probs = jnp.where(unexpanded_mask, self.stochastic_action_probs, -jnp.inf)
-            k, noise_key = jax.random.split(k)
-            masked_probs = masked_probs + jax.random.normal(noise_key, masked_probs.shape) * self.noise_scale
-            return jnp.argmax(masked_probs)
+        # Split key for both branches
+        k1, k2 = jax.random.split(key)
 
-        def probability_match(k):
-            # For vectorized child visit count retrieval, we need to handle NULL_INDEX
-            # We'll replace NULL_INDEX with 0 for array access, then mask the result
-            safe_indices = jnp.maximum(child_indices, 0)  # Replace -1 with 0 for safe access
-            
-            # Vectorized access to visit counts - get n for all safe_indices
-            # Shape: (num_stochastic_actions,)
-            all_n = tree.data.n[safe_indices]
-            
-            # Apply mask to zero out non-existent children
-            # Shape: (num_stochastic_actions,)
-            child_visits = jnp.where(child_exists_mask, all_n, 0)
-            
-            # Calculate total visits
-            total_visits = jnp.sum(child_visits)
-            
-            # Normalize visit counts; handle the case where total_visits=0
-            normalized_visits = jnp.where(
-                total_visits > 0,
-                child_visits / total_visits,
-                # If total_visits=0, use a uniform distribution
-                jnp.ones_like(child_visits, dtype=jnp.float32) / num_stochastic_actions
-            )
-            
-            # Calculate deltas between actual visit frequencies and theoretical probabilities
-            # Now both arrays have shape (num_stochastic_actions,)
-            # NOTE: This selects actions that are under-visited relative to their probability.
-            # LIMITATION: This approach may miss low-probability but high-reward actions.
-            # If some stochastic outcomes have small probabilities but lead to significantly
-            # better rewards, this selector will under-explore them since it only balances
-            # visit frequency with theoretical probability.
-            delta = self.stochastic_action_probs - normalized_visits
-            
-            # Add some noise to break ties
-            k, noise_key = jax.random.split(k)
-            delta = delta + jax.random.normal(noise_key, delta.shape) * self.noise_scale
-            
-            # Return the action with the biggest delta
-            return jnp.argmax(delta)
+        # Compute expand_unexpanded action
+        # Prefer higher-probability outcomes first (reduces early expectimax bias)
+        masked_probs_expand = jnp.where(unexpanded_mask, self.stochastic_action_probs, -jnp.inf)
+        _, noise_key1 = jax.random.split(k1)
+        masked_probs_expand = masked_probs_expand + jax.random.normal(noise_key1, masked_probs_expand.shape) * self.noise_scale
+        expand_action = jnp.argmax(masked_probs_expand)
 
-        return jax.lax.cond(has_unexpanded, expand_unexpanded, probability_match, key)
+        # Compute probability_match action
+        # For vectorized child visit count retrieval, we need to handle NULL_INDEX
+        safe_indices = jnp.maximum(child_indices, 0)  # Replace -1 with 0 for safe access
+
+        # Vectorized access to visit counts
+        all_n = tree.data.n[safe_indices]
+
+        # Apply mask to zero out non-existent children
+        child_visits = jnp.where(child_exists_mask, all_n, 0)
+
+        # Calculate total visits
+        total_visits = jnp.sum(child_visits)
+
+        # Normalize visit counts; handle the case where total_visits=0
+        normalized_visits = jnp.where(
+            total_visits > 0,
+            child_visits / total_visits,
+            jnp.ones_like(child_visits, dtype=jnp.float32) / num_stochastic_actions
+        )
+
+        # Calculate deltas between actual visit frequencies and theoretical probabilities
+        delta = self.stochastic_action_probs - normalized_visits
+
+        # Add some noise to break ties
+        _, noise_key2 = jax.random.split(k2)
+        delta = delta + jax.random.normal(noise_key2, delta.shape) * self.noise_scale
+
+        # Return the action with the biggest delta
+        match_action = jnp.argmax(delta)
+
+        # Select between expand and match based on has_unexpanded
+        return jnp.where(has_unexpanded, expand_action, match_action)
     
     
 
     def cond_action_selector(self, key: chex.PRNGKey, tree: MCTSTree, node_idx: int) -> int:
         """Select an action from the node, picks the right action selector based on the node type.
         We can't just override the action_selector in the base class as we need to pass in the key.
-        
+
         Args:
         - `tree`: MCTSTree to evaluate
         - `node_idx`: index of the node to select an action from
         """
+        is_stochastic = StochasticMCTS.is_node_idx_stochastic(tree, node_idx)
 
-        # Create lambda functions that capture all required parameters
-        return jax.lax.cond(
-            StochasticMCTS.is_node_idx_stochastic(tree, node_idx), 
-            self.stochastic_action_selector,
-            self.deterministic_action_selector,
-            key, tree, node_idx
-        )
+        # Compute both actions and select based on node type
+        # This avoids nested conds which can cause tracing issues with vmap
+        stochastic_action = self.stochastic_action_selector(key, tree, node_idx)
+        deterministic_action = self.deterministic_action_selector(key, tree, node_idx)
+
+        return jnp.where(is_stochastic, stochastic_action, deterministic_action)
     
     
     def value_policy(self, embedding, params, eval_key, metadata, player_reward) -> Tuple[float, chex.Array]:
@@ -327,178 +324,172 @@ class StochasticMCTS(AlphaZero(MCTS)):
 
 
     def iterate(self, key: chex.PRNGKey, tree: MCTSTree, params: chex.ArrayTree, env_step_fn: EnvStepFn) -> MCTSTree:
-        """ Performs one iteration of MCTS.
-        1. Traverse to leaf node.
-        2. Evaluate Leaf Node
-        3. Expand Leaf Node (add to tree)
-        4. Backpropagate
+        """Performs one iteration of MCTS with stochastic support.
 
-        Args:
-        - `tree`: MCTSTree to evaluate
-        - `params`: parameters to pass to the the leaf evaluation function
-        - `env_step_fn`: env step fn: (env_state, action) -> (new_env_state, metadata)
+        Key design: Check stochasticity ONCE after traverse, then branch to either:
+        - Single child expansion (deterministic parent)
+        - All children expansion (stochastic parent with unexpanded children)
 
-        Returns:
-        - (MCTSTree): updated MCTSTree
+        For vmap compatibility, we compute both paths and use jnp.where to select.
+        This ensures uniform computation across the batch.
         """
-        # traverse from root -> leaf
-        traversal_state = self.traverse(key, tree)
-        parent, action = traversal_state.parent, traversal_state.action
-        # get env state (embedding) for leaf node
-        # OPTIMIZATION: Direct access to embedding instead of data_at() which reconstructs entire node
-        embedding = jax.tree_util.tree_map(lambda x: x[parent], tree.data.embedding)
-        
-        # Split key for step function and evaluation
-        step_key, eval_key, key = jax.random.split(key, 3)
+        traverse_key, expand_key, backprop_key = jax.random.split(key, 3)
 
+        # Traverse from root to leaf
+        traversal_state = self.traverse(traverse_key, tree)
+        parent, action = traversal_state.parent, traversal_state.action
+
+        # Check ONCE if parent is stochastic
         is_parent_stochastic = StochasticMCTS.is_node_idx_stochastic(tree, parent)
 
-        def deterministic_parent_branch():
-            new_embedding, metadata = env_step_fn(embedding, action, step_key)
+        # Check if all stochastic children already exist
+        all_children_exist = self._all_stochastic_children_exist(tree, parent)
+
+        # We need expand_all when: parent is stochastic AND not all children exist yet
+        needs_expand_all = jnp.logical_and(is_parent_stochastic, ~all_children_exist)
+
+        # Compute BOTH expansion strategies (for vmap compatibility)
+        # JAX will trace both paths but only execute the selected one at runtime
+        single_result = self._expand_single_child(expand_key, tree, parent, action, params, env_step_fn)
+        all_result = self._expand_all_stochastic_children(expand_key, tree, parent, params, env_step_fn)
+
+        # Select result based on whether we need to expand all stochastic children
+        final_tree = jax.tree_util.tree_map(
+            lambda a, b: jnp.where(needs_expand_all, a, b),
+            all_result.tree, single_result.tree
+        )
+        final_value = jnp.where(needs_expand_all, all_result.value, single_result.value)
+        final_child = jnp.where(needs_expand_all, all_result.child_idx, single_result.child_idx)
+
+        # Backpropagate from the expanded child
+        return self.backpropagate(backprop_key, final_tree, parent, final_child, final_value)
+
+    def _all_stochastic_children_exist(self, tree: MCTSTree, node_idx: int) -> bool:
+        """Check if all stochastic outcome children exist for a node."""
+        num_stochastic = len(self.stochastic_action_probs)
+        child_indices = tree.edge_map[node_idx, :num_stochastic]
+        return jnp.all(child_indices != tree.NULL_INDEX)
+
+    def _expand_single_child(self, key: chex.PRNGKey, tree: MCTSTree, parent: int, action: int,
+                              params: chex.ArrayTree, env_step_fn: EnvStepFn) -> ExpandResult:
+        """Expand a single child node (standard MCTS expansion)."""
+        step_key, eval_key = jax.random.split(key)
+
+        # Get parent embedding and step
+        embedding = jax.tree_util.tree_map(lambda x: x[parent], tree.data.embedding)
+        new_embedding, metadata = env_step_fn(embedding, action, step_key)
+        player_reward = metadata.rewards[metadata.cur_player_id]
+
+        value, policy = self.value_policy(new_embedding, params, eval_key, metadata, player_reward)
+
+        node_exists = tree.is_edge(parent, action)
+        node_idx = tree.edge_map[parent, action]
+
+        def update_existing_node():
+            return StochasticMCTS._update_node_stats(tree, node_idx, value)
+
+        def add_new_node():
+            node_data = self.new_node(policy=policy, value=value, embedding=new_embedding, terminated=metadata.terminated)
+            return tree.add_node(parent_index=parent, edge_index=action, data=node_data)
+
+        updated_tree = jax.lax.cond(node_exists, update_existing_node, add_new_node)
+        child_idx = updated_tree.edge_map[parent, action]
+
+        return ExpandResult(tree=updated_tree, child_idx=child_idx, value=value)
+
+    def _expand_all_stochastic_children(self, key: chex.PRNGKey, tree: MCTSTree, parent: int,
+                                         params: chex.ArrayTree, env_step_fn: EnvStepFn) -> ExpandResult:
+        """Expand ALL stochastic outcome children at once.
+
+        This ensures proper expectimax values from the first backpropagation by having
+        all children available for the weighted average computation.
+
+        Uses jax.lax.scan for vmap compatibility - no dynamic branching.
+        """
+        num_stochastic = len(self.stochastic_action_probs)
+
+        # Get parent embedding
+        parent_embedding = jax.tree_util.tree_map(lambda x: x[parent], tree.data.embedding)
+
+        # Generate keys for each child
+        keys = jax.random.split(key, num_stochastic + 1)
+        child_keys = keys[1:]  # One key per stochastic outcome
+
+        # Expand all children using scan (sequential but traceable)
+        def expand_one_child(carry, inputs):
+            tree, parent_emb = carry
+            action, child_key = inputs
+            step_key, eval_key = jax.random.split(child_key)
+
+            # Step the environment
+            new_embedding, metadata = env_step_fn(parent_emb, action, step_key)
             player_reward = metadata.rewards[metadata.cur_player_id]
 
+            # Get value and policy
             value, policy = self.value_policy(new_embedding, params, eval_key, metadata, player_reward)
 
-            # add leaf node to tree
-            node_exists = tree.is_edge(parent, action)
-            node_idx = tree.edge_map[parent, action]
+            # Check if child already exists
+            child_exists = tree.is_edge(parent, action)
+            existing_idx = tree.edge_map[parent, action]
 
-            # OPTIMIZATION: For existing nodes, only update n/q stats (not the full node with embedding)
-            # For new nodes, create the full node and add to tree
-            def update_existing_node():
-                # Only update n and q - embedding/policy/terminated are unchanged for revisits
-                return StochasticMCTS._update_node_stats(tree, node_idx, value)
+            # Create node data
+            node_data = self.new_node(policy=policy, value=value, embedding=new_embedding, terminated=metadata.terminated)
 
-            def add_new_node():
-                node_data = self.new_node(policy=policy, value=value, embedding=new_embedding, terminated=metadata.terminated)
-                return tree.add_node(parent_index=parent, edge_index=action, data=node_data)
+            # Add node or update existing - use jnp.where to avoid cond
+            # If child exists, update stats; if not, add new node
+            tree_with_new = tree.add_node(parent_index=parent, edge_index=action, data=node_data)
+            tree_updated = StochasticMCTS._update_node_stats(tree, existing_idx, value)
 
-            updated_tree = jax.lax.cond(node_exists, update_existing_node, add_new_node)
+            # Select which tree to use based on whether child exists
+            new_tree = jax.tree_util.tree_map(
+                lambda a, b: jnp.where(child_exists, a, b),
+                tree_updated, tree_with_new
+            )
 
-            # Get the correct node index after adding/updating
-            node_idx2 = jnp.where(node_exists, node_idx, updated_tree.next_free_idx - 1)
+            return (new_tree, parent_emb), value
 
-            # backpropagate
-            return self.backpropagate(key, updated_tree, parent, node_idx2, value)
+        # Create action indices
+        actions = jnp.arange(num_stochastic, dtype=jnp.int32)
 
-        def stochastic_parent_branch():
-            num_stochastic_actions = len(self.stochastic_action_probs)
-            child_indices = tree.edge_map[parent, :num_stochastic_actions]
-            child_exists_mask = child_indices != tree.NULL_INDEX
-            has_unexpanded = jnp.any(~child_exists_mask)
+        # Run scan over all stochastic actions
+        (final_tree, _), child_values = jax.lax.scan(
+            expand_one_child,
+            (tree, parent_embedding),
+            (actions, child_keys)
+        )
 
-            def expand_all_children():
-                actions = jnp.arange(num_stochastic_actions, dtype=jnp.int32)
-                step_keys = jax.random.split(step_key, num_stochastic_actions)
-                eval_keys = jax.random.split(eval_key, num_stochastic_actions)
+        # Compute expectimax value across all children
+        expectimax_value = jnp.sum(self.stochastic_action_probs * child_values)
 
-                new_embeddings, metadatas = jax.vmap(env_step_fn, in_axes=(None, 0, 0))(embedding, actions, step_keys)
+        # Return first child index (all children exist now, backprop will use expectimax)
+        first_child_idx = final_tree.edge_map[parent, 0]
 
-                batch_idx = jnp.arange(num_stochastic_actions, dtype=jnp.int32)
-                player_rewards = metadatas.rewards[batch_idx, metadatas.cur_player_id]
-
-                values, policies = jax.vmap(self.value_policy, in_axes=(0, None, 0, 0, 0))(
-                    new_embeddings, params, eval_keys, metadatas, player_rewards
-                )
-
-                node_datas = jax.vmap(
-                    lambda pol, val, emb, term: self.new_node(policy=pol, value=val, embedding=emb, terminated=term),
-                    in_axes=(0, 0, 0, 0),
-                )(policies, values, new_embeddings, metadatas.terminated)
-
-                def add_one(i, t):
-                    edge_exists = t.is_edge(parent, i)
-
-                    def add_missing():
-                        node_i = jax.tree_util.tree_map(lambda x: x[i], node_datas)
-                        return t.add_node(parent_index=parent, edge_index=i, data=node_i)
-
-                    return jax.lax.cond(edge_exists, lambda: t, add_missing)
-
-                expanded_tree = jax.lax.fori_loop(0, num_stochastic_actions, add_one, tree)
-
-                # Update the stochastic parent with the expectimax value now that all outcomes exist.
-                expected_value = self.compute_expectimax_value(expanded_tree, parent)
-                expanded_tree = StochasticMCTS._update_node_stats(expanded_tree, parent, expected_value)
-
-                parent_idx = expanded_tree.parents[parent]
-
-                def propagate_to_ancestors():
-                    return self.backpropagate(key, expanded_tree, parent_idx, parent, expected_value)
-
-                return jax.lax.cond(parent == expanded_tree.ROOT_INDEX, lambda: expanded_tree, propagate_to_ancestors)
-
-            def single_outcome():
-                # All chance outcomes already exist: follow the selected outcome as a normal iteration.
-                new_embedding, metadata = env_step_fn(embedding, action, step_key)
-                player_reward = metadata.rewards[metadata.cur_player_id]
-                value, policy = self.value_policy(new_embedding, params, eval_key, metadata, player_reward)
-
-                node_exists = tree.is_edge(parent, action)
-                node_idx = tree.edge_map[parent, action]
-
-                def update_existing_node():
-                    return StochasticMCTS._update_node_stats(tree, node_idx, value)
-
-                def add_new_node():
-                    node_data = self.new_node(policy=policy, value=value, embedding=new_embedding, terminated=metadata.terminated)
-                    return tree.add_node(parent_index=parent, edge_index=action, data=node_data)
-
-                updated_tree = jax.lax.cond(node_exists, update_existing_node, add_new_node)
-                node_idx2 = jnp.where(node_exists, node_idx, updated_tree.next_free_idx - 1)
-                return self.backpropagate(key, updated_tree, parent, node_idx2, value)
-
-            return jax.lax.cond(has_unexpanded, expand_all_children, single_outcome)
-
-        return jax.lax.cond(is_parent_stochastic, stochastic_parent_branch, deterministic_parent_branch)
+        return ExpandResult(tree=final_tree, child_idx=first_child_idx, value=expectimax_value)
 
 
     def traverse(self, key: chex.PRNGKey, tree: MCTSTree) -> TraversalState:
         """Traverse from the root node until an unvisited leaf node is reached.
-        Needed to be overridden as we need to pass in the key to action selector.
-        And to use different action selectors for stochastic and deterministic nodes.
-        Args:
-        - `tree`: MCTSTree to evaluate
-        
-        Returns:
-        - (TraversalState): state of the traversal
-            - `parent`: index of the parent node
-            - `action`: action to take from the parent node
+        Uses different action selectors for stochastic and deterministic nodes.
         """
-        
         # Split key for root action and body iterations
         root_key, body_key = jax.random.split(key)
 
-        # continue while:
-        # - there is an existing edge corresponding to the chosen action
-        # - AND the child node connected to that edge is not terminal
         def cond_fn(state: TraversalState) -> bool:
-            # OPTIMIZATION: Direct array access instead of data_at() for terminated check
             child_idx = tree.edge_map[state.parent, state.action]
-            # Use safe index for array access (in case child_idx is NULL_INDEX)
             safe_child_idx = jnp.maximum(child_idx, 0)
             child_terminated = tree.data.terminated[safe_child_idx]
             return jnp.logical_and(
                 tree.is_edge(state.parent, state.action),
                 ~child_terminated
-                # TODO: maximum depth
             )
 
-        # each iterration:
-        # - get the index of the child node connected to the chosen action
-        # - choose the action to take from the child node
         def body_fn(state: TraversalState) -> TraversalState:
             node_idx = tree.edge_map[state.parent, state.action]
-             
-            # Generate unique key for this iteration based on parent and action
-            # This ensures different randomness for each traversal step
             iteration_key = jax.random.fold_in(body_key, node_idx * tree.branching_factor + state.action)
             action = self.cond_action_selector(iteration_key, tree, node_idx)
             return TraversalState(parent=node_idx, action=action)
-        
-        # the action to take from the root
+
         root_action = self.cond_action_selector(root_key, tree, tree.ROOT_INDEX)
-        # traverse from root to leaf
         return jax.lax.while_loop(
             cond_fn, body_fn,
             TraversalState(parent=tree.ROOT_INDEX, action=root_action)
@@ -601,72 +592,34 @@ class StochasticMCTS(AlphaZero(MCTS)):
         return tree.replace(data=new_data)
 
     def backpropagate(self, key: chex.PRNGKey, tree: MCTSTree, parent: int, child: int, value: float) -> MCTSTree:
-        """Backpropagate the value estimate from the leaf node to the root node and update visit counts.
-
-        Uses expectimax for stochastic nodes: the value propagated from a stochastic node
-        is the expected value (weighted sum of child values by their probabilities).
-
-        Args:
-        - `key`: rng
-        - `tree`: MCTSTree to evaluate
-        - `parent`: index of the parent node
-        - `child`: index of the child node
-        - `value`: value estimate of the leaf node
-
-        Returns:
-        - (MCTSTree): updated search tree
-        """
-        # Store reference to self for use in nested function
+        """Backpropagate with expectimax for stochastic nodes."""
         compute_expectimax = self.compute_expectimax_value
+        root_index = tree.ROOT_INDEX
 
         def body_fn(state: BackpropState) -> BackpropState:
             node_idx, value, tree = state.node_idx, state.value, state.tree
-
-            # OPTIMIZATION: Use partial update (only n and q) instead of full node reconstruction
             tree = StochasticMCTS._update_node_stats(tree, node_idx, value)
-
-            # go to parent
             parent_idx = tree.parents[node_idx]
-
             child_and_parent_value_discount = self.calculate_discount_factor(tree, parent_idx, node_idx)
-
-            # For stochastic nodes, use expectimax value instead of sampled value
-            # The expectimax value is the weighted sum of all child values
             is_stochastic = StochasticMCTS.is_node_idx_stochastic(tree, node_idx)
-
-            # Use expectimax value for stochastic nodes, sampled value for deterministic
-            # OPTIMIZATION: expectimax calculation is now INSIDE the cond, so it only
-            # runs for stochastic nodes (lazy evaluation)
-            value_to_propagate = jax.lax.cond(
-                is_stochastic,
-                lambda: compute_expectimax(tree, node_idx),  # Only computed when stochastic
-                lambda: value
-            )
-
+            expectimax_value = compute_expectimax(tree, node_idx)
+            value_to_propagate = jnp.where(is_stochastic, expectimax_value, value)
             value_to_propagate *= child_and_parent_value_discount
-
             return BackpropState(node_idx=parent_idx, value=value_to_propagate, tree=tree)
 
         child_and_parent_value_discount = self.calculate_discount_factor(tree, parent, child)
-
         value *= child_and_parent_value_discount
         state = BackpropState(node_idx=parent, value=value, tree=tree)
 
-        # Backpropagate until we reach the root
         state = jax.lax.while_loop(
-            lambda s: s.node_idx != s.tree.ROOT_INDEX,
+            lambda s: s.node_idx != root_index,
             body_fn,
             state
         )
 
-        # Update the root node - also use optimized partial update
         is_root_stochastic = StochasticMCTS.is_node_idx_stochastic(state.tree, state.node_idx)
-        final_value = jax.lax.cond(
-            is_root_stochastic,
-            lambda: compute_expectimax(state.tree, state.node_idx),
-            lambda: state.value
-        )
-
+        expectimax_root = compute_expectimax(state.tree, state.node_idx)
+        final_value = jnp.where(is_root_stochastic, expectimax_root, state.value)
         tree = StochasticMCTS._update_node_stats(state.tree, state.node_idx, final_value)
 
         return tree

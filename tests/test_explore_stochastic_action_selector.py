@@ -77,7 +77,6 @@ def test_explore_stochastic_action_selector():
         branching_factor=branching_factor,
         max_nodes=10,
         num_iterations=10,
-        discount=-1.0,
         stochastic_action_probs=stochastic_probs,
         noise_scale=0.0  # Set noise to 0 for deterministic testing
     )
@@ -160,7 +159,6 @@ def test_explore_stochastic_action_selector_with_missing_children():
         branching_factor=branching_factor,
         max_nodes=10,
         num_iterations=10,
-        discount=-1.0,
         stochastic_action_probs=stochastic_probs,
         noise_scale=0.0  # Set noise to 0 for deterministic testing
     )

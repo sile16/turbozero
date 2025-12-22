@@ -133,9 +133,9 @@ def bg_pip_count_eval(state: chex.ArrayTree, params: chex.ArrayTree, key: chex.P
 class BGRandomEvaluator(Evaluator):
     """An evaluator that selects actions randomly from legal moves."""
 
-    def __init__(self, discount: float = -1.0):
+    def __init__(self):
         """Initializes the RandomEvaluator."""
-        super().__init__(discount=discount)
+        super().__init__()
 
     def evaluate(self, key: chex.PRNGKey, eval_state: chex.ArrayTree, env_state: chex.ArrayTree,
                  root_metadata: StepMetadata, params: chex.ArrayTree, env_step_fn: EnvStepFn, **kwargs) -> EvalOutput:

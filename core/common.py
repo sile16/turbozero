@@ -198,13 +198,8 @@ def two_player_game_step(
 
     
     active_eval_state = output.eval_state
+    # Value estimate is already from the root player's perspective after backpropagation
     active_value_estimate = active_evaluator.get_value(active_eval_state)
-    active_value_estimate = jax.lax.cond(
-        terminated | truncated,
-        lambda a: a,
-        lambda a: active_evaluator.discount * a,
-        active_value_estimate
-    )
     # update the other evaluator
     other_eval_state = other_evaluator.step(other_eval_state, output.action)
     other_value_estimate = other_evaluator.get_value(other_eval_state)

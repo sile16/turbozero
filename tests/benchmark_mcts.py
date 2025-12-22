@@ -233,7 +233,6 @@ def benchmark_stochastic_mcts_with_different_nodes(max_nodes_list, iterations_pe
             branching_factor=env.num_actions,
             max_nodes=max_nodes,
             num_iterations=50,
-            discount=-1.0,
             temperature=1.0,
             noise_scale=0.05
         )

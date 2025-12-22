@@ -39,7 +39,6 @@ def test_stochastic_mcts_backgammon_simple_doubles_valid_actions():
         max_nodes=200, 
         num_iterations=20, # Player 0 iterations
         stochastic_action_probs=env.stochastic_action_probs,
-        discount=-1.0,
         temperature=0.0, # Greedy action selection
         persist_tree=True, # Player 0 persists tree
     )
@@ -51,7 +50,6 @@ def test_stochastic_mcts_backgammon_simple_doubles_valid_actions():
         max_nodes=200, 
         num_iterations=1, # Player 1 iterations
         stochastic_action_probs=env.stochastic_action_probs,
-        discount=-1.0,
         temperature=0.0, # Greedy action selection
         persist_tree=False, # Player 1 does NOT persist tree
     )
@@ -188,7 +186,6 @@ def test_traverse_through_stochastic_nodes():
         max_nodes=500,  # Large enough to store many nodes
         num_iterations=400,  # Enough iterations to explore deeply
         stochastic_action_probs=env.stochastic_action_probs,
-        discount=-1.0,
         temperature=1.0,  # Some exploration temperature
         persist_tree=True # Enable some debugging output
     )
@@ -317,7 +314,6 @@ def test_backpropagate_through_turn():
         max_nodes=500,  # Large enough to store many nodes
         num_iterations=3,  
         stochastic_action_probs=env.stochastic_action_probs,
-        discount=1.0,
         temperature=0.1,  # Some exploration temperature
         persist_tree=True # Enable some debugging output
     )
@@ -350,7 +346,6 @@ def test_stochastic_action_sample():
         max_nodes=4,  # Large enough to store many nodes
         num_iterations=2,  
         stochastic_action_probs=env.stochastic_action_probs,
-        discount=1.0,
         temperature=0.1,  # Some exploration temperature
         persist_tree=True # Enable some debugging output
     )
