@@ -305,6 +305,16 @@ class Trainer:
             )
         
         # store experience in replay buffer
+        # Check if this is a chance node (stochastic state) - skip policy loss for these
+        # ONLY set is_chance_node=True for evaluators that explicitly handle chance nodes
+        # (like StochasticMCTS). For regular MCTS, all nodes are treated as decision nodes.
+        if getattr(self.evaluator_train, 'handles_chance_nodes', False):
+            is_chance_node = getattr(state.metadata, 'is_stochastic', None)
+            if is_chance_node is None:
+                is_chance_node = jnp.array(False)
+        else:
+            is_chance_node = jnp.array(False)
+
         buffer_state = self.memory_buffer.add_experience(
             state = state.buffer_state,
             experience = BaseExperience(
@@ -312,10 +322,11 @@ class Trainer:
                 policy_mask=state.metadata.action_mask,
                 policy_weights=eval_output.policy_weights,
                 reward=jnp.empty_like(state.metadata.rewards),
-                cur_player_id=state.metadata.cur_player_id
+                cur_player_id=state.metadata.cur_player_id,
+                is_chance_node=is_chance_node
             )
         )
-        # apply transforms 
+        # apply transforms
         for transform_fn in self.transform_fns:
             t_policy_mask, t_policy_weights, t_env_state = transform_fn(
                 state.metadata.action_mask,
@@ -329,7 +340,8 @@ class Trainer:
                     policy_mask=t_policy_mask,
                     policy_weights=t_policy_weights,
                     reward=jnp.empty_like(state.metadata.rewards),
-                    cur_player_id=state.metadata.cur_player_id
+                    cur_player_id=state.metadata.cur_player_id,
+                    is_chance_node=is_chance_node
                 )
             )
         # assign rewards to buffer if episode is terminated
@@ -681,17 +693,26 @@ class Trainer:
     def make_template_experience(self) -> BaseExperience:
         """Create a template experience used for initializing data structures
         that hold experiences to the correct shape.
-        
+
         Returns:
         - (BaseExperience): template experience
         """
         env_state, metadata = self.env_init_fn(jax.random.PRNGKey(0))
+        # Get is_stochastic from metadata if available, but only use it for
+        # evaluators that explicitly handle chance nodes
+        if getattr(self.evaluator_train, 'handles_chance_nodes', False):
+            is_chance_node = getattr(metadata, 'is_stochastic', None)
+            if is_chance_node is None:
+                is_chance_node = jnp.array(False)
+        else:
+            is_chance_node = jnp.array(False)
         return BaseExperience(
             observation_nn=self.state_to_nn_input_fn(env_state),
             policy_mask=metadata.action_mask,
             policy_weights=jnp.zeros_like(metadata.action_mask, dtype=jnp.float32),
             reward=jnp.zeros_like(metadata.rewards),
-            cur_player_id=metadata.cur_player_id
+            cur_player_id=metadata.cur_player_id,
+            is_chance_node=is_chance_node
         )
     
 

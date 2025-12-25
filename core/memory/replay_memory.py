@@ -13,12 +13,14 @@ class BaseExperience:
     - `policy_mask`: mask for policy weights (mask out invalid/illegal actions)
     - `observation_nn`: observation for neural network input
     - `cur_player_id`: current player id
+    - `is_chance_node`: True if this sample is from a chance node (skip policy loss)
     """
     reward: chex.Array
     policy_weights: chex.Array
     policy_mask: chex.Array
     observation_nn: chex.Array
     cur_player_id: chex.Array
+    is_chance_node: chex.Array = None  # Optional: True = skip policy loss for this sample
 
 
 @dataclass(frozen=True)

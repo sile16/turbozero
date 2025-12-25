@@ -10,7 +10,7 @@ from core.trees.tree import Tree
 
 @dataclass(frozen=True)
 class MCTSNode:
-    """Base MCTS node data strucutre.
+    """Base MCTS node data structure.
     - `n`: visit count
     - `p`: policy vector
     - `q`: cumulative value estimate / visit count
@@ -27,6 +27,26 @@ class MCTSNode:
     def w(self) -> jnp.number:
         """cumulative value estimate"""
         return self.q * self.n
+
+
+@dataclass(frozen=True)
+class StochasticMCTSNode(MCTSNode):
+    """MCTS node with additional fields for stochastic games.
+
+    Extends MCTSNode with:
+    - `is_chance_node`: whether this is a chance node (stochastic state)
+    - `nn_value_estimate`: NN value estimate for blending at chance nodes
+    - `expanded_outcomes`: bool mask of which outcomes have been expanded
+    - `outcome_probs`: probability distribution over outcomes (for chance nodes)
+    """
+    is_chance_node: jnp.number  # bool
+    nn_value_estimate: jnp.number  # float - stored NN estimate for blending
+    expanded_outcomes: chex.Array  # bool array (num_outcomes,)
+    outcome_probs: chex.Array  # float array (num_outcomes,) - outcome probabilities
+
+
+# Type alias for stochastic MCTS tree
+StochasticMCTSTree = Tree[StochasticMCTSNode]
 
 
 # an MCTSTree is a Tree containing MCTSNodes

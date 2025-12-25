@@ -128,18 +128,23 @@ class PUCTSelector(MCTSActionSelector):
         u_values = self.c * node.p * jnp.sqrt(node.n) / (n_values + 1)
         # PUCT = Q-value + U-value
         puct_values = q_values + u_values
-        
-        # === FIX: Apply legal action mask ===
-        # Get the legal action mask from the node's embedding
-        legal_action_mask = node.embedding.legal_action_mask
+
+        # Apply legal action mask
         # Mask out illegal actions by setting their PUCT value to negative infinity
+        legal_action_mask = node.embedding.legal_action_mask
+        # Handle shape mismatch: mask may be smaller than puct_values (e.g., 4 vs 32 for stochastic games)
+        mask_size = legal_action_mask.shape[-1]
+        puct_size = puct_values.shape[-1]
+        if mask_size < puct_size:
+            # Pad mask with False (illegal) for extra actions
+            padded_mask = jnp.zeros(puct_size, dtype=bool)
+            padded_mask = padded_mask.at[:mask_size].set(legal_action_mask)
+            legal_action_mask = padded_mask
         masked_puct_values = jnp.where(legal_action_mask, puct_values, jnp.finfo(puct_values.dtype).min)
-        # === END FIX ===
-        
+
         # select action with highest PUCT value (from legal actions)
         return masked_puct_values.argmax()
-    
-    
+
 
 class MuZeroPUCTSelector(MCTSActionSelector):
     """Implements the variant of PUCT used in MuZero."""
@@ -212,13 +217,19 @@ class MuZeroPUCTSelector(MCTSActionSelector):
         u_values = base_term * log_term
         # PUCT = Q-value + U-value
         puct_values = q_values + u_values
-        
-        # === FIX: Apply legal action mask ===
-        # Get the legal action mask from the node's embedding
-        legal_action_mask = node.embedding.legal_action_mask
+
+        # Apply legal action mask
         # Mask out illegal actions by setting their PUCT value to negative infinity
+        legal_action_mask = node.embedding.legal_action_mask
+        # Handle shape mismatch: mask may be smaller than puct_values (e.g., 4 vs 32 for stochastic games)
+        mask_size = legal_action_mask.shape[-1]
+        puct_size = puct_values.shape[-1]
+        if mask_size < puct_size:
+            # Pad mask with False (illegal) for extra actions
+            padded_mask = jnp.zeros(puct_size, dtype=bool)
+            padded_mask = padded_mask.at[:mask_size].set(legal_action_mask)
+            legal_action_mask = padded_mask
         masked_puct_values = jnp.where(legal_action_mask, puct_values, jnp.finfo(puct_values.dtype).min)
-        # === END FIX ===
-        
+
         # select action with highest PUCT value (from legal actions)
         return masked_puct_values.argmax()

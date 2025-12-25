@@ -91,3 +91,15 @@ class Evaluator:
     def get_config(self) -> Dict:
         """Returns the configuration of the Evaluator. Used for logging."""
         return {}
+
+    @property
+    def handles_chance_nodes(self) -> bool:
+        """Whether this evaluator explicitly handles chance nodes (stochastic states).
+
+        If True, the trainer should skip policy loss for chance nodes because the
+        evaluator returns placeholder policy weights for them.
+
+        If False (default), the evaluator treats all nodes as decision nodes and
+        produces meaningful policy weights for all states.
+        """
+        return False

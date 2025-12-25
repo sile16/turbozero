@@ -357,6 +357,14 @@ class MCTS(Evaluator):
         # game state but are illegal in the CURRENT state. We must mask these out
         # to avoid putting probability mass on illegal actions in policy_weights.
         if action_mask is not None:
+            # Handle shape mismatch: mask may be smaller than action_visits (stochastic games)
+            mask_size = action_mask.shape[-1]
+            visits_size = action_visits.shape[-1]
+            if mask_size < visits_size:
+                # Pad mask with False (illegal) for extra actions
+                padded_mask = jnp.zeros(visits_size, dtype=bool)
+                padded_mask = padded_mask.at[:mask_size].set(action_mask)
+                action_mask = padded_mask
             action_visits = jnp.where(action_mask, action_visits, 0)
 
         # normalize visit counts to get policy weights

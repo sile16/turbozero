@@ -18,17 +18,22 @@ class _AlphaZero:
     def __init__(self,
         dirichlet_alpha: float = 0.3,
         dirichlet_epsilon: float = 0.25,
+        policy_size: int = None,
         **kwargs
     ):
         """
         Args:
         - `dirichlet_alpha`: magnitude of Dirichlet noise.
         - `dirichlet_epsilon`: proportion of root policy composed of Dirichlet noise.
+        - `policy_size`: size of neural network policy output. Defaults to branching_factor.
+          For stochastic games, this may differ from branching_factor (tree edge storage).
         (see `MCTS` class for additional configuration)
         """
         super().__init__(**kwargs)
         self.dirichlet_alpha = dirichlet_alpha
         self.dirichlet_epsilon = dirichlet_epsilon
+        # policy_size defaults to branching_factor if not specified
+        self.policy_size = policy_size if policy_size is not None else self.branching_factor
 
 
     def get_config(self) -> Dict:
@@ -42,27 +47,28 @@ class _AlphaZero:
 
     def update_root(self, key: chex.PRNGKey, tree: MCTSTree, root_embedding: chex.ArrayTree, params: chex.ArrayTree, root_metadata: StepMetadata) -> MCTSTree:
         """Populates the root node of the search tree. Adds Dirichlet noise to the root policy.
-        
+
         Args:
         - `key`: rng
         - `tree`: The search tree.
         - `root_embedding`: root environment state.
         - `params`: nn parameters.
         - `root_metadata`: metadata of the root environment state
-        
+
         Returns:
         - `tree`: The updated search tree.
         """
-        # evaluate the root state 
+        # evaluate the root state
         root_key, dir_key = jax.random.split(key, 2)
         root_policy_logits, root_value = self.eval_fn(root_embedding, params, root_key) #pylint: disable=no-member
         root_policy = jax.nn.softmax(root_policy_logits)
 
         # add Dirichlet noise to the root policy
+        # Use policy_size (not branching_factor) - these may differ for stochastic games
         dirichlet_noise = jax.random.dirichlet(
             dir_key,
             alpha=jnp.full(
-                [tree.branching_factor], 
+                [self.policy_size],
                 fill_value=self.dirichlet_alpha
             )
         )
@@ -70,10 +76,27 @@ class _AlphaZero:
             ((1-self.dirichlet_epsilon) * root_policy) +
             (self.dirichlet_epsilon * dirichlet_noise)
         )
+
+        # Handle action_mask size mismatch (mask may be smaller than policy_size)
+        action_mask = root_metadata.action_mask
+        mask_size = action_mask.shape[-1]
+        if mask_size < self.policy_size:
+            padded_mask = jnp.zeros(self.policy_size, dtype=bool)
+            padded_mask = padded_mask.at[:mask_size].set(action_mask)
+            action_mask = padded_mask
+        elif mask_size > self.policy_size:
+            action_mask = action_mask[:self.policy_size]
+
         # re-normalize the policy
-        new_logits = jnp.log(jnp.maximum(noisy_policy, jnp.finfo(noisy_policy).tiny))
-        policy = jnp.where(root_metadata.action_mask, new_logits, jnp.finfo(noisy_policy).min)
+        new_logits = jnp.log(jnp.maximum(noisy_policy, jnp.finfo(noisy_policy.dtype).tiny))
+        policy = jnp.where(action_mask, new_logits, jnp.finfo(noisy_policy.dtype).min)
         renorm_policy = jax.nn.softmax(policy)
+
+        # Pad policy to branching_factor if needed (for tree storage)
+        if self.policy_size < tree.branching_factor:
+            padded_policy = jnp.zeros(tree.branching_factor)
+            padded_policy = padded_policy.at[:self.policy_size].set(renorm_policy)
+            renorm_policy = padded_policy
 
         # update the root node
         # NOTE: The caller (MCTS.evaluate) already determines when update_root should be called

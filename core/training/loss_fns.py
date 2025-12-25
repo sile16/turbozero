@@ -66,8 +66,23 @@ def az_default_loss_fn(params: chex.ArrayTree, train_state: TrainState, experien
         jnp.finfo(jnp.float32).min
     )
 
-    # compute policy loss
-    policy_loss = optax.softmax_cross_entropy(pred_policy_logits, experience.policy_weights).mean()
+    # compute policy loss (skip for chance nodes if flag is set)
+    policy_loss_per_sample = optax.softmax_cross_entropy(pred_policy_logits, experience.policy_weights)
+
+    # Mask out policy loss for chance nodes (where we don't have meaningful policy targets)
+    if experience.is_chance_node is not None:
+        # is_chance_node is True for chance nodes, False for decision nodes
+        # We want to keep loss only for decision nodes (is_chance_node = False)
+        is_decision_node = ~experience.is_chance_node
+        num_decision_samples = jnp.sum(is_decision_node)
+        # Avoid division by zero if all samples are chance nodes
+        policy_loss = jnp.where(
+            num_decision_samples > 0,
+            jnp.sum(policy_loss_per_sample * is_decision_node) / num_decision_samples,
+            0.0
+        )
+    else:
+        policy_loss = policy_loss_per_sample.mean()
 
     # select appropriate value from experience.reward
     current_player = experience.cur_player_id
