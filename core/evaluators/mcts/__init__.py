@@ -4,6 +4,15 @@ from core.evaluators.mcts.state import MCTSTree, MCTSNode, MCTSOutput
 # Note: StochasticMCTS should be imported directly from core.evaluators.mcts.stochastic_mcts
 # to avoid circular import issues
 
+# Gumbel variants for efficient training (fewer simulations needed)
+from core.evaluators.mcts.gumbel import (
+    gumbel_top_k,
+    GumbelRootSelector,
+    GumbelActionScheduler,
+)
+from core.evaluators.mcts.gumbel_mcts import GumbelMCTS
+from core.evaluators.mcts.gumbel_stochastic_mcts import GumbelStochasticMCTS
+
 # Configuration class for MCTS
 class MCTSConfig:
     def __init__(

@@ -301,8 +301,184 @@ def hold20_action(turn_total, legal_mask):
 
 An untrained network will make poor decisions (e.g., holding at turn_total=2 instead of 20). This is expected - the network needs training to learn good policies.
 
+## StochasticMCTS Training (2025-12-26)
+
+### PGX `step_stochastic` Observation Bug (FIXED in pgx 3.1.2)
+
+**Problem** (pgx <= 3.1.0): `env.step_stochastic()` updated internal state but did NOT recompute the `observation` field, causing the NN to see stale observations.
+
+**Status**: **FIXED in pgx 3.1.2** - `step_stochastic` now properly updates observations. No workaround needed.
+
+### Value Loss Must Be Masked for Chance Nodes
+
+**Problem**: Value targets at chance nodes depend on which random dice outcome was sampled during training, creating noisy targets. The same chance node observation might have value +1 or -1 depending on the sampled dice roll.
+
+**Fix**: Mask out value loss for chance node samples in `core/training/loss_fns.py`:
+```python
+if experience.is_chance_node is not None:
+    is_decision_node = ~experience.is_chance_node
+    num_decision_samples = jnp.sum(is_decision_node)
+    value_loss = jnp.where(
+        num_decision_samples > 0,
+        jnp.sum(value_loss_per_sample * is_decision_node) / num_decision_samples,
+        0.0
+    )
+```
+
+### Training Data Collection Strategy
+
+**Problem**: Using `make_stochastic_aware_step_fn` collects samples from both decision nodes AND chance nodes. Since ~50% of samples are chance nodes (which have policy loss masked), this dilutes the training signal.
+
+**Solution**: Use regular `env.step` for training data collection, which auto-resolves stochasticity with random sampling. This means:
+- All training samples are from decision nodes
+- Policy loss is computed for all samples
+- Value targets are cleaner (only for decision nodes)
+- StochasticMCTS still handles chance nodes properly during its internal MCTS search
+
+```python
+# StochasticMCTS training - use regular step function
+stoch_result = train_and_evaluate(
+    "StochasticMCTS",
+    stoch_evaluator,
+    stoch_evaluator_test,
+    env,
+    mlp_stoch,
+    step_fn=make_step_fn(env),  # Regular env.step, NOT stochastic_aware
+    num_epochs=num_epochs
+)
+```
+
+### Comparison Results (Pig, 300 epochs, with Dirichlet noise)
+
+| Method | Win Rate vs Optimal | Training Time | Policy Accuracy |
+|--------|---------------------|---------------|-----------------|
+| **StochasticMCTS** | **10%** | **532s** (3x faster) | **99%** |
+| AlphaZero(MCTS) | 0% | 1528s | 84% |
+
+**Key finding**: Regular MCTS (even with AlphaZero Dirichlet noise) completely fails to learn Pig. The random dice sampling during MCTS search creates noisy, inconsistent policy targets that the network can't converge on. StochasticMCTS explores all dice outcomes deterministically, providing stable targets.
+
+### NN Architecture Note: Zero Observation Problem
+
+**Problem**: Pig starts with observation `[0, 0, 0, 0]`. With ReLU activation, this produces all-zero hidden activations, causing dead neurons.
+
+**Fix**: Add a constant feature to break symmetry:
+```python
+class SimpleMLP(nn.Module):
+    @nn.compact
+    def __call__(self, x, train: bool = True):
+        # Add constant feature to avoid all-zero input
+        ones = jnp.ones((x.shape[0], 1))
+        x = jnp.concatenate([x, ones], axis=-1)
+        # Use GELU instead of ReLU for smoother gradients
+        for _ in range(num_layers):
+            x = nn.Dense(features=hidden_size)(x)
+            x = nn.gelu(x)
+        ...
+```
+
 ## Test Files
 
 - `tests/jax_pig_eval.py` - Vectorized Hold-20 vs Optimal evaluation (GPU, ~seconds for 5000 games)
 - `tests/jax_mcts_pig_eval.py` - MCTS agent evaluation vs strategies
 - `tests/test_stochastic_pig.py` - StochasticMCTS correctness tests
+- `scripts/compare_mcts_games.py` - Multi-game MCTS comparison (Connect4, 2048, Pig, Backgammon)
+
+## Extracting Model Params from TrainState
+
+When extracting params from `Trainer.train_loop()` output for inference/evaluation:
+
+1. **Remove device axis**: Trainer uses `jax.pmap` so params have shape `(num_devices, ...)`. Remove the leading axis:
+   ```python
+   raw_params = jax.tree.map(lambda x: x[0], train_state.params)
+   ```
+
+2. **Wrap for nn.apply**: Flax's `module.apply(variables, ...)` expects `{'params': params}`:
+   ```python
+   params = {'params': raw_params}
+   ```
+
+3. **Handle batch_stats** (if using BatchNorm):
+   ```python
+   if hasattr(train_state, 'batch_stats') and train_state.batch_stats is not None:
+       raw_batch_stats = jax.tree.map(lambda x: x[0], train_state.batch_stats)
+       params = {'params': raw_params, 'batch_stats': raw_batch_stats}
+   ```
+
+**Common error if you skip step 1:**
+```
+flax.errors.ScopeParamShapeError: expected shape (3, 3, 2, 64), but got (1, 3, 3, 2, 64)
+```
+
+**Common error if you skip step 2:**
+```
+flax.errors.ScopeCollectionNotFound: Tried to access "kernel" from collection "params" but the collection is empty
+```
+
+## Gumbel MCTS Implementation (2025-12-27)
+
+### Overview
+
+Implemented Gumbel MCTS variants based on "Policy improvement by planning with Gumbel" (ICLR 2022). The key insight is achieving same performance with 50-100x fewer simulations by using Gumbel-Top-k sampling at the root.
+
+### New Files
+
+- `core/evaluators/mcts/gumbel.py` - Core Gumbel utilities:
+  - `gumbel_top_k()` - Sample k actions without replacement using Gumbel-Max trick
+  - `GumbelRootSelector` - Gumbel-based action selector for MCTS root
+  - `GumbelActionScheduler` - Schedules which actions to search
+
+- `core/evaluators/mcts/gumbel_mcts.py` - `GumbelMCTS` class for deterministic games
+- `core/evaluators/mcts/gumbel_stochastic_mcts.py` - `GumbelStochasticMCTS` for stochastic games
+
+### Usage
+
+```python
+from core.evaluators.mcts.gumbel_stochastic_mcts import GumbelStochasticMCTS
+
+evaluator = GumbelStochasticMCTS(
+    eval_fn=make_nn_eval_fn(network, state_to_nn_input),
+    action_selector=PUCTSelector(),
+    stochastic_action_probs=stochastic_probs,
+    policy_size=env.num_actions,
+    num_iterations=16,  # Far fewer than standard MCTS!
+    max_nodes=66,
+    gumbel_k=16,  # Number of actions to sample at root
+    decision_step_fn=decision_step_fn,
+    stochastic_step_fn=stochastic_step_fn,
+)
+```
+
+### JAX Tracing Notes
+
+**jax.lax.top_k for Gumbel selection**: Use `jax.lax.top_k` instead of manual slicing for JIT compatibility:
+```python
+# WRONG - dynamic slicing in JIT
+sorted_indices = jnp.argsort(-perturbed)
+selected_actions = sorted_indices[:k]  # Fails if k is traced
+
+# CORRECT - use jax.lax.top_k
+_, selected_actions = jax.lax.top_k(perturbed, k)
+```
+
+**Static vs traced values**: Use Python `min()` instead of `jnp.minimum()` for values that should be static:
+```python
+# WRONG - creates traced value
+effective_k = jnp.minimum(self.gumbel_k, self.policy_size)
+
+# CORRECT - static computation
+effective_k = min(self.gumbel_k, self.policy_size)
+```
+
+### Comparison Results (2048, 30 epochs)
+
+| Configuration | Time | Speed | Eval Score |
+|---------------|------|-------|------------|
+| Standard StochasticMCTS (50 sims) | 166s | 0.18 epochs/sec | ~4136 |
+| Gumbel StochasticMCTS (16 sims) | 87s | 0.34 epochs/sec | ~4104 |
+| Gumbel StochasticMCTS (8 sims) | ~60s | ~0.5 epochs/sec | ~4104 |
+
+**Key findings**:
+- Gumbel variant is ~2x faster due to fewer simulations
+- Training score similar, but policy accuracy plateaus at ~55-60% (vs 97%+ for standard)
+- The lower policy accuracy suggests the action cycling strategy may need tuning
+- For now, recommend standard StochasticMCTS for production training
