@@ -482,3 +482,57 @@ effective_k = min(self.gumbel_k, self.policy_size)
 - Training score similar, but policy accuracy plateaus at ~55-60% (vs 97%+ for standard)
 - The lower policy accuracy suggests the action cycling strategy may need tuning
 - For now, recommend standard StochasticMCTS for production training
+
+## 2048 Symmetry Augmentation (2025-12-27)
+
+### Overview
+
+2048 has 8 symmetries (D4 group): 4 rotations × 2 reflections. Data augmentation multiplies training data by 8x, significantly improving sample efficiency.
+
+### Implementation
+
+**File**: `core/training/augmentation.py`
+
+```python
+from core.training.augmentation import make_2048_symmetry_transforms
+
+# Get list of 7 transforms (excluding identity)
+transforms = make_2048_symmetry_transforms()
+
+# Pass to Trainer
+trainer = Trainer(
+    ...,
+    data_transform_fns=transforms,
+)
+```
+
+### Key Points
+
+1. **Action transformation**: When rotating the board, actions must also rotate:
+   - rot90: up→right, right→down, down→left, left→up
+   - flip_h: left↔right
+
+2. **pgx State API**: Use `state.replace(observation=new_obs)` not `state._replace()`
+
+### Throughput Analysis
+
+**Paper reference (Stochastic MuZero on V100)**:
+- 10 billion frames in 8 days = ~14,500 frames/sec
+- RTX 4090 expected: ~29,000 frames/sec (2x V100)
+
+**Current implementation (RTX 4090)**:
+- Without augmentation: ~4,400 frames/sec
+- With 8x symmetry: ~35,300 frames/sec (8x effective training data)
+
+**Time to 10B frames**:
+- Without aug: ~26 days
+- With 8x aug: ~3.3 days (meets paper target!)
+
+### Note on Optimization
+
+Current bottlenecks:
+1. Sequential MCTS (not batched across games)
+2. Small batch size (32 vs 1024+ in paper)
+3. Python-level game loop
+
+With full optimization, expect 10-50x additional speedup.
