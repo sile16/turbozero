@@ -1,3 +1,5 @@
+from typing import Optional, Dict
+
 import chex
 from chex import dataclass
 import graphviz
@@ -80,9 +82,15 @@ class MCTSOutput(EvalOutput):
     """Output of an MCTS evaluation. See EvalOutput.
     - `eval_state`: The updated internal state of the Evaluator.
     - `policy_weights`: The policy weights assigned to each action.
+    - `tree_size`: Number of nodes in tree after evaluation (before reset)
+    - `root_visits`: Number of visits to root node
+    - `exploration_pct`: Exploration percentage (how spread visits are)
     """
     eval_state: MCTSTree
     policy_weights: chex.Array
+    tree_size: chex.Array = None  # Scalar
+    root_visits: chex.Array = None  # Scalar
+    exploration_pct: chex.Array = None  # Scalar
 
 
 def tree_to_graph(tree, batch_id=0):

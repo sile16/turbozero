@@ -11,12 +11,12 @@ TurboZero is a vectorized implementation of AlphaZero written in JAX. It provide
 This fork extends the original [lowrollr/turbozero](https://github.com/lowrollr/turbozero) to build a **backgammon AI** using:
 
 - **PGX Backgammon** as the game environment (use latest from [sile16/pgx](https://github.com/sile16/pgx) main branch)
-- **Stochastic MCTS** to handle dice rolls as chance nodes
+- **Unified MCTS** to handle stochastic nodes, multi-steps per player, i.e, Gumbel AlphaZero approach. 
 - **Multi-move per turn** architecture where each pip move is treated as a separate node in the MCTS tree
 
 ### Key Design Decisions
 
-1. **Per-pip moves as actions**: Instead of treating a full backgammon turn (potentially 2-4 pip moves) as a single action, we treat each individual pip move as a state change. This dramatically reduces the action space to a manageable size.
+1. **Per-pip moves as actions**: Instead of treating a full backgammon turn (potentially 1-4 pip moves) as a single action, we treat each individual pip move as a state change. This dramatically reduces the action space to a manageable size.
 
 2. **Stochastic nodes**: Dice rolls are modeled as stochastic nodes in the MCTS tree, with probabilities from `env.stochastic_action_probs`.
 
@@ -24,26 +24,16 @@ This fork extends the original [lowrollr/turbozero](https://github.com/lowrollr/
 
 ## Current Status & Next Steps
 
-1. ✅ Implemented `StochasticMCTS` extending base MCTS for stochastic games
-2. ✅ **Review current codebase** - verified correctness of stochastic MCTS implementation
-3. ✅ **Review tests** - tests properly validate the stochastic behavior
-4. ✅ **Run tests** - all tests passing
+1. ✅ Consolidated all MCTS variants into single `UnifiedMCTS` class
+2. ✅ Implemented temperature annealing (temperature as function of epoch)
+3. ✅ Always subtree persistence (removed `persist_tree` flag)
+4. ✅ Always Gumbel-Top-k at decision roots
+5. ✅ Handles both stochastic and deterministic games
+6. ⏳ Remove old MCTS files after migration complete
+7. ⏳ Update training code to use UnifiedMCTS
 
-## Recent Changes (2025-11-25)
 
-### 1. Fixed `is_node_stochastic` to return JAX boolean (stochastic_mcts.py:531-553)
-
-**Problem**: The static methods `is_node_stochastic()` and `is_node_idx_stochastic()` returned Python `False` when the `is_stochastic` attribute didn't exist. This could cause tracing issues in JIT-compiled code.
-
-**Fix**: Now returns `jnp.array(False)` instead of Python `False`:
-```python
-is_stochastic = getattr(node.embedding, 'is_stochastic', None)
-if is_stochastic is None:
-    return jnp.array(False)
-return is_stochastic
-```
-
-### 2. Implemented expectimax value calculation for stochastic nodes (stochastic_mcts.py:414-530)
+### 1. Implemented expectimax value calculation for stochastic nodes (stochastic_mcts.py:414-530)
 
 **Problem**: The original backpropagation simply propagated the sampled value through stochastic nodes, which doesn't properly account for the expected value across all possible outcomes.
 
@@ -58,7 +48,7 @@ return is_stochastic
 
 2. **Zero policy weights at stochastic nodes**: `stochastic_evaluate()` returns `jnp.zeros(branching_factor)` for policy weights. This is acceptable because:
    - Consistent return shape is required
-   - `StochasticTrainer.collect()` correctly skips stochastic states when adding to replay buffer
+   - `StochasticTrainer.collect()` correctly skips stochastic states when adding to replay buffer , need to make sure trainer doesn't train policy on a stochastic node but can train on the value. 
 
 3. **visit_node logic**: In `iterate()`, the node is visited once via `new_node()`/`visit_node()`, then backprop updates ancestors only (starting from parent). This is correct.
 
@@ -88,10 +78,12 @@ poetry add jax[cuda12]
 
 - **`core/evaluators/`**: Evaluation strategies for game states
   - `evaluator.py`: Base `Evaluator` class - evaluates environment states and returns actions with policy weights
-  - `mcts/mcts.py`: Batched MCTS implementation operating on `MCTSTree` state objects
-  - `mcts/stochastic_mcts.py`: Extension of MCTS supporting stochastic nodes (e.g., for backgammon dice rolls)
-  - `mcts/state.py`: Data structures: `MCTSTree`, `MCTSNode`, `MCTSOutput`, `TraversalState`, `BackpropState`
-  - `mcts/action_selection.py`: `MCTSActionSelector` for tree traversal action selection
+  - `mcts/unified_mcts.py`: **Primary MCTS implementation** - unified class handling all game types with Gumbel-Top-k and temperature annealing
+  - `mcts/mcts.py`: (Legacy) Base MCTS implementation - will be removed
+  - `mcts/stochastic_mcts.py`: (Legacy) MCTS for stochastic games - will be removed
+  - `mcts/state.py`: Data structures: `MCTSTree`, `MCTSNode`, `StochasticMCTSNode`, `MCTSOutput`, `TraversalState`
+  - `mcts/action_selection.py`: `MCTSActionSelector` (PUCTSelector) for tree traversal action selection
+  - `mcts/gumbel.py`: Gumbel-Top-k sampling utilities for efficient root exploration
   - `alphazero.py`: AlphaZero wrapper adding Dirichlet noise exploration
 
 - **`core/training/`**: Training infrastructure
@@ -482,6 +474,121 @@ effective_k = min(self.gumbel_k, self.policy_size)
 - Training score similar, but policy accuracy plateaus at ~55-60% (vs 97%+ for standard)
 - The lower policy accuracy suggests the action cycling strategy may need tuning
 - For now, recommend standard StochasticMCTS for production training
+
+## UnifiedMCTS - Consolidated MCTS Implementation (2025-12-31)
+
+### Overview
+
+Consolidated all MCTS variants (MCTS, StochasticMCTS, GumbelMCTS, GumbelStochasticMCTS) into a single `UnifiedMCTS` class that handles all game types.
+
+**File**: `core/evaluators/mcts/unified_mcts.py`
+
+### Key Features
+
+1. **Always Gumbel-Top-k at decision roots**: Efficient exploration by sampling k actions at root
+2. **Always subtree persistence**: Tree is always reused between evaluate() calls
+3. **Stochastic node support**: Handles dice rolls, tile spawns, etc.
+4. **Temperature annealing**: Temperature can be a function of epoch for training schedules
+5. **1-2 player support**: Correct Q-value handling with player perspective
+
+### Usage
+
+```python
+from core.evaluators.mcts.unified_mcts import (
+    UnifiedMCTS,
+    linear_temp_schedule,
+    exponential_temp_schedule,
+)
+from core.evaluators.mcts.action_selection import PUCTSelector
+
+# Basic usage with constant temperature
+mcts = UnifiedMCTS(
+    eval_fn=nn_eval_fn,
+    action_selector=PUCTSelector(),
+    policy_size=env.num_actions,
+    max_nodes=200,
+    num_iterations=50,
+    decision_step_fn=make_decision_step_fn(env),
+    stochastic_step_fn=make_stochastic_step_fn(env),  # None for deterministic games
+    stochastic_action_probs=env.stochastic_action_probs,  # None for deterministic
+    gumbel_k=16,
+    temperature=1.0,  # Or use a schedule (see below)
+)
+
+# Temperature annealing example (linear decay from 1.0 to 0.0 over 100 epochs)
+mcts = UnifiedMCTS(
+    ...,
+    temperature=linear_temp_schedule(start_temp=1.0, end_temp=0.0, total_epochs=100),
+)
+
+# In training loop, update epoch for temperature annealing
+for epoch in range(num_epochs):
+    mcts.set_epoch(epoch)
+    # ... training code
+```
+
+### Temperature Schedules
+
+Three built-in schedules:
+
+1. **Linear**: `linear_temp_schedule(start, end, total_epochs)` - Linear interpolation
+2. **Exponential**: `exponential_temp_schedule(start, end, decay_rate)` - Exponential decay
+3. **Step**: `step_temp_schedule(temps, boundaries)` - Discrete steps
+
+Custom schedules: Pass any `Callable[[int], float]` that takes epoch and returns temperature.
+
+### Configuration Examples
+
+**Backgammon (Stochastic 2-Player)**:
+```python
+mcts = UnifiedMCTS(
+    eval_fn=nn_eval_fn,
+    action_selector=PUCTSelector(),
+    policy_size=156,
+    max_nodes=200,
+    num_iterations=50,
+    gumbel_k=16,
+    stochastic_action_probs=env.stochastic_action_probs,
+    decision_step_fn=make_bg_decision_step_fn(env),
+    stochastic_step_fn=make_bg_stochastic_step_fn(env),
+)
+```
+
+**2048 (Stochastic 1-Player)**:
+```python
+mcts = UnifiedMCTS(
+    eval_fn=nn_eval_fn,
+    action_selector=PUCTSelector(),
+    policy_size=4,
+    max_nodes=150,
+    num_iterations=50,
+    gumbel_k=4,
+    stochastic_action_probs=tile_spawn_probs,
+    decision_step_fn=make_2048_decision_step_fn(env),
+    stochastic_step_fn=make_2048_stochastic_step_fn(env),
+)
+```
+
+**TicTacToe (Deterministic 2-Player)**:
+```python
+mcts = UnifiedMCTS(
+    eval_fn=nn_eval_fn,
+    action_selector=PUCTSelector(),
+    policy_size=9,
+    max_nodes=100,
+    num_iterations=25,
+    gumbel_k=9,
+    stochastic_action_probs=None,  # Deterministic
+    decision_step_fn=ttt_step_fn,
+    stochastic_step_fn=None,
+)
+```
+
+### Root Embedding After step()
+
+When calling `step(tree, action)`, the subtree rooted at the child becomes the new tree. The root embedding is preserved from when the child was expanded, so it correctly matches the game state.
+
+**Important**: The caller should pass the matching `env_state` to the next `evaluate()` call.
 
 ## 2048 Symmetry Augmentation (2025-12-27)
 
