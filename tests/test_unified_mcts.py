@@ -717,5 +717,90 @@ def test_value_to_scalar(key):
     print("test_value_to_scalar PASSED")
 
 
+def test_legal_action_masking(key):
+    """Test that MCTS only expands legal actions.
+
+    Regression test for bug where gumbel_top_k returns more actions than
+    are legal (illegal actions have -inf scores but still get returned).
+    The MCTS must filter these out to only expand legal actions.
+    """
+    import pgx
+    pig_env = pgx.make('pig')
+
+    def make_pig_step_fn(env):
+        def step_fn(state, action, k):
+            new_state = env.step(state, action, k)
+            return new_state, StepMetadata(
+                rewards=new_state.rewards,
+                action_mask=new_state.legal_action_mask,
+                terminated=new_state.terminated,
+                cur_player_id=new_state.current_player,
+                step=getattr(new_state, '_step_count', 0),
+                is_stochastic=getattr(new_state, '_is_stochastic', False),
+            )
+        return step_fn
+
+    def make_pig_stoch_step_fn(env):
+        def step_fn(state, outcome, k):
+            new_state = env.stochastic_step(state, outcome)
+            return new_state, StepMetadata(
+                rewards=new_state.rewards,
+                action_mask=new_state.legal_action_mask,
+                terminated=new_state.terminated,
+                cur_player_id=new_state.current_player,
+                step=getattr(new_state, '_step_count', 0),
+                is_stochastic=getattr(new_state, '_is_stochastic', False),
+            )
+        return step_fn
+
+    def pig_eval_fn(state, params, k):
+        logits = jnp.zeros(pig_env.num_actions)
+        return logits, jnp.array(0.0)
+
+    mcts = UnifiedMCTS(
+        eval_fn=pig_eval_fn,
+        action_selector=PUCTSelector(),
+        policy_size=pig_env.num_actions,  # 6
+        max_nodes=50,
+        num_iterations=10,
+        decision_step_fn=make_pig_step_fn(pig_env),
+        stochastic_step_fn=make_pig_stoch_step_fn(pig_env),
+        stochastic_action_probs=jnp.array(pig_env.stochastic_action_probs),
+    )
+
+    # Initial state: only action 0 (Roll) is legal
+    state = pig_env.init(key)
+    assert state.legal_action_mask[0] == True
+    assert state.legal_action_mask[1] == False
+    assert jnp.sum(state.legal_action_mask) == 1
+
+    tree = mcts.init(template_embedding=state)
+    metadata = StepMetadata(
+        rewards=state.rewards,
+        action_mask=state.legal_action_mask,
+        terminated=state.terminated,
+        cur_player_id=state.current_player,
+        step=0,
+        is_stochastic=False,
+    )
+
+    eval_key, _ = jax.random.split(key)
+    output = mcts.evaluate(eval_key, tree, state, metadata, params=None)
+    result_tree = output.eval_state
+
+    # Count how many children were created
+    children = []
+    for action in range(mcts.policy_size):
+        child_idx = result_tree.edge_map[result_tree.ROOT_INDEX, action]
+        if child_idx != result_tree.NULL_INDEX:
+            children.append(action)
+
+    # Only action 0 should have been expanded
+    assert len(children) == 1, f"Expected 1 child (Roll), got {len(children)}: {children}"
+    assert children[0] == 0, f"Expected action 0 (Roll), got {children[0]}"
+
+    print("test_legal_action_masking PASSED")
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -332,7 +332,7 @@ class UnifiedMCTS:
         def scan_body(carry, iteration):
             state, k = carry
             k, iter_key = jax.random.split(k)
-            new_state = self._gumbel_iterate(iter_key, state, iteration, params, selected_actions)
+            new_state = self._gumbel_iterate(iter_key, state, iteration, params, selected_actions, legal_mask)
             return (new_state, k), None
 
         iterations = jnp.arange(self.num_iterations)
@@ -467,6 +467,7 @@ class UnifiedMCTS:
         iteration: int,
         params: chex.ArrayTree,
         selected_actions: chex.Array,
+        legal_mask: chex.Array,
     ) -> StochasticMCTSTree:
         """Single MCTS iteration with Gumbel selection at root."""
         traverse_key, expand_key, backprop_key = jax.random.split(key, 3)
@@ -475,9 +476,13 @@ class UnifiedMCTS:
         root_child_visits = tree.get_child_data('n', tree.ROOT_INDEX)[:self.policy_size]
         selected_visits = root_child_visits[selected_actions]
 
-        # Pick action with minimum visits
-        min_visits = jnp.min(selected_visits)
-        is_min_mask = selected_visits == min_visits
+        # Mask out illegal actions - set their visits to infinity so they're never picked
+        selected_legal = legal_mask[selected_actions]
+        masked_visits = jnp.where(selected_legal, selected_visits, jnp.inf)
+
+        # Pick action with minimum visits (among legal ones)
+        min_visits = jnp.min(masked_visits)
+        is_min_mask = masked_visits == min_visits
         action_idx = jnp.argmax(
             is_min_mask * (1.0 + 0.1 * (jnp.arange(self.gumbel_k) == (iteration % self.gumbel_k)))
         )
@@ -582,9 +587,49 @@ class UnifiedMCTS:
         return jax.lax.cond(is_stochastic, lambda: stochastic_action, lambda: decision_action)
 
     def _stochastic_action_selector(self, key: chex.PRNGKey, tree: StochasticMCTSTree, node_idx: int) -> int:
-        """Select action at a stochastic node (sample from probabilities)."""
-        # Sample based on stochastic_action_probs
-        outcome = jax.random.choice(key, self.stochastic_size, p=self.stochastic_action_probs)
+        """Select action at a stochastic node.
+
+        Strategy:
+        1. First expansion: Expand all outcomes (prioritize unexpanded ones)
+        2. Future visits: Select outcome with greatest delta (expected - actual visits)
+
+        This ensures all outcomes get evaluated before we start selecting based on
+        visit counts, preventing early bad values from biasing the search.
+        """
+        stoch_start = self.policy_size
+        stoch_end = self.policy_size + self.stochastic_size
+
+        # Get child indices for all stochastic outcomes
+        child_indices = tree.edge_map[node_idx, stoch_start:stoch_end]
+
+        # Check which outcomes have been expanded (have a child node)
+        expanded_mask = child_indices != tree.NULL_INDEX
+
+        # Get visit counts for expanded children (0 for unexpanded)
+        safe_indices = jnp.maximum(child_indices, 0)  # Avoid negative indexing
+        child_visits = jnp.where(expanded_mask, tree.data.n[safe_indices], 0)
+
+        # Check if any outcome is not yet expanded
+        has_unexpanded = jnp.any(~expanded_mask)
+
+        def select_unexpanded():
+            # Prioritize unexpanded outcomes - select first one not yet expanded
+            unexpanded_scores = (~expanded_mask).astype(jnp.float32)
+            # Add small noise to randomize among unexpanded
+            noise = jax.random.uniform(key, unexpanded_scores.shape) * 0.1
+            return jnp.argmax(unexpanded_scores + noise)
+
+        def select_by_delta():
+            # All outcomes expanded - select by greatest delta (under-visited)
+            total_visits = jnp.sum(child_visits)
+            expected_visits = self.stochastic_action_probs * total_visits
+            delta = expected_visits - child_visits
+
+            # Add small noise for tiebreaking
+            noise = jax.random.uniform(key, delta.shape) * 1e-6
+            return jnp.argmax(delta + noise)
+
+        outcome = jax.lax.cond(has_unexpanded, select_unexpanded, select_by_delta)
         return self.policy_size + outcome
 
     def _is_chance_node(self, tree: StochasticMCTSTree, node_idx: int) -> chex.Array:
