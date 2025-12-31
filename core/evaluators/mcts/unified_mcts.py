@@ -589,47 +589,27 @@ class UnifiedMCTS:
     def _stochastic_action_selector(self, key: chex.PRNGKey, tree: StochasticMCTSTree, node_idx: int) -> int:
         """Select action at a stochastic node.
 
-        Strategy:
-        1. First expansion: Expand all outcomes (prioritize unexpanded ones)
-        2. Future visits: Select outcome with greatest delta (expected - actual visits)
-
-        This ensures all outcomes get evaluated before we start selecting based on
-        visit counts, preventing early bad values from biasing the search.
+        All outcomes are expanded when the chance node is first created.
+        Selection is by greatest delta (expected - actual visits) to keep
+        visit distribution proportional to outcome probabilities.
         """
         stoch_start = self.policy_size
         stoch_end = self.policy_size + self.stochastic_size
 
-        # Get child indices for all stochastic outcomes
+        # Get child indices and visit counts
         child_indices = tree.edge_map[node_idx, stoch_start:stoch_end]
+        safe_indices = jnp.maximum(child_indices, 0)
+        child_visits = tree.data.n[safe_indices]
 
-        # Check which outcomes have been expanded (have a child node)
-        expanded_mask = child_indices != tree.NULL_INDEX
+        # Select by greatest delta (most under-visited relative to probability)
+        total_visits = jnp.sum(child_visits)
+        expected_visits = self.stochastic_action_probs * total_visits
+        delta = expected_visits - child_visits
 
-        # Get visit counts for expanded children (0 for unexpanded)
-        safe_indices = jnp.maximum(child_indices, 0)  # Avoid negative indexing
-        child_visits = jnp.where(expanded_mask, tree.data.n[safe_indices], 0)
+        # Add small noise for tiebreaking
+        noise = jax.random.uniform(key, delta.shape) * 1e-6
+        outcome = jnp.argmax(delta + noise)
 
-        # Check if any outcome is not yet expanded
-        has_unexpanded = jnp.any(~expanded_mask)
-
-        def select_unexpanded():
-            # Prioritize unexpanded outcomes - select first one not yet expanded
-            unexpanded_scores = (~expanded_mask).astype(jnp.float32)
-            # Add small noise to randomize among unexpanded
-            noise = jax.random.uniform(key, unexpanded_scores.shape) * 0.1
-            return jnp.argmax(unexpanded_scores + noise)
-
-        def select_by_delta():
-            # All outcomes expanded - select by greatest delta (under-visited)
-            total_visits = jnp.sum(child_visits)
-            expected_visits = self.stochastic_action_probs * total_visits
-            delta = expected_visits - child_visits
-
-            # Add small noise for tiebreaking
-            noise = jax.random.uniform(key, delta.shape) * 1e-6
-            return jnp.argmax(delta + noise)
-
-        outcome = jax.lax.cond(has_unexpanded, select_unexpanded, select_by_delta)
         return self.policy_size + outcome
 
     def _is_chance_node(self, tree: StochasticMCTSTree, node_idx: int) -> chex.Array:
@@ -647,8 +627,11 @@ class UnifiedMCTS:
         action: int,
         params: chex.ArrayTree,
     ) -> ExpandResult:
-        """Expand a child from a decision node."""
-        step_key, eval_key = jax.random.split(key)
+        """Expand a child from a decision node.
+
+        If the child is a chance node, immediately expands all stochastic outcomes.
+        """
+        step_key, eval_key, expand_key = jax.random.split(key, 3)
 
         # Get parent embedding
         parent_embedding = jax.tree_util.tree_map(lambda x: x[parent], tree.data.embedding)
@@ -656,59 +639,160 @@ class UnifiedMCTS:
         # Step environment
         new_embedding, metadata = self.decision_step_fn(parent_embedding, action, step_key)
 
-        # Evaluate new state
-        policy_logits, value = self.eval_fn(new_embedding, params, eval_key)
-
-        # Convert 4-way value to scalar if needed
-        scalar_value = _value_to_scalar(value)
-
-        # Handle terminal state
-        player_reward = metadata.rewards[metadata.cur_player_id]
-        scalar_value = jnp.where(metadata.terminated, player_reward, scalar_value)
-
-        # Mask illegal actions
-        policy_logits = jnp.where(
-            metadata.action_mask[:self.policy_size],
-            policy_logits,
-            jnp.finfo(jnp.float32).min
-        )
-        policy = jax.nn.softmax(policy_logits)
-
-        # Build full policy
-        full_policy = jnp.zeros(self.branching_factor)
-        is_next_stochastic = getattr(metadata, 'is_stochastic', jnp.array(False))
-
-        # If next state is stochastic, put stochastic probs in policy
-        full_policy = jax.lax.cond(
-            is_next_stochastic,
-            lambda: full_policy.at[self.policy_size:self.policy_size + self.stochastic_size].set(
-                self.stochastic_action_probs if self.is_stochastic_game else jnp.zeros(max(1, self.stochastic_size))
-            ),
-            lambda: full_policy.at[:self.policy_size].set(policy)
-        )
-
-        # Check if node exists
+        # Check if node already exists
         node_exists = tree.is_edge(parent, action)
         node_idx = tree.edge_map[parent, action]
 
+        is_next_stochastic = getattr(metadata, 'is_stochastic', jnp.array(False))
+
         def update_existing():
+            # Node exists - just evaluate and update stats
+            _, value = self.eval_fn(new_embedding, params, eval_key)
+            scalar_value = _value_to_scalar(value)
+            player_reward = metadata.rewards[metadata.cur_player_id]
+            scalar_value = jnp.where(metadata.terminated, player_reward, scalar_value)
             updated_tree = self._update_node_stats(tree, node_idx, scalar_value)
             return ExpandResult(tree=updated_tree, child_idx=node_idx, value=scalar_value)
 
         def add_new():
+            # Evaluate new state
+            policy_logits, value = self.eval_fn(new_embedding, params, eval_key)
+            scalar_value = _value_to_scalar(value)
+
+            # Handle terminal state
+            player_reward = metadata.rewards[metadata.cur_player_id]
+            scalar_value = jnp.where(metadata.terminated, player_reward, scalar_value)
+
+            # Mask illegal actions
+            policy_logits = jnp.where(
+                metadata.action_mask[:self.policy_size],
+                policy_logits,
+                jnp.finfo(jnp.float32).min
+            )
+            policy = jax.nn.softmax(policy_logits)
+
+            # Build full policy
+            full_policy = jnp.zeros(self.branching_factor)
+            full_policy = jax.lax.cond(
+                is_next_stochastic,
+                lambda: full_policy.at[self.policy_size:self.policy_size + self.stochastic_size].set(
+                    self.stochastic_action_probs if self.is_stochastic_game else jnp.zeros(max(1, self.stochastic_size))
+                ),
+                lambda: full_policy.at[:self.policy_size].set(policy)
+            )
+
+            # Create the child node
             node_data = self._new_node(
                 policy=full_policy,
                 value=scalar_value,
                 embedding=new_embedding,
                 terminated=metadata.terminated,
                 nn_value_estimate=scalar_value,
-                is_chance_node=is_next_stochastic  # Child is chance node if next state is stochastic
+                is_chance_node=is_next_stochastic
             )
             new_tree = tree.add_node(parent_index=parent, edge_index=action, data=node_data)
             child_idx = new_tree.edge_map[parent, action]
-            return ExpandResult(tree=new_tree, child_idx=child_idx, value=scalar_value)
+
+            # If this is a chance node, immediately expand all stochastic outcomes
+            def expand_all_outcomes():
+                return self._expand_all_stochastic_children(
+                    expand_key, new_tree, child_idx, new_embedding, params
+                )
+
+            def keep_single():
+                return ExpandResult(tree=new_tree, child_idx=child_idx, value=scalar_value)
+
+            return jax.lax.cond(
+                jnp.logical_and(is_next_stochastic, self.is_stochastic_game),
+                expand_all_outcomes,
+                keep_single
+            )
 
         return jax.lax.cond(node_exists, update_existing, add_new)
+
+    def _expand_all_stochastic_children(
+        self,
+        key: chex.PRNGKey,
+        tree: StochasticMCTSTree,
+        chance_node_idx: int,
+        chance_node_embedding: chex.ArrayTree,
+        params: chex.ArrayTree,
+    ) -> ExpandResult:
+        """Expand ALL stochastic outcomes from a chance node at once.
+
+        This is called immediately when a chance node is created, ensuring all
+        outcomes are evaluated before any selection happens.
+
+        Returns weighted average value based on outcome probabilities.
+        """
+        # Use scan to expand each outcome sequentially
+        def expand_one_outcome(carry, outcome_idx):
+            current_tree, current_key = carry
+            current_key, step_key, eval_key = jax.random.split(current_key, 3)
+
+            # Step with this outcome
+            new_embedding, metadata = self.stochastic_step_fn(
+                chance_node_embedding, outcome_idx, step_key
+            )
+
+            # Evaluate
+            policy_logits, value = self.eval_fn(new_embedding, params, eval_key)
+            scalar_value = _value_to_scalar(value)
+
+            # Handle terminal
+            player_reward = metadata.rewards[metadata.cur_player_id]
+            scalar_value = jnp.where(metadata.terminated, player_reward, scalar_value)
+
+            # Build policy
+            policy_logits = jnp.where(
+                metadata.action_mask[:self.policy_size],
+                policy_logits,
+                jnp.finfo(jnp.float32).min
+            )
+            policy = jax.nn.softmax(policy_logits)
+
+            full_policy = jnp.zeros(self.branching_factor)
+            is_next_stochastic = getattr(metadata, 'is_stochastic', jnp.array(False))
+            full_policy = jax.lax.cond(
+                is_next_stochastic,
+                lambda: full_policy.at[self.policy_size:self.policy_size + self.stochastic_size].set(
+                    self.stochastic_action_probs
+                ),
+                lambda: full_policy.at[:self.policy_size].set(policy)
+            )
+
+            # Create child node
+            node_data = self._new_node(
+                policy=full_policy,
+                value=scalar_value,
+                embedding=new_embedding,
+                terminated=metadata.terminated,
+                nn_value_estimate=scalar_value,
+                is_chance_node=is_next_stochastic
+            )
+
+            # Add to tree at action = policy_size + outcome_idx
+            action = self.policy_size + outcome_idx
+            updated_tree = current_tree.add_node(
+                parent_index=chance_node_idx,
+                edge_index=action,
+                data=node_data
+            )
+
+            return (updated_tree, current_key), scalar_value
+
+        # Expand all outcomes
+        outcome_indices = jnp.arange(self.stochastic_size)
+        (final_tree, _), all_values = jax.lax.scan(
+            expand_one_outcome,
+            (tree, key),
+            outcome_indices
+        )
+
+        # Compute weighted average value
+        weighted_value = jnp.sum(all_values * self.stochastic_action_probs)
+
+        return ExpandResult(tree=final_tree, child_idx=chance_node_idx, value=weighted_value)
 
     def _expand_stochastic_child(
         self,
