@@ -18,8 +18,18 @@ from core.evaluators.mcts.action_selection import PUCTSelector
 from core.types import StepMetadata
 
 
-from core.bgcommon import bg_hit2_eval, bg_step_fn as backgammon_step_fn
-from core.bgcommon import bg_pip_count_eval as backgammon_eval_fn
+from core.bgcommon import (
+    bg_hit2_eval,
+    bg_pip_count_eval as backgammon_eval_fn,
+    make_bg_decision_step_fn,
+    make_bg_stochastic_step_fn,
+    make_bg_stochastic_aware_step_fn
+)
+
+# Create stochastic-aware step function factory for tests
+def backgammon_step_fn(env):
+    """Returns a stochastic-aware step function closure for the backgammon environment."""
+    return make_bg_stochastic_aware_step_fn(env)
 
 
 # --- Fixtures ---
@@ -39,10 +49,15 @@ def mock_params():
     return {}
 
 @pytest.fixture
-def branching_factor(backgammon_env):
-    """Return the branching factor for backgammon."""
-    # Get num_actions from the environment instance
+def policy_size(backgammon_env):
+    """Return the policy size for backgammon."""
     return backgammon_env.num_actions
+
+# Keep branching_factor as alias for backward compatibility in tests
+@pytest.fixture
+def branching_factor(policy_size):
+    """Alias for policy_size for backward compatibility."""
+    return policy_size
 
 @pytest.fixture
 def stochastic_action_probs(backgammon_env):
@@ -50,42 +65,60 @@ def stochastic_action_probs(backgammon_env):
     return backgammon_env.stochastic_action_probs
 
 @pytest.fixture
-def mcts_config(branching_factor, stochastic_action_probs):
+def decision_step_fn(backgammon_env):
+    """Create decision step function for backgammon."""
+    return make_bg_decision_step_fn(backgammon_env)
+
+@pytest.fixture
+def stochastic_step_fn(backgammon_env):
+    """Create stochastic step function for backgammon."""
+    return make_bg_stochastic_step_fn(backgammon_env)
+
+@pytest.fixture
+def mcts_config(policy_size, stochastic_action_probs, decision_step_fn, stochastic_step_fn):
     return {
         "eval_fn": backgammon_eval_fn,
         "action_selector": PUCTSelector(),
-        "branching_factor": branching_factor,
+        "policy_size": policy_size,
         "max_nodes": 50, # Keep small for tests
         "num_iterations": 20, # Reduced iterations for faster tests
         "temperature": 0.0, # Greedy selection for testing
         "persist_tree": True,
-        "stochastic_action_probs": stochastic_action_probs
+        "stochastic_action_probs": stochastic_action_probs,
+        "decision_step_fn": decision_step_fn,
+        "stochastic_step_fn": stochastic_step_fn
     }
 
 @pytest.fixture
-def stochastic_mcts(branching_factor, stochastic_action_probs):
+def stochastic_mcts(policy_size, stochastic_action_probs, decision_step_fn, stochastic_step_fn):
     """Create a StochasticMCTS instance for testing without mocking."""
     return StochasticMCTS(
         eval_fn=backgammon_eval_fn,
         action_selector=PUCTSelector(),
-        branching_factor=branching_factor,
+        policy_size=policy_size,
         max_nodes=50, # Keep small for tests
-        num_iterations=20, # Reduced iterations for faster tests        temperature=0.0, # Greedy selection for testing
+        num_iterations=20, # Reduced iterations for faster tests
+        temperature=0.0, # Greedy selection for testing
         persist_tree=True,
-        stochastic_action_probs=stochastic_action_probs
+        stochastic_action_probs=stochastic_action_probs,
+        decision_step_fn=decision_step_fn,
+        stochastic_step_fn=stochastic_step_fn
     )
 
 @pytest.fixture
-def non_persistent_mcts(branching_factor, stochastic_action_probs):
+def non_persistent_mcts(policy_size, stochastic_action_probs, decision_step_fn, stochastic_step_fn):
     """Create a non-persistent StochasticMCTS instance for testing without mocking."""
     return StochasticMCTS(
         eval_fn=backgammon_eval_fn,
         action_selector=PUCTSelector(),
-        branching_factor=branching_factor,
+        policy_size=policy_size,
         max_nodes=50, # Keep small for tests
-        num_iterations=20, # Reduced iterations for faster tests        temperature=0.0, # Greedy selection for testing
+        num_iterations=20, # Reduced iterations for faster tests
+        temperature=0.0, # Greedy selection for testing
         persist_tree=False, # Non-persistent
-        stochastic_action_probs=stochastic_action_probs
+        stochastic_action_probs=stochastic_action_probs,
+        decision_step_fn=decision_step_fn,
+        stochastic_step_fn=stochastic_step_fn
     )
 
 
@@ -129,7 +162,7 @@ def test_stochastic_node_handling(stochastic_mcts, backgammon_env, key):
         env_state=initial_state,
         root_metadata=root_metadata,
         params={},
-        env_step_fn=partial(backgammon_step_fn, backgammon_env)
+        env_step_fn=backgammon_step_fn(backgammon_env)
     )
     tree = mcts_output.eval_state
     
@@ -161,7 +194,7 @@ def test_stochastic_expansion(stochastic_mcts, backgammon_env, key, mock_params)
         # Make a move to get to a stochastic state (after a move, we need to roll dice)
         legal_actions = jnp.where(state.legal_action_mask)[0]
         first_legal_action = legal_actions[0]
-        state, _ = backgammon_step_fn(backgammon_env, state, first_legal_action, init_key)
+        state, _ = backgammon_step_fn(backgammon_env)(state, first_legal_action, init_key)
     
     assert state._is_stochastic, "State should be stochastic for this test"
     
@@ -182,7 +215,7 @@ def test_stochastic_expansion(stochastic_mcts, backgammon_env, key, mock_params)
         env_state=state,
         root_metadata=metadata,
         params=mock_params,
-        env_step_fn=partial(backgammon_step_fn, backgammon_env)
+        env_step_fn=backgammon_step_fn(backgammon_env)
     )
     
     # The current implementation keeps the root stochastic after evaluation
@@ -208,7 +241,7 @@ def test_stochastic_root_selection(stochastic_mcts, backgammon_env, key, mock_pa
         # Make a move to get to a stochastic state (after a move, we need to roll dice)
         legal_actions = jnp.where(state.legal_action_mask)[0]
         first_legal_action = legal_actions[0]
-        state, _ = backgammon_step_fn(backgammon_env, state, first_legal_action, init_key)
+        state, _ = backgammon_step_fn(backgammon_env)(state, first_legal_action, init_key)
     
     assert state._is_stochastic, "State should be stochastic for this test"
     
@@ -232,7 +265,7 @@ def test_stochastic_root_selection(stochastic_mcts, backgammon_env, key, mock_pa
             env_state=state,
             root_metadata=metadata,
             params=mock_params,
-            env_step_fn=partial(backgammon_step_fn, backgammon_env)
+            env_step_fn=backgammon_step_fn(backgammon_env)
         )
         # Convert JAX array action to Python int before appending
         results.append(int(mcts_output.action))
@@ -277,7 +310,7 @@ def test_stochastic_backpropagation(stochastic_mcts, backgammon_env, key, mock_p
         env_state=state,
         root_metadata=metadata,
         params=mock_params,
-        env_step_fn=partial(backgammon_step_fn, backgammon_env)
+        env_step_fn=backgammon_step_fn(backgammon_env)
     )
     
     # The root Q-value might be NaN if the root is stochastic
@@ -290,7 +323,7 @@ def test_stochastic_backpropagation(stochastic_mcts, backgammon_env, key, mock_p
     
     # Step to stochastic state
     action = mcts_output.action
-    next_state, next_metadata = backgammon_step_fn(backgammon_env, state, action, init_key)
+    next_state, next_metadata = backgammon_step_fn(backgammon_env)(state, action, init_key)
     next_eval_state = stochastic_mcts.step(mcts_output.eval_state, action)
     
     # Check the actual state returned by the environment step function
@@ -308,7 +341,7 @@ def test_stochastic_backpropagation(stochastic_mcts, backgammon_env, key, mock_p
         env_state=next_state,
         root_metadata=next_metadata,
         params=mock_params,
-        env_step_fn=partial(backgammon_step_fn, backgammon_env)
+        env_step_fn=backgammon_step_fn(backgammon_env)
     )
     
     # After evaluating stochastic state, we should have a deterministic root
@@ -320,15 +353,17 @@ def test_stochastic_backpropagation(stochastic_mcts, backgammon_env, key, mock_p
     
     print("test_stochastic_backpropagation PASSED")
 
-def test_full_tree_edge_case(stochastic_mcts, backgammon_env, key, mock_params):
+def test_full_tree_edge_case(stochastic_mcts, backgammon_env, key, mock_params, decision_step_fn, stochastic_step_fn):
     """Test behavior when the tree reaches its capacity."""
     # Create a small tree for this test
     small_mcts = StochasticMCTS(
         eval_fn=stochastic_mcts.eval_fn,
         action_selector=stochastic_mcts.action_selector,
-        branching_factor=stochastic_mcts.branching_factor,
+        policy_size=stochastic_mcts.policy_size,
         max_nodes=10,  # Very small max_nodes to reach capacity quickly
         num_iterations=50,  # Run many iterations to fill the tree
+        decision_step_fn=decision_step_fn,
+        stochastic_step_fn=stochastic_step_fn,
         stochastic_action_probs=stochastic_mcts.stochastic_action_probs,
         temperature=stochastic_mcts.temperature,
         persist_tree=stochastic_mcts.persist_tree
@@ -358,7 +393,7 @@ def test_full_tree_edge_case(stochastic_mcts, backgammon_env, key, mock_params):
         env_state=state,
         root_metadata=metadata,
         params=mock_params,
-        env_step_fn=partial(backgammon_step_fn, backgammon_env)
+        env_step_fn=backgammon_step_fn(backgammon_env)
     )
     
     # The tree should be at or near capacity, but still functioning
@@ -410,7 +445,7 @@ def test_traversal_with_stochastic_nodes(stochastic_mcts, backgammon_env, key, m
         env_state=state,
         root_metadata=metadata,
         params=mock_params,
-        env_step_fn=partial(backgammon_step_fn, backgammon_env)
+        env_step_fn=backgammon_step_fn(backgammon_env)
     )
     
     # The result should reflect proper traversal:
@@ -443,7 +478,7 @@ def test_node_type_detection(backgammon_env, key):
     legal_actions = jnp.where(det_state.legal_action_mask)[0]
     action = legal_actions[0]
     move_key = jax.random.fold_in(key, 0)
-    next_state, _ = backgammon_step_fn(backgammon_env, det_state, action, move_key)
+    next_state, _ = backgammon_step_fn(backgammon_env)(det_state, action, move_key)
     
     # Check the actual state returned by the environment step function
     # Note: PGX Backgammon step might not immediately set is_stochastic=True after a move
@@ -468,17 +503,17 @@ def test_stochastic_action_probs_propagation(stochastic_mcts, backgammon_env):
 def test_get_config(stochastic_mcts):
     """Test that get_config returns the expected configuration."""
     config = stochastic_mcts.get_config()
-    
+
     # Check essential fields
     assert "num_iterations" in config
-    assert "branching_factor" in config
+    assert "policy_size" in config
     assert "max_nodes" in config
     assert "persist_tree" in config
 
     # Check values
     assert config["num_iterations"] == 20
-    assert config["branching_factor"] == stochastic_mcts.branching_factor
-    
+    assert config["policy_size"] == stochastic_mcts.policy_size
+
     print("test_get_config PASSED")
 
 def test_get_value(stochastic_mcts, backgammon_env, key, mock_params):
@@ -507,14 +542,14 @@ def test_get_value(stochastic_mcts, backgammon_env, key, mock_params):
         env_state=state,
         root_metadata=metadata,
         params=mock_params,
-        env_step_fn=partial(backgammon_step_fn, backgammon_env)
+        env_step_fn=backgammon_step_fn(backgammon_env)
     )
     
     # Get value from root node
     root_value = stochastic_mcts.get_value(mcts_output.eval_state)
     is_stochastic = StochasticMCTS.is_node_idx_stochastic(mcts_output.eval_state, mcts_output.eval_state.ROOT_INDEX)
 
-    value, policy, value_probs = stochastic_mcts.value_policy(state, None, None, metadata, 0)
+    value, policy, value_probs = stochastic_mcts.value_policy_nway(state, None, None, metadata, 0)
     # make sure the value is finite
     assert jnp.isfinite(value), "Value should be finite"
     assert value_probs.shape == (4,)  # 4-way value head
@@ -534,7 +569,7 @@ def test_get_value(stochastic_mcts, backgammon_env, key, mock_params):
         env_state=state,
         root_metadata=metadata,
         params=mock_params,
-        env_step_fn=partial(backgammon_step_fn, backgammon_env)
+        env_step_fn=backgammon_step_fn(backgammon_env)
     )
     
     # Get value from root node
@@ -632,7 +667,7 @@ def test_evaluate_deterministic_root(stochastic_mcts, backgammon_env, key, mock_
         env_state=state,
         root_metadata=metadata,
         params=mock_params,
-        env_step_fn=partial(backgammon_step_fn, backgammon_env)
+        env_step_fn=backgammon_step_fn(backgammon_env)
     )
     
     # Assertions
@@ -667,7 +702,7 @@ def test_evaluate_stochastic_root(stochastic_mcts, backgammon_env, key, mock_par
         env_state=state,
         root_metadata=metadata,
         params=mock_params,
-        env_step_fn=partial(backgammon_step_fn, backgammon_env)
+        env_step_fn=backgammon_step_fn(backgammon_env)
     )
 
     # Assertions
@@ -709,7 +744,7 @@ def test_step_deterministic(stochastic_mcts, backgammon_env, key, mock_params):
         env_state=state,
         root_metadata=metadata,
         params=mock_params,
-        env_step_fn=partial(backgammon_step_fn, backgammon_env)
+        env_step_fn=backgammon_step_fn(backgammon_env)
     )
     
     # Take action from policy

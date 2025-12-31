@@ -28,6 +28,40 @@ def scalar_value_to_probs(value: chex.Array) -> chex.Array:
     win_prob = jnp.clip(0.5 + 0.5 * value, 0.0, 1.0)
     return jnp.array([win_prob, 0.0, 0.0, 0.0], dtype=jnp.float32)
 
+
+def probs_to_equity(value_probs: chex.Array) -> chex.Array:
+    """Convert 4-way value probabilities to scalar equity for money games.
+
+    Args:
+        value_probs: [win, gam_win_cond, gam_loss_cond, bg_rate]
+            - win: P(win)
+            - gam_win_cond: P(gammon | win)
+            - gam_loss_cond: P(gammon | loss)
+            - bg_rate: P(backgammon | gammon)
+
+    Returns:
+        Scalar equity in [-3, 3] for money games where:
+        - Normal win/loss: ±1
+        - Gammon win/loss: ±2
+        - Backgammon win/loss: ±3
+
+    For match play, this can be replaced with match equity table lookups.
+    """
+    win = value_probs[0]
+    gam_win_cond = value_probs[1]
+    gam_loss_cond = value_probs[2]
+    bg_rate = value_probs[3]
+
+    # Expected points when winning: 1 + P(gammon|win) * (1 + P(bg|gammon))
+    expected_win_points = 1.0 + gam_win_cond * (1.0 + bg_rate)
+    # Expected points when losing
+    expected_loss_points = 1.0 + gam_loss_cond * (1.0 + bg_rate)
+
+    # Equity = P(win) * E[points|win] - P(loss) * E[points|loss]
+    equity = win * expected_win_points - (1.0 - win) * expected_loss_points
+
+    return equity
+
 def bg_simple_step_fn(env: Env, state, action, key=None):
     """Simple step function for testing does not know about stochastic nodes."""
     # MCTS step_fn expects a key parameter, use it if provided, otherwise use fixed key
@@ -42,35 +76,60 @@ def bg_simple_step_fn(env: Env, state, action, key=None):
     )
 
 def bg_step_fn(env: Env, state: bg.State, action: int, key: chex.PRNGKey) -> Tuple[bg.State, StepMetadata]:
-    """Combined step function for backgammon environment that handles both deterministic and stochastic actions."""
-    # print(f"[DEBUG-BG_STEP-{time.time()}] Called with state (stochastic={state._is_stochastic}), action={action}") # Optional debug
+    """Combined step function for backgammon environment that handles both deterministic and stochastic actions.
+
+    This function preserves stochastic states at turn boundaries so that MCTS can properly
+    explore dice roll outcomes. When a turn ends, instead of auto-rolling dice (which env.step does),
+    we return a stochastic state requiring a dice roll.
+    """
 
     # Handle stochastic vs deterministic branches
     def stochastic_branch(operand):
-        s, a, _ = operand # state, action, key (key ignored for stochastic step)
-        # Use env instance captured by closure (assuming env is accessible in this scope)
+        s, a, _ = operand  # state, action, key (key ignored for stochastic step)
         return env.stochastic_step(s, a)
 
     def deterministic_branch(operand):
-        s, a, k = operand # state, action, key
-        # Use env instance captured by closure
+        s, a, k = operand  # state, action, key
+        old_turn = s._turn
         new_state = env.step(s, a, k)
-        # If the state becomes stochastic (player change), we want to keep it that way
-        # but prevent the automatic dice roll by setting playable_dice to -1
+        new_turn = new_state._turn
+
+        # Detect turn change: when turn increments, a stochastic dice roll is needed.
+        # env.step() auto-rolls dice, but for proper MCTS we need to preserve the
+        # stochastic state so the tree can explore different dice outcomes.
+        turn_changed = new_turn != old_turn
+
+        # Create legal action mask for stochastic state (dice roll actions 0-20 are valid)
+        # There are 21 dice outcomes: 6 doubles (0-5) + 15 non-doubles (6-20)
+        num_dice_outcomes = 21
+        stochastic_action_mask = jnp.concatenate([
+            jnp.ones(num_dice_outcomes, dtype=jnp.bool_),
+            jnp.zeros(new_state.legal_action_mask.shape[0] - num_dice_outcomes, dtype=jnp.bool_)
+        ])
+
+        # When turn changes, restore stochastic state for dice roll
+        def make_stochastic(ns):
+            return ns.replace(
+                _is_stochastic=jnp.array(True),
+                _dice=jnp.array([0, 0]),  # Reset dice (not rolled yet)
+                _playable_dice=jnp.array([-1, -1, -1, -1]),
+                _played_dice_num=jnp.array(0),
+                legal_action_mask=stochastic_action_mask
+            )
+
         return jax.lax.cond(
-            new_state._is_stochastic,
-            lambda s: s.replace(_playable_dice=jnp.array([-1, -1, -1, -1])),
-            lambda s: s,
+            turn_changed,
+            make_stochastic,
+            lambda ns: ns,
             new_state
         )
 
     # Use conditional to route to the appropriate branch
-    # The key is only needed for the deterministic branch
     new_state = jax.lax.cond(
         state._is_stochastic,
         stochastic_branch,
         deterministic_branch,
-        (state, action, key) # Pass all required operands
+        (state, action, key)
     )
 
     # Create standard metadata
@@ -79,10 +138,104 @@ def bg_step_fn(env: Env, state: bg.State, action: int, key: chex.PRNGKey) -> Tup
         action_mask=new_state.legal_action_mask,
         terminated=new_state.terminated,
         cur_player_id=new_state.current_player,
-        step=new_state._step_count
+        step=new_state._step_count,
+        is_stochastic=new_state._is_stochastic
     )
 
     return new_state, metadata
+
+
+def make_bg_decision_step_fn(env: Env):
+    """Create a decision step function for backgammon (for deterministic/player actions).
+
+    This function preserves stochastic states at turn boundaries so that MCTS can properly
+    explore dice roll outcomes. When a turn ends, instead of auto-rolling dice (which env.step does),
+    we return a stochastic state requiring a dice roll.
+    """
+    def step_fn(state, action, key=None):
+        action = jnp.asarray(action, dtype=jnp.int32)
+        step_key = key if key is not None else jax.random.PRNGKey(0)
+        old_turn = state._turn
+        new_state = env.step(state, action, step_key)
+        new_turn = new_state._turn
+
+        # Detect turn change: when turn increments, a stochastic dice roll is needed.
+        # env.step() auto-rolls dice, but for proper MCTS we need to preserve the
+        # stochastic state so the tree can explore different dice outcomes.
+        turn_changed = new_turn != old_turn
+
+        # Create legal action mask for stochastic state (dice roll actions 0-20 are valid)
+        num_dice_outcomes = 21
+        stochastic_action_mask = jnp.concatenate([
+            jnp.ones(num_dice_outcomes, dtype=jnp.bool_),
+            jnp.zeros(new_state.legal_action_mask.shape[0] - num_dice_outcomes, dtype=jnp.bool_)
+        ])
+
+        # When turn changes, restore stochastic state for dice roll
+        def make_stochastic(ns):
+            return ns.replace(
+                _is_stochastic=jnp.array(True),
+                _dice=jnp.array([0, 0]),
+                _playable_dice=jnp.array([-1, -1, -1, -1]),
+                _played_dice_num=jnp.array(0),
+                legal_action_mask=stochastic_action_mask
+            )
+
+        final_state = jax.lax.cond(
+            turn_changed,
+            make_stochastic,
+            lambda ns: ns,
+            new_state
+        )
+
+        return final_state, StepMetadata(
+            rewards=final_state.rewards,
+            action_mask=final_state.legal_action_mask,
+            terminated=final_state.terminated,
+            cur_player_id=final_state.current_player,
+            step=final_state._step_count,
+            is_stochastic=final_state._is_stochastic
+        )
+    return step_fn
+
+
+def make_bg_stochastic_step_fn(env: Env):
+    """Create a stochastic step function for backgammon (for dice roll outcomes)."""
+    def step_fn(state, outcome, key=None):
+        outcome = jnp.asarray(outcome, dtype=jnp.int32)
+        # Use env.step_stochastic for chance node outcomes (dice rolls)
+        new_state = env.step_stochastic(state, outcome)
+        return new_state, StepMetadata(
+            rewards=new_state.rewards,
+            action_mask=new_state.legal_action_mask,
+            terminated=new_state.terminated,
+            cur_player_id=new_state.current_player,
+            step=new_state._step_count,
+            is_stochastic=new_state._is_stochastic
+        )
+    return step_fn
+
+
+def make_bg_stochastic_aware_step_fn(env: Env):
+    """Create a step function that uses the appropriate sub-function based on state type.
+
+    This is a convenience function for tests and callers that need to step through
+    states without knowing in advance if they're stochastic or deterministic.
+
+    For production MCTS code, prefer using the separate decision_step_fn and
+    stochastic_step_fn directly for clarity and type safety.
+    """
+    decision_step = make_bg_decision_step_fn(env)
+    stochastic_step = make_bg_stochastic_step_fn(env)
+
+    def step_fn(state, action, key=None):
+        return jax.lax.cond(
+            state._is_stochastic,
+            lambda args: stochastic_step(args[0], args[1], args[2]),
+            lambda args: decision_step(args[0], args[1], args[2]),
+            (state, action, key)
+        )
+    return step_fn
 
 
 # --- Pip Count Eval Fn (for test evaluator) ---

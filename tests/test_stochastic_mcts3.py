@@ -13,8 +13,13 @@ from core.types import StepMetadata
 
 env = bg.Backgammon(simple_doubles=True)
 
-from core.bgcommon import bg_step_fn 
-from core.bgcommon import bg_pip_count_eval, bg_hit2_eval
+from core.bgcommon import (
+    bg_pip_count_eval,
+    bg_hit2_eval,
+    make_bg_decision_step_fn,
+    make_bg_stochastic_step_fn,
+    make_bg_stochastic_aware_step_fn
+)
 
 
 @pytest.mark.slow
@@ -27,17 +32,22 @@ def test_stochastic_mcts_backgammon_simple_doubles_valid_actions():
     """
     key = jax.random.PRNGKey(44) # Use a different seed
     
-    backgammon_step_fn = partial(bg_step_fn, env)
+    backgammon_step_fn = make_bg_stochastic_aware_step_fn(env)
    #backgammon_eval_fn = bg_pip_count_eval
     backgammon_eval_fn = bg_hit2_eval
 
     # --- MCTS setup for two players ---
+    decision_step = make_bg_decision_step_fn(env)
+    stochastic_step = make_bg_stochastic_step_fn(env)
+
     mcts_p0 = StochasticMCTS(
         eval_fn=backgammon_eval_fn,
         action_selector=PUCTSelector(),
-        branching_factor=env.num_actions,
-        max_nodes=200, 
+        policy_size=env.num_actions,
+        max_nodes=200,
         num_iterations=20, # Player 0 iterations
+        decision_step_fn=decision_step,
+        stochastic_step_fn=stochastic_step,
         stochastic_action_probs=env.stochastic_action_probs,
         temperature=0.0, # Greedy action selection
         persist_tree=True, # Player 0 persists tree
@@ -46,9 +56,11 @@ def test_stochastic_mcts_backgammon_simple_doubles_valid_actions():
     mcts_p1 = StochasticMCTS(
         eval_fn=backgammon_eval_fn,
         action_selector=PUCTSelector(),
-        branching_factor=env.num_actions,
-        max_nodes=200, 
+        policy_size=env.num_actions,
+        max_nodes=200,
         num_iterations=1, # Player 1 iterations
+        decision_step_fn=decision_step,
+        stochastic_step_fn=stochastic_step,
         stochastic_action_probs=env.stochastic_action_probs,
         temperature=0.0, # Greedy action selection
         persist_tree=False, # Player 1 does NOT persist tree
@@ -174,7 +186,7 @@ def test_traverse_through_stochastic_nodes():
     
 
     state = env.init(init_key)
-    backgammon_step_fn = partial(bg_step_fn, env)
+    backgammon_step_fn = make_bg_stochastic_aware_step_fn(env)
     
     state, metadata = backgammon_step_fn(state, 3, step_key) # dice roll of 4-4
     
@@ -182,12 +194,14 @@ def test_traverse_through_stochastic_nodes():
     mcts = StochasticMCTS(
         eval_fn=bg_pip_count_eval,
         action_selector=PUCTSelector(),
-        branching_factor=env.num_actions,
+        policy_size=env.num_actions,
         max_nodes=500,  # Large enough to store many nodes
         num_iterations=400,  # Enough iterations to explore deeply
+        decision_step_fn=make_bg_decision_step_fn(env),
+        stochastic_step_fn=make_bg_stochastic_step_fn(env),
         stochastic_action_probs=env.stochastic_action_probs,
         temperature=1.0,  # Some exploration temperature
-        persist_tree=True # Enable some debugging output
+        persist_tree=True
     )
     
     # Initialize evaluation state and metadata
@@ -289,7 +303,7 @@ def test_backpropagate_through_turn():
 
     key = jax.random.PRNGKey(42)
     key, init_key, eval_key, step_key = jax.random.split(key, 4)
-    step_fn = partial(bg_step_fn, env)
+    step_fn = make_bg_stochastic_aware_step_fn(env)
 
     state = env.init(init_key)
 
@@ -310,12 +324,14 @@ def test_backpropagate_through_turn():
     mcts = StochasticMCTS(
         eval_fn=bg_pip_count_eval,
         action_selector=PUCTSelector(),
-        branching_factor=env.num_actions,
+        policy_size=env.num_actions,
         max_nodes=500,  # Large enough to store many nodes
-        num_iterations=3,  
+        num_iterations=3,
+        decision_step_fn=make_bg_decision_step_fn(env),
+        stochastic_step_fn=make_bg_stochastic_step_fn(env),
         stochastic_action_probs=env.stochastic_action_probs,
         temperature=0.1,  # Some exploration temperature
-        persist_tree=True # Enable some debugging output
+        persist_tree=True
     )
 
     eval_state = mcts.init(template_embedding=state)
@@ -342,12 +358,14 @@ def test_stochastic_action_sample():
     mcts = StochasticMCTS(
         eval_fn=bg_pip_count_eval,
         action_selector=PUCTSelector(),
-        branching_factor=env.num_actions,
-        max_nodes=4,  # Large enough to store many nodes
-        num_iterations=2,  
+        policy_size=env.num_actions,
+        max_nodes=50,
+        num_iterations=10,
+        decision_step_fn=make_bg_decision_step_fn(env),
+        stochastic_step_fn=make_bg_stochastic_step_fn(env),
         stochastic_action_probs=env.stochastic_action_probs,
-        temperature=0.1,  # Some exploration temperature
-        persist_tree=True # Enable some debugging output
+        temperature=1.0,  # Temperature=1.0 for proper stochastic sampling
+        persist_tree=False  # Fresh tree each evaluation for independent samples
     )
 
     metadata = StepMetadata(
@@ -355,23 +373,25 @@ def test_stochastic_action_sample():
         action_mask=state.legal_action_mask,
         terminated=state.terminated,
         cur_player_id=state.current_player,
-        step=state._step_count)
-    
+        step=state._step_count,
+        is_stochastic=state._is_stochastic)  # Backgammon starts with dice roll
+
     eval_state = mcts.init(template_embedding=state)
 
-    # do an initial eval.
+    # Run 20 evaluations to test stochastic action sampling
     actions = []
-    for i in range(2):
-        key, eval_key, step_key = jax.random.split(key, 3)
+    for i in range(20):
+        key, eval_key = jax.random.split(key)
         mcts_output = mcts.evaluate(key=eval_key,
             eval_state=eval_state,
             env_state=state,
             root_metadata=metadata,
             params={},
-            env_step_fn=partial(bg_step_fn, env)
+            env_step_fn=make_bg_stochastic_aware_step_fn(env)
         )
         actions.append(mcts_output.action)
-    print(actions)
+        eval_state = mcts_output.eval_state  # Use returned state for next eval
+
     action_values = [int(a.item()) for a in actions]
 
     # Find the set of unique action values
@@ -382,7 +402,8 @@ def test_stochastic_action_sample():
 
     print(f"Unique actions found ({num_unique_actions}): {unique_actions_set}")
 
-    # Assert that we found at least 3 unique actions
+    # Assert that we found at least 2 unique actions over 20 evaluations
+    # With temperature=1.0 and multiple legal moves, we expect variation
     assert num_unique_actions >= 2, \
-        f"Expected at least 3 unique actions over 100 evaluations, but found only {num_unique_actions}. Unique actions: {unique_actions_set}"
+        f"Expected at least 2 unique actions over 20 evaluations, but found only {num_unique_actions}. Unique actions: {unique_actions_set}"
 

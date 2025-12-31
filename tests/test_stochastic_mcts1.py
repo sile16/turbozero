@@ -19,12 +19,17 @@ from core.evaluators.mcts.action_selection import PUCTSelector
 from core.trees.tree import Tree, init_tree
 from core.types import StepMetadata
 
-from core.bgcommon import bg_step_fn, bg_pip_count_eval
+from core.bgcommon import (
+    bg_pip_count_eval,
+    make_bg_decision_step_fn,
+    make_bg_stochastic_step_fn,
+    make_bg_stochastic_aware_step_fn
+)
 
-# Define the backgammon step function factory
+# Define the backgammon step function factory using stochastic-aware pattern
 def backgammon_step_fn(env: bg.Backgammon):
-    """Returns a step function closure for the backgammon environment."""
-    return partial(bg_step_fn, env)
+    """Returns a stochastic-aware step function closure for the backgammon environment."""
+    return make_bg_stochastic_aware_step_fn(env)
 
 # Define an evaluation function that uses pip count heuristic for the value
 @jax.jit
@@ -49,28 +54,9 @@ def mock_params():
     return {}
 
 @pytest.fixture
-def branching_factor(backgammon_env):
-    """Return the branching factor for backgammon."""
-    # Use num_actions from the env instance
-    return backgammon_env.num_actions
-
-@pytest.fixture
 def stochastic_action_probs(backgammon_env):
     """Get stochastic action probabilities from the backgammon environment."""
     return backgammon_env.stochastic_action_probs
-
-@pytest.fixture
-def mcts_config(branching_factor, stochastic_action_probs):
-    return {
-        "eval_fn": backgammon_eval_fn,
-        "action_selector": PUCTSelector(),
-        "branching_factor": branching_factor,
-        "max_nodes": 50, # Keep small for tests
-        "num_iterations": 20, # Reduced iterations for faster tests
-        "temperature": 0.0, # Greedy selection for testing
-        "persist_tree": True,
-        "stochastic_action_probs": stochastic_action_probs
-    }
 
 def test_step_stochastic(stochastic_mcts, backgammon_env, mock_params, key):
     """Test step method when the chosen action leads to a stochastic state."""
@@ -273,14 +259,16 @@ def test_sample_root_action(stochastic_mcts, backgammon_env, mock_params, key):
     greedy_mcts = StochasticMCTS(
         eval_fn=stochastic_mcts.eval_fn,
         action_selector=stochastic_mcts.action_selector,
-        branching_factor=stochastic_mcts.branching_factor,
+        policy_size=stochastic_mcts.policy_size,
         max_nodes=stochastic_mcts.max_nodes,
         num_iterations=stochastic_mcts.num_iterations,
+        decision_step_fn=make_bg_decision_step_fn(backgammon_env),
+        stochastic_step_fn=make_bg_stochastic_step_fn(backgammon_env),
         stochastic_action_probs=stochastic_mcts.stochastic_action_probs,
-        temperature=0.0, # Set temp to 0
+        temperature=0.0,
         persist_tree=stochastic_mcts.persist_tree
     )
-    
+
     # Use the configured MCTS to sample action
     greedy_action, _ = greedy_mcts.sample_root_action(sample_key_greedy, tree)
     assert greedy_action == jnp.argmax(policy_weights)
@@ -290,17 +278,19 @@ def test_sample_root_action(stochastic_mcts, backgammon_env, mock_params, key):
     temp_mcts = StochasticMCTS(
         eval_fn=stochastic_mcts.eval_fn,
         action_selector=stochastic_mcts.action_selector,
-        branching_factor=stochastic_mcts.branching_factor,
+        policy_size=stochastic_mcts.policy_size,
         max_nodes=stochastic_mcts.max_nodes,
         num_iterations=stochastic_mcts.num_iterations,
+        decision_step_fn=make_bg_decision_step_fn(backgammon_env),
+        stochastic_step_fn=make_bg_stochastic_step_fn(backgammon_env),
         stochastic_action_probs=stochastic_mcts.stochastic_action_probs,
-        temperature=1.0, # Set temp to 1.0
+        temperature=1.0,
         persist_tree=stochastic_mcts.persist_tree
     )
     # Sample action with temperature = 1.0
     temp_action, _ = temp_mcts.sample_root_action(sample_key_temp, tree)
     # Check if the sampled action is valid
-    assert temp_action >= 0 and temp_action < stochastic_mcts.branching_factor
+    assert temp_action >= 0 and temp_action < stochastic_mcts.policy_size
 
     print("test_sample_root_action PASSED")
 
@@ -406,9 +396,11 @@ def test_low_iteration_count(stochastic_mcts, backgammon_env, mock_params, key):
     low_iter_mcts = StochasticMCTS(
         eval_fn=stochastic_mcts.eval_fn,
         action_selector=stochastic_mcts.action_selector,
-        branching_factor=stochastic_mcts.branching_factor,
+        policy_size=stochastic_mcts.policy_size,
         max_nodes=stochastic_mcts.max_nodes,
-        num_iterations=1, # Set iterations to 1
+        num_iterations=1,
+        decision_step_fn=make_bg_decision_step_fn(backgammon_env),
+        stochastic_step_fn=make_bg_stochastic_step_fn(backgammon_env),
         stochastic_action_probs=stochastic_mcts.stochastic_action_probs,
         temperature=stochastic_mcts.temperature,
         persist_tree=stochastic_mcts.persist_tree
@@ -446,7 +438,7 @@ def test_low_iteration_count(stochastic_mcts, backgammon_env, mock_params, key):
 
     # Check that the root node has a policy
     assert det_root_data.p is not None
-    assert det_root_data.p.shape == (stochastic_mcts.branching_factor,)
+    assert det_root_data.p.shape == (stochastic_mcts.policy_size,)
 
     # --- Test with another state to verify proper processing ---
     # Start deterministic, evaluate, step to another state
@@ -498,7 +490,7 @@ def test_low_iteration_count(stochastic_mcts, backgammon_env, mock_params, key):
     # Final assertions on the tree structure
     assert stoch_tree.next_free_idx >= 1, "Tree should at least have the root node"
     assert stoch_root_data.p is not None
-    assert stoch_root_data.p.shape == (stochastic_mcts.branching_factor,)
+    assert stoch_root_data.p.shape == (stochastic_mcts.policy_size,)
     
     print("test_low_iteration_count PASSED")
 
@@ -856,28 +848,34 @@ def test_root_state_preservation(stochastic_mcts, backgammon_env, mock_params, k
     print("test_root_state_preservation PASSED")
 
 @pytest.fixture
-def stochastic_mcts(branching_factor, stochastic_action_probs):
+def stochastic_mcts(backgammon_env, stochastic_action_probs):
     """Create a real StochasticMCTS instance for testing without mocking."""
     return StochasticMCTS(
         eval_fn=backgammon_eval_fn,
         action_selector=PUCTSelector(),
-        branching_factor=branching_factor,
-        max_nodes=50, # Keep small for tests
-        num_iterations=20, # Reduced iterations for faster tests        temperature=0.0, # Greedy selection for testing
+        policy_size=backgammon_env.num_actions,
+        max_nodes=50,
+        num_iterations=20,
+        decision_step_fn=make_bg_decision_step_fn(backgammon_env),
+        stochastic_step_fn=make_bg_stochastic_step_fn(backgammon_env),
+        temperature=0.0,
         persist_tree=True,
         stochastic_action_probs=stochastic_action_probs
     )
 
 @pytest.fixture
-def non_persistent_mcts(branching_factor, stochastic_action_probs):
+def non_persistent_mcts(backgammon_env, stochastic_action_probs):
     """Create a non-persistent StochasticMCTS instance for testing without mocking."""
     return StochasticMCTS(
         eval_fn=backgammon_eval_fn,
         action_selector=PUCTSelector(),
-        branching_factor=branching_factor,
-        max_nodes=50, # Keep small for tests
-        num_iterations=20, # Reduced iterations for faster tests        temperature=0.0, # Greedy selection for testing
-        persist_tree=False, # Non-persistent
+        policy_size=backgammon_env.num_actions,
+        max_nodes=50,
+        num_iterations=20,
+        decision_step_fn=make_bg_decision_step_fn(backgammon_env),
+        stochastic_step_fn=make_bg_stochastic_step_fn(backgammon_env),
+        temperature=0.0,
+        persist_tree=False,
         stochastic_action_probs=stochastic_action_probs
     )
 
