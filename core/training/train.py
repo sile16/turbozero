@@ -385,9 +385,12 @@ class Trainer:
                 )
             )
         # assign rewards to buffer if episode is terminated
+        # IMPORTANT: For terminated episodes, pass bootstrap_value=0 because the terminal
+        # reward is already captured in step_reward. Passing the terminal reward again
+        # would double-count it (V = step_r + gamma * V_next, where V_next should be 0).
         buffer_state = jax.lax.cond(
             terminated,
-            lambda s: self.memory_buffer.assign_rewards(s, rewards),
+            lambda s: self.memory_buffer.assign_rewards(s, jnp.zeros_like(rewards)),
             lambda s: s,
             buffer_state
         )
@@ -555,12 +558,13 @@ class Trainer:
             ts = update_batch_stats(ts)
 
         # Stack metrics into array for JAX compatibility inside fori_loop
-        # Order: loss, policy_loss, value_loss, policy_entropy, policy_accuracy, grad_norm, param_norm,
+        # Order: loss, policy_loss, value_loss, illegal_action_loss, policy_entropy, policy_accuracy, grad_norm, param_norm,
         #        value_target_mean, value_target_std, value_target_max, value_pred_mean, step_reward_sum, reward_sum
         metrics_array = jnp.array([
             loss,
             metrics_dict.get('policy_loss', 0.0),
             metrics_dict.get('value_loss', 0.0),
+            metrics_dict.get('illegal_action_loss', 0.0),
             metrics_dict.get('policy_entropy', 0.0),
             metrics_dict.get('policy_accuracy', 0.0),
             grad_norm,
@@ -593,7 +597,7 @@ class Trainer:
         - (TrainState, Array): updated train state and metrics array (num_steps, num_metrics)
         """
         num_steps = jax.tree_util.tree_leaves(batches)[0].shape[0]
-        num_metrics = 13  # loss, policy_loss, value_loss, policy_entropy, policy_accuracy, grad_norm, param_norm, value_target_mean/std/max, value_pred_mean, step_reward_sum, reward_sum
+        num_metrics = 14  # loss, policy_loss, value_loss, illegal_action_loss, policy_entropy, policy_accuracy, grad_norm, param_norm, value_target_mean/std/max, value_pred_mean, step_reward_sum, reward_sum
 
         def loop_body(i, carry):
             ts, metrics_acc = carry
@@ -678,7 +682,7 @@ class Trainer:
         std_metrics = metrics_array.std(axis=0)
 
         # Convert back to dict
-        metric_names = ['loss', 'policy_loss', 'value_loss', 'policy_entropy', 'policy_accuracy', 'grad_norm', 'param_norm',
+        metric_names = ['loss', 'policy_loss', 'value_loss', 'illegal_action_loss', 'policy_entropy', 'policy_accuracy', 'grad_norm', 'param_norm',
                         'value_target_mean', 'value_target_std', 'value_target_max', 'value_pred_mean', 'step_reward_sum', 'reward_sum']
         metrics = {}
         for i, name in enumerate(metric_names):
@@ -708,19 +712,48 @@ class Trainer:
                 flat_metrics[k] = v
 
         # Extract key metrics for console display (only show important ones)
-        console_keys = ['loss', 'policy_loss', 'value_loss', 'policy_accuracy', 'grad_norm',
-                        'buffer/trainable_samples', 'buffer/fullness_pct',
-                        'value_target_mean', 'value_target_std', 'value_target_max', 'value_pred_mean', 'step_reward_sum', 'reward_sum']
+        # Ordered: avg metrics first (most important), then debugging metrics
+        console_keys_ordered = [
+            # Primary metrics (averages)
+            'loss', 'policy_loss', 'value_loss', 'policy_accuracy',
+            # Episode reward (avg)
+            'collect/episode_reward/avg',
+        ]
+        console_keys_debug = [
+            # Debugging metrics (less important)
+            'grad_norm', 'value_target_mean', 'value_target_std', 'value_target_max',
+            'value_pred_mean', 'step_reward_sum', 'reward_sum',
+            'buffer/trainable_samples', 'buffer/fullness_pct',
+        ]
+
+        # Build ordered console metrics
         console_metrics = {}
+
+        # First pass: add metrics in order of console_keys_ordered
+        for k in console_keys_ordered:
+            if k in flat_metrics:
+                v = flat_metrics[k]
+                if hasattr(v, 'item') and callable(getattr(v, 'item')):
+                    console_metrics[k] = f"{v.item():.4f}"
+                elif isinstance(v, (int, float)):
+                    console_metrics[k] = f"{v:.4f}"
+
+        # Second pass: add eval/tester reward averages (any key ending in _reward/avg)
         for k, v in flat_metrics.items():
-            # Only show important scalar values in console output
-            base_key = k.split('/')[-1] if '/' in k else k
-            if base_key not in console_keys and not k.endswith(('_avg_outcome', '_max_outcome', '_min_outcome')):
-                continue
-            if hasattr(v, 'item') and callable(getattr(v, 'item')):
-                console_metrics[k] = f"{v.item():.4f}"
-            elif isinstance(v, (int, float)):
-                console_metrics[k] = f"{v:.4f}"
+            if k.endswith('_reward/avg') and k not in console_metrics:
+                if hasattr(v, 'item') and callable(getattr(v, 'item')):
+                    console_metrics[k] = f"{v.item():.4f}"
+                elif isinstance(v, (int, float)):
+                    console_metrics[k] = f"{v:.4f}"
+
+        # Third pass: add debug metrics
+        for k in console_keys_debug:
+            if k in flat_metrics and k not in console_metrics:
+                v = flat_metrics[k]
+                if hasattr(v, 'item') and callable(getattr(v, 'item')):
+                    console_metrics[k] = f"{v.item():.4f}"
+                elif isinstance(v, (int, float)):
+                    console_metrics[k] = f"{v:.4f}"
 
         # log to console
         print(f"Epoch {epoch}: {console_metrics}")
@@ -730,7 +763,7 @@ class Trainer:
             wandb_metrics = {}
 
             # Training metrics (loss, policy, value, etc.)
-            training_keys = ['loss', 'policy_loss', 'value_loss', 'l2_reg', 'policy_entropy',
+            training_keys = ['loss', 'policy_loss', 'value_loss', 'illegal_action_loss', 'l2_reg', 'policy_entropy',
                            'policy_accuracy', 'policy_kl', 'value_accuracy', 'value_entropy',
                            'loss_std', 'policy_loss_std', 'value_loss_std',
                            'grad_norm', 'grad_norm_std', 'param_norm']
@@ -742,7 +775,10 @@ class Trainer:
             for k, v in flat_metrics.items():
                 if k.startswith(('buffer/', 'mcts/', 'game/', 'collect/', 'train/', 'eval/')):
                     wandb_metrics[k] = v
-                # Handle tester metrics (e.g., pretrained_avg_outcome -> eval/pretrained_avg_outcome)
+                # Handle tester metrics with slash notation (e.g., vs_random_reward/avg -> eval/vs_random_reward/avg)
+                elif '_reward/' in k or '_first_reward/' in k or '_second_reward/' in k:
+                    wandb_metrics[f'eval/{k}'] = v
+                # Handle legacy tester metrics (e.g., pretrained_avg_outcome -> eval/pretrained_avg_outcome)
                 elif k.endswith(('_avg_outcome', '_max_outcome', '_min_outcome', '_avg_length')):
                     wandb_metrics[f'eval/{k}'] = v
                 elif k.endswith('_win_rate') or k.endswith('_loss_rate') or k.endswith('_draw_rate'):
@@ -1019,11 +1055,13 @@ class Trainer:
             min_length = jnp.where(games_completed > 0, min_length, 0)
 
             metrics["buffer/avg_game_length"] = avg_game_length
-            metrics["collect/avg_episode_reward"] = avg_reward
-            metrics["collect/max_episode_reward"] = max_reward
-            metrics["collect/min_episode_reward"] = min_reward
-            metrics["collect/max_episode_length"] = max_length
-            metrics["collect/min_episode_length"] = min_length
+            # Episode reward and length use slash notation for WandB grouping (min/avg/max on same graph)
+            metrics["collect/episode_reward/min"] = min_reward
+            metrics["collect/episode_reward/avg"] = avg_reward
+            metrics["collect/episode_reward/max"] = max_reward
+            metrics["collect/episode_length/min"] = min_length
+            metrics["collect/episode_length/avg"] = avg_game_length
+            metrics["collect/episode_length/max"] = max_length
 
             # Add MCTS tree statistics (sample from first device, first batch element)
             if hasattr(self.evaluator_train, 'get_tree_stats'):

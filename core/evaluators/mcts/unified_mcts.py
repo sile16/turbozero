@@ -25,7 +25,16 @@ from core.evaluators.mcts.state import (
     MCTSOutput, TraversalState,
     StochasticMCTSNode, StochasticMCTSTree
 )
-from core.evaluators.mcts.gumbel import gumbel_top_k
+from core.evaluators.mcts.gumbel import (
+    gumbel_top_k,
+    sigma_q,
+    compute_gumbel_score,
+    get_action_to_simulate,
+    eliminate_half,
+    select_action_after_halving,
+    compute_improved_policy,
+    sequential_halving_phases,
+)
 from core.types import EvalFn, StepMetadata
 from core.trees.tree import init_tree
 
@@ -142,11 +151,20 @@ class UnifiedMCTS(Evaluator):
         stochastic_action_probs: Optional[chex.Array] = None,
         gumbel_k: int = 16,
         temperature: Temperature = 1.0,
-        dirichlet_alpha: float = 0.3,
-        dirichlet_epsilon: float = 0.25,
+        c_visit: float = 50.0,
+        c_scale: float = 1.0,
         tiebreak_noise: float = 1e-8,
     ):
         """Initialize UnifiedMCTS.
+
+        Uses Gumbel AlphaZero algorithm from "Policy improvement by planning with Gumbel"
+        (ICLR 2022) https://openreview.net/forum?id=bERaNdoegnO
+
+        Key features:
+        - Gumbel-Top-k sampling for exploration (replaces Dirichlet noise)
+        - Sequential Halving progressively eliminates actions
+        - σ(q̂) scaling normalizes Q-values for action selection
+        - Improved policy from g(a) + logits(a) + σ(q̂(a))
 
         Args:
             eval_fn: Neural network evaluation function (state, params, key) -> (policy_logits, value)
@@ -161,8 +179,8 @@ class UnifiedMCTS(Evaluator):
             temperature: Temperature for final action selection. Can be:
                 - float: constant temperature (0 = greedy)
                 - callable: function (epoch: int) -> float for temperature annealing
-            dirichlet_alpha: Dirichlet noise alpha (for exploration)
-            dirichlet_epsilon: Dirichlet noise weight (0 = no noise)
+            c_visit: Visit count offset for σ(q̂) scaling (default: 50, from paper)
+            c_scale: Scale factor for σ(q̂) (default: 1.0, from paper)
             tiebreak_noise: Small noise for breaking ties
         """
         self.eval_fn = eval_fn
@@ -171,8 +189,8 @@ class UnifiedMCTS(Evaluator):
         self.max_nodes = max_nodes
         self.num_iterations = num_iterations
         self.decision_step_fn = decision_step_fn
-        self.dirichlet_alpha = dirichlet_alpha
-        self.dirichlet_epsilon = dirichlet_epsilon
+        self.c_visit = c_visit
+        self.c_scale = c_scale
         self.tiebreak_noise = tiebreak_noise
         self.gumbel_k = min(gumbel_k, policy_size)  # Can't sample more than available
 
@@ -186,23 +204,26 @@ class UnifiedMCTS(Evaluator):
         self._current_epoch = 0
 
         # Stochastic game support
-        self.stochastic_action_probs = stochastic_action_probs
         self.is_stochastic_game = stochastic_action_probs is not None
 
         if self.is_stochastic_game:
+            self.stochastic_action_probs = stochastic_action_probs
             self.stochastic_step_fn = stochastic_step_fn
             self.stochastic_size = len(stochastic_action_probs)
             # Total branching factor = decision actions + stochastic outcomes
             self.branching_factor = policy_size + self.stochastic_size
         else:
-            # Identity function for non-stochastic games
+            # For deterministic games, provide dummy values for JAX tracing
+            # jax.lax.cond traces both branches, so stochastic code paths need valid arrays
+            # Use single-element dummy array so operations like jax.random.choice work during tracing
+            self.stochastic_action_probs = jnp.array([1.0])  # Dummy single-element for tracing
             self.stochastic_step_fn = lambda s, a, k: (s, StepMetadata(
                 rewards=jnp.zeros(2), action_mask=jnp.ones(policy_size, dtype=bool),
                 terminated=jnp.array(False), cur_player_id=jnp.array(0), step=jnp.array(0),
                 is_stochastic=jnp.array(False)
             ))
-            self.stochastic_size = 0
-            self.branching_factor = policy_size
+            self.stochastic_size = 1  # Match dummy array size
+            self.branching_factor = policy_size + 1  # Extra slot for dummy stochastic
 
     @property
     def temperature(self) -> float:
@@ -249,8 +270,8 @@ class UnifiedMCTS(Evaluator):
             "is_stochastic_game": self.is_stochastic_game,
             "stochastic_size": self.stochastic_size,
             "branching_factor": self.branching_factor,
-            "dirichlet_alpha": self.dirichlet_alpha,
-            "dirichlet_epsilon": self.dirichlet_epsilon,
+            "c_visit": self.c_visit,
+            "c_scale": self.c_scale,
             "action_selector": self.action_selector.get_config(),
         }
 
@@ -319,7 +340,14 @@ class UnifiedMCTS(Evaluator):
         root_metadata: StepMetadata,
         params: chex.ArrayTree,
     ) -> MCTSOutput:
-        """Evaluate when root is a decision node (player's turn)."""
+        """Evaluate when root is a decision node (player's turn).
+
+        Implements full Gumbel AlphaZero algorithm:
+        1. Gumbel-Top-k samples k actions without replacement
+        2. Sequential Halving progressively eliminates actions
+        3. σ(q̂) scaling normalizes Q-values for action selection
+        4. Improved policy computed from g(a) + logits(a) + σ(q̂(a))
+        """
         key, root_key, gumbel_key, sample_key = jax.random.split(key, 4)
 
         # Update root if tree is empty (first call or after stepping to unexplored child)
@@ -343,33 +371,112 @@ class UnifiedMCTS(Evaluator):
             lambda: legal_mask[:self.policy_size]
         )
 
-        # Sample k actions using Gumbel-Top-k
-        selected_actions, _ = gumbel_top_k(gumbel_key, root_logits, self.gumbel_k, legal_mask)
+        # Sample k actions using Gumbel-Top-k (this replaces Dirichlet noise for exploration)
+        selected_actions, gumbel_logits = gumbel_top_k(gumbel_key, root_logits, self.gumbel_k, legal_mask)
 
-        # Run MCTS iterations
+        # Initialize Sequential Halving state
+        # All k actions start as active
+        active_mask = jnp.ones(self.gumbel_k, dtype=bool)
+
+        # Compute number of phases and iterations per phase
+        num_phases = sequential_halving_phases(self.num_iterations, self.gumbel_k)
+        iters_per_phase = self.num_iterations // max(num_phases, 1)
+
+        # Run MCTS iterations with Sequential Halving
         def scan_body(carry, iteration):
-            state, k = carry
+            state, k, active = carry
             k, iter_key = jax.random.split(k)
-            new_state = self._gumbel_iterate(iter_key, state, iteration, params, selected_actions, legal_mask)
-            return (new_state, k), None
+
+            # Run one iteration
+            new_state = self._gumbel_iterate(
+                iter_key, state, iteration, params, selected_actions, active, gumbel_logits, legal_mask
+            )
+
+            # Check if we should eliminate half at phase boundary
+            # Phase boundary occurs every iters_per_phase iterations (but not at iteration 0)
+            is_phase_boundary = jnp.logical_and(
+                iteration > 0,
+                (iteration + 1) % iters_per_phase == 0
+            )
+
+            # Get Q-values and visit counts for elimination decision
+            root_q = new_state.get_child_data('q', new_state.ROOT_INDEX)[:self.policy_size]
+            root_visits = new_state.get_child_data('n', new_state.ROOT_INDEX)[:self.policy_size]
+
+            # Eliminate half of active actions based on Gumbel scores
+            new_active = jax.lax.cond(
+                is_phase_boundary,
+                lambda: eliminate_half(
+                    selected_actions, active, gumbel_logits, root_q, root_visits,
+                    self.c_visit, self.c_scale
+                ),
+                lambda: active
+            )
+
+            return (new_state, k, new_active), None
 
         iterations = jnp.arange(self.num_iterations)
-        (eval_state, _), _ = jax.lax.scan(scan_body, (eval_state, key), iterations)
+        (eval_state, _, final_active), _ = jax.lax.scan(
+            scan_body, (eval_state, key, active_mask), iterations
+        )
 
-        # Sample action from visit counts
-        action, policy_weights = self._sample_root_action(sample_key, eval_state, root_metadata.action_mask)
+        # Get final Q-values and visit counts
+        root_q = eval_state.get_child_data('q', eval_state.ROOT_INDEX)[:self.policy_size]
+        root_visits = eval_state.get_child_data('n', eval_state.ROOT_INDEX)[:self.policy_size]
+
+        # Get root value for completing unvisited Q-values
+        root_value = eval_state.data.q[eval_state.ROOT_INDEX]
+
+        # Select action using Gumbel scores (g(a) + logits(a) + σ(q̂(a)))
+        action = select_action_after_halving(
+            gumbel_logits, root_q, root_visits, selected_actions, legal_mask,
+            self.c_visit, self.c_scale
+        )
+
+        # Compute improved policy for training
+        # Uses logits (not gumbel_logits) and completed Q-values per the paper:
+        # π'(a) ∝ exp(logits(a) + σ(q̂(a)))
+        policy_weights = compute_improved_policy(
+            root_logits, root_q, root_visits, legal_mask, root_value,
+            self.c_visit, self.c_scale
+        )
+
+        # Apply temperature for action sampling (if not greedy)
+        action = self._apply_temperature_to_action(sample_key, action, policy_weights, legal_mask)
 
         # Compute MCTS stats
         tree_size = eval_state.next_free_idx
-        root_visits = eval_state.data.n[eval_state.ROOT_INDEX]
+        root_visits_total = eval_state.data.n[eval_state.ROOT_INDEX]
 
         return MCTSOutput(
             eval_state=eval_state,
             action=action,
             policy_weights=policy_weights[:self.policy_size],
             tree_size=tree_size,
-            root_visits=root_visits,
+            root_visits=root_visits_total,
         )
+
+    def _apply_temperature_to_action(
+        self,
+        key: chex.PRNGKey,
+        greedy_action: int,
+        policy_weights: chex.Array,
+        legal_mask: chex.Array,
+    ) -> int:
+        """Apply temperature to action selection.
+
+        If temperature > 0, sample from policy_weights raised to 1/temperature.
+        If temperature == 0, return greedy action.
+        """
+        safe_temp = jnp.maximum(self.temperature, 1e-8)
+
+        def sample_with_temp():
+            tempered = jnp.power(jnp.maximum(policy_weights, 1e-10), 1.0 / safe_temp)
+            tempered = jnp.where(legal_mask, tempered, 0.0)
+            tempered = tempered / jnp.maximum(jnp.sum(tempered), 1e-8)
+            return jax.random.choice(key, self.policy_size, p=tempered)
+
+        return jax.lax.cond(self.temperature > 0, sample_with_temp, lambda: greedy_action)
 
     def _evaluate_stochastic_root(
         self,
@@ -425,7 +532,11 @@ class UnifiedMCTS(Evaluator):
         params: chex.ArrayTree,
         root_metadata: StepMetadata,
     ) -> StochasticMCTSTree:
-        """Initialize root node for decision state."""
+        """Initialize root node for decision state.
+
+        Uses clean policy without Dirichlet noise. Exploration is handled by
+        Gumbel-Top-k sampling in _evaluate_decision_root.
+        """
         policy_logits, value = self.eval_fn(env_state, params, key)
 
         # Convert 4-way value to scalar if needed
@@ -439,15 +550,9 @@ class UnifiedMCTS(Evaluator):
         )
         policy = jax.nn.softmax(policy_logits)
 
-        # Pad policy to branching_factor if needed
+        # Pad policy to branching_factor (no Dirichlet noise - Gumbel handles exploration)
         full_policy = jnp.zeros(self.branching_factor)
         full_policy = full_policy.at[:self.policy_size].set(policy)
-
-        # Add Dirichlet noise for exploration
-        key, noise_key = jax.random.split(key)
-        noise = jax.random.dirichlet(noise_key, jnp.ones(self.policy_size) * self.dirichlet_alpha)
-        noisy_policy = (1 - self.dirichlet_epsilon) * policy + self.dirichlet_epsilon * noise
-        full_policy = full_policy.at[:self.policy_size].set(noisy_policy)
 
         root_node = self._new_node(
             policy=full_policy,
@@ -497,26 +602,24 @@ class UnifiedMCTS(Evaluator):
         iteration: int,
         params: chex.ArrayTree,
         selected_actions: chex.Array,
+        active_mask: chex.Array,
+        gumbel_logits: chex.Array,
         legal_mask: chex.Array,
     ) -> StochasticMCTSTree:
-        """Single MCTS iteration with Gumbel selection at root."""
+        """Single MCTS iteration with Sequential Halving at root.
+
+        Uses get_action_to_simulate to select which action to explore,
+        prioritizing actions with minimum visits among active actions.
+        """
         traverse_key, expand_key, backprop_key = jax.random.split(key, 3)
 
-        # Select action from Gumbel-sampled set (prefer minimum visits)
+        # Get current visit counts for selected actions
         root_child_visits = tree.get_child_data('n', tree.ROOT_INDEX)[:self.policy_size]
-        selected_visits = root_child_visits[selected_actions]
 
-        # Mask out illegal actions - set their visits to infinity so they're never picked
-        selected_legal = legal_mask[selected_actions]
-        masked_visits = jnp.where(selected_legal, selected_visits, jnp.inf)
-
-        # Pick action with minimum visits (among legal ones)
-        min_visits = jnp.min(masked_visits)
-        is_min_mask = masked_visits == min_visits
-        action_idx = jnp.argmax(
-            is_min_mask * (1.0 + 0.1 * (jnp.arange(self.gumbel_k) == (iteration % self.gumbel_k)))
+        # Select action using Sequential Halving (minimum visits among active legal actions)
+        root_action = get_action_to_simulate(
+            iteration, selected_actions, root_child_visits, active_mask, traverse_key, legal_mask
         )
-        root_action = selected_actions[action_idx]
 
         # Traverse tree from root
         traversal_state = self._traverse(traverse_key, tree, root_action)
