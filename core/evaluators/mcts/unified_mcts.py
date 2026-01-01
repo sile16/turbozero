@@ -739,13 +739,27 @@ class UnifiedMCTS(Evaluator):
         return jax.lax.cond(root_child_exists, traverse_deeper, start_from_root)
 
     def _cond_action_selector(self, key: chex.PRNGKey, tree: StochasticMCTSTree, node_idx: int) -> int:
-        """Select action based on node type (stochastic or decision)."""
-        is_stochastic = self._is_chance_node(tree, node_idx)
+        """Select action based on node type using branchless arithmetic.
 
+        Why: Replaces control flow with simple math, allowing XLA to fuse the entire
+        traversal loop into a single efficient GPU kernel.
+        """
+        # 1. Cast boolean flag to float (0.0 or 1.0)
+        # is_chance = 1.0 if stochastic, 0.0 if decision
+        is_chance = self._is_chance_node(tree, node_idx).astype(jnp.float32)
+
+        # 2. Compute BOTH candidates unconditionally
+        # This is safe because both selectors rely on array lookups that are valid for any node
         stochastic_action = self._stochastic_action_selector(key, tree, node_idx)
         decision_action = self.action_selector(tree, node_idx)
 
-        return jax.lax.cond(is_stochastic, lambda: stochastic_action, lambda: decision_action)
+        # 3. Blend results using the mask
+        # If is_chance=1.0: (1.0 * stoch) + (0.0 * decis) = stoch
+        # If is_chance=0.0: (0.0 * stoch) + (1.0 * decis) = decis
+        final_action = (is_chance * stochastic_action) + ((1.0 - is_chance) * decision_action)
+
+        # Cast back to int for indexing
+        return final_action.astype(jnp.int32)
 
     def _stochastic_action_selector(self, key: chex.PRNGKey, tree: StochasticMCTSTree, node_idx: int) -> int:
         """Select action at a stochastic node.
@@ -879,79 +893,106 @@ class UnifiedMCTS(Evaluator):
         chance_node_embedding: chex.ArrayTree,
         params: chex.ArrayTree,
     ) -> ExpandResult:
-        """Expand ALL stochastic outcomes from a chance node at once.
+        """Expand ALL stochastic outcomes from a chance node at once using vmap.
 
         This is called immediately when a chance node is created, ensuring all
         outcomes are evaluated before any selection happens.
 
+        Uses vmap to process all outcomes in parallel:
+        1. Batch step: vmap over stochastic_step_fn for all outcomes
+        2. Batch eval: vmap over eval_fn for all resulting states
+        3. Sequential update: Add nodes to tree (inherently sequential)
+
+        This reduces latency from O(K) to O(1) for the expensive NN evaluations.
+
         Returns weighted average value based on outcome probabilities.
         """
-        # Use scan to expand each outcome sequentially
-        def expand_one_outcome(carry, outcome_idx):
-            current_tree, current_key = carry
-            current_key, step_key, eval_key = jax.random.split(current_key, 3)
+        # Generate all keys upfront for parallel processing
+        outcome_indices = jnp.arange(self.stochastic_size)
+        step_keys = jax.random.split(key, self.stochastic_size)
+        eval_keys = jax.random.split(jax.random.fold_in(key, 1), self.stochastic_size)
 
-            # Step with this outcome
-            new_embedding, metadata = self.stochastic_step_fn(
-                chance_node_embedding, outcome_idx, step_key
-            )
+        # Step 1: Batch step - vmap over all stochastic outcomes
+        # This steps the environment for all outcomes in parallel
+        def step_one_outcome(outcome_idx, step_key):
+            return self.stochastic_step_fn(chance_node_embedding, outcome_idx, step_key)
 
-            # Evaluate
-            policy_logits, value = self.eval_fn(new_embedding, params, eval_key)
-            scalar_value = _value_to_scalar(value)
+        all_embeddings, all_metadata = jax.vmap(step_one_outcome)(outcome_indices, step_keys)
 
-            # Handle terminal
-            player_reward = metadata.rewards[metadata.cur_player_id]
-            scalar_value = jnp.where(metadata.terminated, player_reward, scalar_value)
+        # Step 2: Batch eval - vmap over all resulting states
+        # This runs the neural network on all states in a single batched call
+        def eval_one_state(embedding, eval_key):
+            return self.eval_fn(embedding, params, eval_key)
 
-            # Build policy
-            policy_logits = jnp.where(
-                metadata.action_mask[:self.policy_size],
+        all_policy_logits, all_values = jax.vmap(eval_one_state)(all_embeddings, eval_keys)
+
+        # Convert values to scalars (handle 4-way value heads)
+        all_scalar_values = jax.vmap(_value_to_scalar)(all_values)
+
+        # Handle terminal states - use rewards if terminated
+        all_player_rewards = jax.vmap(
+            lambda rewards, player_id: rewards[player_id]
+        )(all_metadata.rewards, all_metadata.cur_player_id)
+        all_scalar_values = jnp.where(
+            all_metadata.terminated, all_player_rewards, all_scalar_values
+        )
+
+        # Build policies for all outcomes in parallel
+        def build_policy(policy_logits, action_mask, is_next_stochastic):
+            # Mask illegal actions
+            masked_logits = jnp.where(
+                action_mask[:self.policy_size],
                 policy_logits,
                 jnp.finfo(jnp.float32).min
             )
-            policy = jax.nn.softmax(policy_logits)
+            policy = jax.nn.softmax(masked_logits)
 
+            # Build full policy based on whether next state is stochastic
             full_policy = jnp.zeros(self.branching_factor)
-            is_next_stochastic = getattr(metadata, 'is_stochastic', jnp.array(False))
-            full_policy = jax.lax.cond(
-                is_next_stochastic,
-                lambda: full_policy.at[self.policy_size:self.policy_size + self.stochastic_size].set(
-                    self.stochastic_action_probs
-                ),
-                lambda: full_policy.at[:self.policy_size].set(policy)
+            stoch_policy = full_policy.at[self.policy_size:self.policy_size + self.stochastic_size].set(
+                self.stochastic_action_probs
             )
+            decision_policy = full_policy.at[:self.policy_size].set(policy)
 
-            # Create child node
+            # Branchless selection between stochastic and decision policy
+            is_stoch_float = is_next_stochastic.astype(jnp.float32)
+            return is_stoch_float * stoch_policy + (1.0 - is_stoch_float) * decision_policy
+
+        all_is_next_stochastic = getattr(all_metadata, 'is_stochastic', jnp.zeros(self.stochastic_size, dtype=bool))
+        all_policies = jax.vmap(build_policy)(all_policy_logits, all_metadata.action_mask, all_is_next_stochastic)
+
+        # Step 3: Sequential update - add all nodes to tree
+        # Tree updates are inherently sequential, but the expensive computation is done
+        def add_one_node(current_tree, idx):
+            # Extract data for this outcome
+            embedding = jax.tree_util.tree_map(lambda x: x[idx], all_embeddings)
+            policy = all_policies[idx]
+            value = all_scalar_values[idx]
+            terminated = all_metadata.terminated[idx]
+            is_chance = all_is_next_stochastic[idx]
+
             node_data = self._new_node(
-                policy=full_policy,
-                value=scalar_value,
-                embedding=new_embedding,
-                terminated=metadata.terminated,
-                nn_value_estimate=scalar_value,
-                is_chance_node=is_next_stochastic
+                policy=policy,
+                value=value,
+                embedding=embedding,
+                terminated=terminated,
+                nn_value_estimate=value,
+                is_chance_node=is_chance
             )
 
             # Add to tree at action = policy_size + outcome_idx
-            action = self.policy_size + outcome_idx
+            action = self.policy_size + idx
             updated_tree = current_tree.add_node(
                 parent_index=chance_node_idx,
                 edge_index=action,
                 data=node_data
             )
+            return updated_tree, None
 
-            return (updated_tree, current_key), scalar_value
-
-        # Expand all outcomes
-        outcome_indices = jnp.arange(self.stochastic_size)
-        (final_tree, _), all_values = jax.lax.scan(
-            expand_one_outcome,
-            (tree, key),
-            outcome_indices
-        )
+        final_tree, _ = jax.lax.scan(add_one_node, tree, outcome_indices)
 
         # Compute weighted average value
-        weighted_value = jnp.sum(all_values * self.stochastic_action_probs)
+        weighted_value = jnp.sum(all_scalar_values * self.stochastic_action_probs)
 
         return ExpandResult(tree=final_tree, child_idx=chance_node_idx, value=weighted_value)
 
