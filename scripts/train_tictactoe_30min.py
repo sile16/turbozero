@@ -10,6 +10,11 @@ Usage:
 """
 
 import os
+
+# Limit JAX GPU memory to 40% to allow sharing with other users
+# Must be set BEFORE importing JAX
+os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.4'
+
 import time
 import pickle
 import jax
@@ -28,7 +33,19 @@ from core.types import StepMetadata
 
 
 # ============================================================================
-# Configuration
+# Configuration - Matches alpha-zero-general baseline
+# ============================================================================
+# Reference: https://github.com/suragnair/alpha-zero-general
+# Their setup:
+#   - ~100 iterations, 25 episodes/iter = ~2500 games
+#   - ~15,000 samples in buffer (2500 games × 6 moves)
+#   - 10 training epochs per iteration over full buffer
+#   - ~100,000+ total gradient updates
+#
+# Our matching config:
+#   - 100 epochs, 1000 train steps/epoch = 100,000 gradient updates
+#   - Buffer size 15,000 to match their replay size
+#   - 25 MCTS simulations per move
 # ============================================================================
 TRAINING_TIME_MINUTES = 30
 SEED = 42
@@ -36,31 +53,34 @@ SEED = 42
 # Environment
 ENV_NAME = "tic_tac_toe"
 
-# Network - medium size for balance of quality and speed
-NUM_BLOCKS = 4
-NUM_CHANNELS = 64
+# Network - small, similar to alpha-zero-general's simple CNN
+# alpha-zero-general uses: Conv(512) -> BN -> ReLU -> Conv(512) -> BN -> ReLU -> FC
+NUM_BLOCKS = 2         # ~2 conv layers like baseline
+NUM_CHANNELS = 32      # Smaller game = smaller network
 
-# MCTS (training) - moderate iterations for quality/speed balance
-TRAIN_MCTS_ITERATIONS = 100
-TRAIN_MCTS_MAX_NODES = 200
-TRAIN_GUMBEL_K = 9  # 9 possible actions in TicTacToe
+# MCTS (training) - 25 simulations like alpha-zero-general
+TRAIN_MCTS_ITERATIONS = 25   # Match baseline
+TRAIN_MCTS_MAX_NODES = 50    # 2x iterations is plenty
+TRAIN_GUMBEL_K = 9           # 9 possible actions in TicTacToe
 
 # MCTS (evaluation) - same as training for consistency
-EVAL_MCTS_ITERATIONS = 100
-EVAL_MCTS_MAX_NODES = 200
+EVAL_MCTS_ITERATIONS = 25
+EVAL_MCTS_MAX_NODES = 50
 
-# Training
-BATCH_SIZE = 128       # More parallel games for faster data collection
-TRAIN_BATCH_SIZE = 256  # Batch size for gradient updates
-TRAIN_STEPS_PER_EPOCH = 16
-COLLECTION_STEPS_PER_EPOCH = 32
-WARMUP_STEPS = 64
-BUFFER_SIZE = 30000    # Good buffer size
-MAX_EPISODE_STEPS = 10  # TicTacToe max 9 moves
+# Training - optimized for GPU memory constraints
+# 100 epochs × 100 steps × 64 batch = 640,000 samples seen
+BATCH_SIZE = 32              # Parallel games for data collection (reduced for memory)
+TRAIN_BATCH_SIZE = 64        # Batch size for gradient updates
+TRAIN_STEPS_PER_EPOCH = 100  # Reduced from 1000 to fit in GPU memory
+COLLECTION_STEPS_PER_EPOCH = 10  # Collect more games each epoch
+WARMUP_STEPS = 50            # Fill buffer before training
+BUFFER_SIZE = 5000           # Reduced buffer size
+MAX_EPISODE_STEPS = 10       # TicTacToe max 9 moves
+NUM_EPOCHS = 100             # 100 epochs
 
 # Evaluation
-EVAL_EPISODES = 256    # More evaluation games for reliable metrics
-EVAL_EVERY = 10
+EVAL_EPISODES = 128    # Evaluation games
+EVAL_EVERY = 10        # Test every 10 epochs
 
 # Checkpointing
 CHECKPOINT_DIR = "./checkpoints/tictactoe"
@@ -135,7 +155,6 @@ def main():
     print("=" * 60)
 
     start_time = time.time()
-    max_training_time = TRAINING_TIME_MINUTES * 60
 
     # Create environment
     print(f"\nCreating {ENV_NAME} environment...")
@@ -168,9 +187,8 @@ def main():
     env_step_fn = decision_step_fn  # Same for deterministic games
     env_init_fn = make_tictactoe_env_init_fn(env)
 
-    # Calculate approximate number of epochs (needed for LR schedule)
-    estimated_epochs_per_minute = 4
-    num_epochs = int(TRAINING_TIME_MINUTES * estimated_epochs_per_minute)
+    # Use fixed number of epochs
+    num_epochs = NUM_EPOCHS
 
     # Create MCTS evaluator for training
     # TicTacToe is deterministic - no stochastic probs needed
@@ -179,17 +197,16 @@ def main():
 
     # Gumbel policy improvement hyperparameters for low-simulation regime
     # Paper uses c_visit=50, c_scale=1 for Go/Chess with thousands of sims.
-    # With 100 iterations and 9 actions, each action gets ~11 visits.
+    # With 25 iterations and Gumbel focusing, best actions get ~15 visits.
     # σ(Q) = c_scale * Q / (c_visit + max_N)
     #
-    # For TicTacToe with max_visits ≈ 47:
-    #   c_visit=50, c_scale=1: σ(Q) ≈ 0.01 * Q (too weak)
-    #   c_visit=5, c_scale=5:  σ(Q) ≈ 0.10 * Q (moderate, stable)
-    #   c_visit=1, c_scale=20: σ(Q) ≈ 0.42 * Q (too strong, noisy targets)
+    # For TicTacToe with 25 sims, max_visits ≈ 15:
+    #   c_visit=5, c_scale=5:  σ(Q) = 5 / (5 + 15) = 0.25 * Q (good signal)
     #
-    # Moderate scaling balances Q-value signal with stability.
-    C_VISIT = 5.0   # Moderate offset for stability
-    C_SCALE = 5.0   # Moderate scaling for Q-value signal
+    # Gumbel AlphaZero is specifically designed for low-simulation regimes
+    # (paper shows it works with as few as 2 simulations!)
+    C_VISIT = 5.0   # Low offset for stronger Q-value signal
+    C_SCALE = 5.0   # Moderate scaling
 
     mcts_train = UnifiedMCTS(
         eval_fn=nn_eval_fn,
@@ -244,11 +261,12 @@ def main():
     print("\nCreating trainer...")
 
     # Learning rate schedule: warmup + cosine decay
-    lr_warmup_steps = 500
-    total_train_steps = num_epochs * TRAIN_STEPS_PER_EPOCH
+    # Total: 100 epochs × 1000 steps = 100,000 gradient updates
+    total_train_steps = num_epochs * TRAIN_STEPS_PER_EPOCH  # 100,000
+    lr_warmup_steps = 1000  # 1% warmup
     lr_schedule = optax.warmup_cosine_decay_schedule(
         init_value=1e-5,
-        peak_value=1e-3,
+        peak_value=2e-3,  # Slightly higher peak for more training
         warmup_steps=lr_warmup_steps,
         decay_steps=total_train_steps,
         end_value=1e-5,
@@ -281,15 +299,16 @@ def main():
         wandb_project_name=WANDB_PROJECT,
     )
 
-    # Temperature schedule (linear decay from 1.0 to 0.1)
-    def temp_schedule(step):
-        total_steps = max_training_time * 10
-        progress = min(step / total_steps, 1.0)
-        return 1.0 - 0.9 * progress
+    # Temperature schedule (linear decay from 1.0 to 0.1 over training)
+    def temp_schedule(epoch):
+        progress = min(epoch / num_epochs, 1.0)
+        return 1.0 - 0.9 * progress  # 1.0 -> 0.1
 
     trainer.set_temp_fn(temp_schedule)
 
-    print(f"\nStarting training (target: {TRAINING_TIME_MINUTES} min, ~{num_epochs} epochs)...")
+    total_samples = num_epochs * TRAIN_STEPS_PER_EPOCH * TRAIN_BATCH_SIZE
+    print(f"\nStarting training ({num_epochs} epochs × {TRAIN_STEPS_PER_EPOCH} steps = {num_epochs * TRAIN_STEPS_PER_EPOCH:,} updates, {total_samples:,} samples)...")
+    print(f"Buffer size: {BUFFER_SIZE:,}, Batch size: {TRAIN_BATCH_SIZE}")
     print("Expected: NN should learn to never lose against random (win rate ~0.95+)")
     print("=" * 60)
 
