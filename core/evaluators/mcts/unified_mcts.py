@@ -400,8 +400,20 @@ class UnifiedMCTS(Evaluator):
             )
 
             # Get Q-values and visit counts for elimination decision
-            root_q = new_state.get_child_data('q', new_state.ROOT_INDEX)[:self.policy_size]
+            raw_q = new_state.get_child_data('q', new_state.ROOT_INDEX)[:self.policy_size]
             root_visits = new_state.get_child_data('n', new_state.ROOT_INDEX)[:self.policy_size]
+
+            # Flip Q-values for two-player games (same logic as final selection)
+            root_node = new_state.data_at(new_state.ROOT_INDEX)
+            root_player = root_node.embedding.current_player
+            child_indices = new_state.edge_map[new_state.ROOT_INDEX, :self.policy_size]
+            safe_child_indices = jnp.maximum(child_indices, 0)
+            child_players = new_state.data.embedding.current_player[safe_child_indices]
+            child_exists = child_indices != new_state.NULL_INDEX
+            player_diff = jnp.abs(root_player - child_players)
+            per_child_discount = 1.0 - 2.0 * player_diff
+            per_child_discount = jnp.where(child_exists, per_child_discount, 1.0)
+            root_q = raw_q * per_child_discount
 
             # Eliminate half of active actions based on Gumbel scores
             new_active = jax.lax.cond(
@@ -421,8 +433,26 @@ class UnifiedMCTS(Evaluator):
         )
 
         # Get final Q-values and visit counts
-        root_q = eval_state.get_child_data('q', eval_state.ROOT_INDEX)[:self.policy_size]
+        raw_root_q = eval_state.get_child_data('q', eval_state.ROOT_INDEX)[:self.policy_size]
         root_visits = eval_state.get_child_data('n', eval_state.ROOT_INDEX)[:self.policy_size]
+
+        # CRITICAL: Flip Q-values for two-player games
+        # Child Q-values are from child's perspective; we need parent's perspective
+        # For two-player games: if child is opponent, negate Q-value
+        root_node = eval_state.data_at(eval_state.ROOT_INDEX)
+        root_player = root_node.embedding.current_player
+        child_indices = eval_state.edge_map[eval_state.ROOT_INDEX, :self.policy_size]
+        safe_child_indices = jnp.maximum(child_indices, 0)
+        child_players = eval_state.data.embedding.current_player[safe_child_indices]
+        child_exists = child_indices != eval_state.NULL_INDEX
+
+        # Discount: 1.0 if same player, -1.0 if different player
+        player_diff = jnp.abs(root_player - child_players)
+        per_child_discount = 1.0 - 2.0 * player_diff
+        per_child_discount = jnp.where(child_exists, per_child_discount, 1.0)
+
+        # Apply discount to get Q-values from root player's perspective
+        root_q = raw_root_q * per_child_discount
 
         # Get root value for completing unvisited Q-values
         root_value = eval_state.data.q[eval_state.ROOT_INDEX]
