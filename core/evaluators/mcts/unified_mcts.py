@@ -1007,6 +1007,28 @@ class UnifiedMCTS(Evaluator):
         """Reset tree to empty state."""
         return tree.reset()
 
+    def get_tree_stats(self, tree: StochasticMCTSTree) -> dict:
+        """Get statistics about the MCTS tree.
+
+        Args:
+            tree: Current tree state
+
+        Returns:
+            Dictionary with tree statistics:
+            - mcts/tree_size: number of nodes in tree
+            - mcts/root_visits: number of visits to root node
+            - mcts/max_nodes: maximum nodes allowed
+            - mcts/num_iterations: number of MCTS iterations per move
+        """
+        tree_size = tree.next_free_idx
+        root_visits = tree.data.n[tree.ROOT_INDEX]
+        return {
+            "mcts/tree_size": float(tree_size),
+            "mcts/root_visits": float(root_visits),
+            "mcts/max_nodes": float(self.max_nodes),
+            "mcts/num_iterations": float(self.num_iterations),
+        }
+
     def _new_node(
         self,
         policy: chex.Array,

@@ -933,6 +933,7 @@ class Trainer:
         while cur_epoch < num_epochs:
             # Track epoch start time for performance metrics
             epoch_start_time = time.time()
+            is_first_epoch = (cur_epoch == 0)
 
             # Update temperature if schedule is set
             training_step = cur_epoch * self.collection_steps_per_epoch * self.batch_size
@@ -964,12 +965,20 @@ class Trainer:
             print("Training Done")
             train_duration = time.time() - train_start_time
             metrics["train/train_time_sec"] = train_duration
-            metrics["train/train_steps_per_sec"] = self.train_steps_per_epoch * self.train_batch_size / jnp.maximum(train_duration, 1e-6)
+            # Exclude first epoch from steps/sec (includes JIT compilation time)
+            if is_first_epoch:
+                metrics["train/train_steps_per_sec"] = 0.0  # Skip - includes compile time
+            else:
+                metrics["train/train_steps_per_sec"] = self.train_steps_per_epoch * self.train_batch_size / jnp.maximum(train_duration, 1e-6)
 
            # Add performance metrics
             collection_steps = self.batch_size * (cur_epoch+1) * self.collection_steps_per_epoch
             metrics["collect/collect_time_sec"] = collect_duration
-            metrics["collect/collect_steps_per_sec"] = self.batch_size * self.collection_steps_per_epoch / max(collect_duration, 1e-6)
+            # Exclude first epoch from steps/sec (includes JIT compilation time)
+            if is_first_epoch:
+                metrics["collect/collect_steps_per_sec"] = 0.0  # Skip - includes compile time
+            else:
+                metrics["collect/collect_steps_per_sec"] = self.batch_size * self.collection_steps_per_epoch / max(collect_duration, 1e-6)
             # Log temperature if set
             if hasattr(self, 'temp_func'):
                 metrics["collect/temperature"] = self.evaluator_train.temperature
