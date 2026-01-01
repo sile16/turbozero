@@ -513,10 +513,8 @@ class UnifiedMCTS:
         """Single iteration when root is stochastic."""
         traverse_key, expand_key, backprop_key = jax.random.split(key, 3)
 
-        # Sample outcome from stochastic probabilities
-        outcome = jax.random.choice(traverse_key, self.stochastic_size, p=self.stochastic_action_probs)
-        # Convert to tree action index (stochastic actions start at policy_size)
-        root_action = self.policy_size + outcome
+        # Use delta-based selection to keep visits proportional to probabilities
+        root_action = self._stochastic_action_selector(traverse_key, tree, tree.ROOT_INDEX)
 
         # Traverse from root
         traversal_state = self._traverse(traverse_key, tree, root_action)
