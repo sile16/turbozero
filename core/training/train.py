@@ -2,7 +2,7 @@ from functools import partial
 import os
 import shutil
 import time
-from typing import Any, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 import chex
 from chex import dataclass
@@ -96,6 +96,7 @@ class Trainer:
         state_to_nn_input_fn: StateToNNInputFn,
         testers: List[BaseTester],
         evaluator_test: Optional[Evaluator] = None,
+        max_test_steps: Optional[int] = None,
         data_transform_fns: List[DataTransformFn] = [],
         extract_model_params_fn: Optional[ExtractModelParamsFn] = extract_params,
         wandb_project_name: str = "",
@@ -138,6 +139,7 @@ class Trainer:
         self.env_step_fn = env_step_fn
         self.env_init_fn = env_init_fn
         self.max_episode_steps = max_episode_steps
+        self.max_test_steps = max_test_steps if max_test_steps is not None else max_episode_steps
         self.template_env_state = self.make_template_env_state()
         # nn
         self.state_to_nn_input_fn = state_to_nn_input_fn
@@ -220,9 +222,45 @@ class Trainer:
         # check collection batch size
         if self.batch_size % self.num_devices != 0:
             raise ValueError(err_fmt.format(b=self.batch_size, d=self.num_devices))
-        # check testers 
+        # check testers
         for tester in self.testers:
             tester.check_size_compatibilities(self.num_devices)
+
+
+    def set_temp_fn(self, temp_func: Callable[[int], float]) -> None:
+        """Set a temperature schedule function.
+
+        Args:
+            temp_func: Function that takes training step count and returns temperature.
+                       Used to anneal exploration during training.
+        """
+        self.temp_func = temp_func
+
+    def set_curriculum_fn(self, curriculum_func: Callable[[int], Callable]) -> None:
+        """Set a curriculum function that returns different env_init_fn based on training step.
+
+        Args:
+            curriculum_func: Function that takes training step and returns an env_init_fn.
+                             Useful for progressive difficulty increases.
+        """
+        self.curriculum_func = curriculum_func
+        self._original_env_init_fn = self.env_init_fn
+
+    def _get_current_env_init_fn(self, training_step: int):
+        """Get the appropriate env_init_fn for the current training step."""
+        if hasattr(self, 'curriculum_func'):
+            return self.curriculum_func(training_step)
+        return self.env_init_fn
+
+    def _update_step_train_for_curriculum(self, training_step: int):
+        """Update the step_train function with curriculum-aware env_init_fn."""
+        current_env_init_fn = self._get_current_env_init_fn(training_step)
+        self.step_train = partial(step_env_and_evaluator,
+            evaluator=self.evaluator_train,
+            env_step_fn=self.env_step_fn,
+            env_init_fn=current_env_init_fn,
+            max_steps=self.max_episode_steps
+        )
 
 
     @partial(jax.pmap, axis_name='d', static_broadcasted_argnums=(0,))
@@ -321,7 +359,8 @@ class Trainer:
                 observation_nn=self.state_to_nn_input_fn(state.env_state),
                 policy_mask=state.metadata.action_mask,
                 policy_weights=eval_output.policy_weights,
-                reward=jnp.empty_like(state.metadata.rewards),
+                reward=jnp.empty_like(state.metadata.rewards),  # Filled at episode end
+                step_reward=rewards,  # Per-step reward from environment (already step-wise in pgx)
                 cur_player_id=state.metadata.cur_player_id,
                 is_chance_node=is_chance_node
             )
@@ -339,7 +378,8 @@ class Trainer:
                     observation_nn=self.state_to_nn_input_fn(t_env_state),
                     policy_mask=t_policy_mask,
                     policy_weights=t_policy_weights,
-                    reward=jnp.empty_like(state.metadata.rewards),
+                    reward=jnp.empty_like(state.metadata.rewards),  # Filled at episode end
+                    step_reward=rewards,  # Same step reward for augmented samples
                     cur_player_id=state.metadata.cur_player_id,
                     is_chance_node=is_chance_node
                 )
@@ -351,10 +391,35 @@ class Trainer:
             lambda s: s,
             buffer_state
         )
-        # truncate episode experiences in buffer if episode is too long
+        # For truncated episodes, use bootstrap value from NN instead of discarding
+        # This ensures long-running games like 2048 still contribute to value learning
+        def bootstrap_truncated(s):
+            # Get value estimate for current state as bootstrap
+            obs_nn = self.state_to_nn_input_fn(new_env_state)
+            # Add batch dimension for model input
+            obs_batch = jnp.expand_dims(obs_nn, 0)  # (1, *obs_shape)
+
+            # params already has structure {'params': ...} from extract_model_params_fn
+            # Use directly as variables
+            _, value_logits = self.nn.apply(params, x=obs_batch, train=False)
+
+            # Extract scalar value estimate (shape is (1,) or (1, 1))
+            if value_logits.ndim == 1:
+                bootstrap_value = value_logits[0]
+            else:
+                bootstrap_value = value_logits[0, 0]
+
+            # Create bootstrap reward array (same shape as rewards)
+            # The bootstrap value represents V(s) at truncation point
+            # We need to scale it back to reward scale for assign_rewards
+            # assign_rewards will multiply by reward_scale, so we divide here
+            bootstrap_rewards = jnp.full_like(new_metadata.rewards, bootstrap_value / self.memory_buffer.reward_scale)
+
+            return self.memory_buffer.assign_rewards(s, bootstrap_rewards)
+
         buffer_state = jax.lax.cond(
             truncated,
-            self.memory_buffer.truncate,
+            bootstrap_truncated,
             lambda s: s,
             buffer_state
         )
@@ -398,7 +463,52 @@ class Trainer:
             lambda s: s,
             state
         )
-    
+
+
+    @partial(jax.pmap, axis_name='d', static_broadcasted_argnums=(0,))
+    def bootstrap_ongoing_episodes(self,
+        state: CollectionState,
+        params: chex.ArrayTree,
+    ) -> CollectionState:
+        """Assign bootstrap values to ongoing episodes to enable n-step returns.
+
+        This makes samples from ongoing episodes trainable WITHOUT ending them.
+        Essential for long-running games like 2048 where truncation would discard
+        the most valuable training data.
+
+        Args:
+        - `state`: current collection state
+        - `params`: model parameters
+
+        Returns:
+        - (CollectionState): updated collection state with bootstrap-assigned samples
+        """
+        def bootstrap_one(env_state, buffer_state, metadata):
+            # Get value estimate for current state as bootstrap
+            obs_nn = self.state_to_nn_input_fn(env_state)
+            obs_batch = jnp.expand_dims(obs_nn, 0)  # (1, *obs_shape)
+
+            _, value_logits = self.nn.apply(params, x=obs_batch, train=False)
+
+            # Extract scalar value estimate
+            if value_logits.ndim == 1:
+                bootstrap_value = value_logits[0]
+            else:
+                bootstrap_value = value_logits[0, 0]
+
+            # Create bootstrap reward array (scale back for assign_bootstrap_ongoing)
+            bootstrap_rewards = jnp.full_like(metadata.rewards, bootstrap_value / self.memory_buffer.reward_scale)
+
+            # Assign bootstrap values to ongoing episode samples
+            return self.memory_buffer.assign_bootstrap_ongoing(buffer_state, bootstrap_rewards)
+
+        # vmap across batch dimension
+        new_buffer_state = jax.vmap(bootstrap_one)(
+            state.env_state, state.buffer_state, state.metadata
+        )
+
+        return state.replace(buffer_state=new_buffer_state)
+
 
     def _one_train_step_inner(self, ts: TrainState, batch: BaseExperience) -> Tuple[TrainState, chex.Array]:
         """Inner training step logic without pmap decorator.
@@ -445,7 +555,8 @@ class Trainer:
             ts = update_batch_stats(ts)
 
         # Stack metrics into array for JAX compatibility inside fori_loop
-        # Order: loss, policy_loss, value_loss, policy_entropy, policy_accuracy, grad_norm, param_norm
+        # Order: loss, policy_loss, value_loss, policy_entropy, policy_accuracy, grad_norm, param_norm,
+        #        value_target_mean, value_target_std, value_target_max, value_pred_mean, step_reward_sum, reward_sum
         metrics_array = jnp.array([
             loss,
             metrics_dict.get('policy_loss', 0.0),
@@ -454,6 +565,12 @@ class Trainer:
             metrics_dict.get('policy_accuracy', 0.0),
             grad_norm,
             param_norm,
+            metrics_dict.get('value_target_mean', 0.0),
+            metrics_dict.get('value_target_std', 0.0),
+            metrics_dict.get('value_target_max', 0.0),
+            metrics_dict.get('value_pred_mean', 0.0),
+            metrics_dict.get('step_reward_sum', 0.0),
+            metrics_dict.get('reward_sum', 0.0),
         ])
 
         return ts, metrics_array
@@ -476,7 +593,7 @@ class Trainer:
         - (TrainState, Array): updated train state and metrics array (num_steps, num_metrics)
         """
         num_steps = jax.tree_util.tree_leaves(batches)[0].shape[0]
-        num_metrics = 7  # loss, policy_loss, value_loss, policy_entropy, policy_accuracy, grad_norm, param_norm
+        num_metrics = 13  # loss, policy_loss, value_loss, policy_entropy, policy_accuracy, grad_norm, param_norm, value_target_mean/std/max, value_pred_mean, step_reward_sum, reward_sum
 
         def loop_body(i, carry):
             ts, metrics_acc = carry
@@ -561,7 +678,8 @@ class Trainer:
         std_metrics = metrics_array.std(axis=0)
 
         # Convert back to dict
-        metric_names = ['loss', 'policy_loss', 'value_loss', 'policy_entropy', 'policy_accuracy', 'grad_norm', 'param_norm']
+        metric_names = ['loss', 'policy_loss', 'value_loss', 'policy_entropy', 'policy_accuracy', 'grad_norm', 'param_norm',
+                        'value_target_mean', 'value_target_std', 'value_target_max', 'value_pred_mean', 'step_reward_sum', 'reward_sum']
         metrics = {}
         for i, name in enumerate(metric_names):
             metrics[name] = mean_metrics[i]
@@ -590,12 +708,14 @@ class Trainer:
                 flat_metrics[k] = v
 
         # Extract key metrics for console display (only show important ones)
-        console_keys = ['loss', 'policy_loss', 'value_loss', 'policy_accuracy', 'grad_norm']
+        console_keys = ['loss', 'policy_loss', 'value_loss', 'policy_accuracy', 'grad_norm',
+                        'buffer/trainable_samples', 'buffer/fullness_pct',
+                        'value_target_mean', 'value_target_std', 'value_target_max', 'value_pred_mean', 'step_reward_sum', 'reward_sum']
         console_metrics = {}
         for k, v in flat_metrics.items():
             # Only show important scalar values in console output
             base_key = k.split('/')[-1] if '/' in k else k
-            if base_key not in console_keys and not k.endswith('_avg_outcome'):
+            if base_key not in console_keys and not k.endswith(('_avg_outcome', '_max_outcome', '_min_outcome')):
                 continue
             if hasattr(v, 'item') and callable(getattr(v, 'item')):
                 console_metrics[k] = f"{v.item():.4f}"
@@ -623,7 +743,7 @@ class Trainer:
                 if k.startswith(('buffer/', 'mcts/', 'game/', 'collect/', 'train/', 'eval/')):
                     wandb_metrics[k] = v
                 # Handle tester metrics (e.g., pretrained_avg_outcome -> eval/pretrained_avg_outcome)
-                elif k.endswith('_avg_outcome'):
+                elif k.endswith(('_avg_outcome', '_max_outcome', '_min_outcome', '_avg_length')):
                     wandb_metrics[f'eval/{k}'] = v
                 elif k.endswith('_win_rate') or k.endswith('_loss_rate') or k.endswith('_draw_rate'):
                     wandb_metrics[f'eval/{k}'] = v
@@ -703,14 +823,18 @@ class Trainer:
         if getattr(self.evaluator_train, 'handles_chance_nodes', False):
             is_chance_node = getattr(metadata, 'is_stochastic', None)
             if is_chance_node is None:
-                is_chance_node = jnp.array(False)
+                is_chance_node = jnp.array(False, dtype=jnp.bool_)
+            else:
+                # Ensure it's a JAX array (not a Python bool)
+                is_chance_node = jnp.asarray(is_chance_node, dtype=jnp.bool_)
         else:
-            is_chance_node = jnp.array(False)
+            is_chance_node = jnp.array(False, dtype=jnp.bool_)
         return BaseExperience(
             observation_nn=self.state_to_nn_input_fn(env_state),
             policy_mask=metadata.action_mask,
             policy_weights=jnp.zeros_like(metadata.action_mask, dtype=jnp.float32),
             reward=jnp.zeros_like(metadata.rewards),
+            step_reward=jnp.zeros_like(metadata.rewards),  # Per-step reward for discounted returns
             cur_player_id=metadata.cur_player_id,
             is_chance_node=is_chance_node
         )
@@ -809,7 +933,17 @@ class Trainer:
         while cur_epoch < num_epochs:
             # Track epoch start time for performance metrics
             epoch_start_time = time.time()
-            
+
+            # Update temperature if schedule is set
+            training_step = cur_epoch * self.collection_steps_per_epoch * self.batch_size
+            if hasattr(self, 'temp_func'):
+                current_temp = self.temp_func(training_step)
+                self.evaluator_train.temperature = current_temp
+                print(f"Temperature: {current_temp}")
+
+            # Update curriculum if curriculum function is set
+            self._update_step_train_for_curriculum(training_step)
+
             # Collect self-play games
             print("Collecting self-play games")
             collect_start_time = time.time()
@@ -817,6 +951,10 @@ class Trainer:
             collect_keys = partition(jax.random.split(collect_key, self.batch_size), self.num_devices)
             collection_state = collect(collect_keys, collection_state, params, self.collection_steps_per_epoch)
             collect_duration = time.time() - collect_start_time
+
+            # Assign bootstrap values to ongoing episode samples (n-step returns)
+            # This makes samples trainable without truncating valuable long games
+            collection_state = self.bootstrap_ongoing_episodes(collection_state, params)
 
             # Train
             print("Training")
@@ -832,8 +970,9 @@ class Trainer:
             collection_steps = self.batch_size * (cur_epoch+1) * self.collection_steps_per_epoch
             metrics["collect/collect_time_sec"] = collect_duration
             metrics["collect/collect_steps_per_sec"] = self.batch_size * self.collection_steps_per_epoch / max(collect_duration, 1e-6)
-            # we don't know how many games, 
-            #metrics["perf/collect_game_steps_per_sec"] = (self.collection_steps_per_epoch * self.batch_size) / max(collect_duration, 1e-6)
+            # Log temperature if set
+            if hasattr(self, 'temp_func'):
+                metrics["collect/temperature"] = self.evaluator_train.temperature
 
             
            # Add replay buffer statistics
@@ -841,10 +980,41 @@ class Trainer:
             populated = jnp.sum(buffer_state.populated)
             trainable_samples = jnp.sum(jnp.logical_and(buffer_state.populated, buffer_state.has_reward))
             total_capacity = buffer_state.populated.size
+            games_completed = jnp.sum(buffer_state.games_completed_count)
+            total_game_steps = jnp.sum(buffer_state.total_completed_game_steps)
+            print(f"Buffer: populated={int(populated)}, trainable={int(trainable_samples)}, games_completed={int(games_completed)}")
             metrics["buffer/populated"] = populated
             metrics["buffer/trainable_samples"] = trainable_samples
             metrics["buffer/fullness_pct"] = 100.0 * populated / total_capacity
             metrics["buffer/trainable_pct"] = 100.0 * trainable_samples / total_capacity
+            metrics["buffer/games_completed"] = games_completed
+
+            # Episode reward and length statistics (collection metrics)
+            total_reward_sum = jnp.sum(buffer_state.total_episode_reward_sum)
+            max_reward = jnp.max(buffer_state.max_episode_reward)
+            min_reward = jnp.min(buffer_state.min_episode_reward)
+            avg_game_length = jnp.where(
+                games_completed > 0,
+                total_game_steps / games_completed,
+                0.0
+            )
+            avg_reward = jnp.where(
+                games_completed > 0,
+                total_reward_sum / games_completed,
+                0.0
+            )
+            max_length = jnp.max(buffer_state.max_episode_length)
+            min_length = jnp.min(buffer_state.min_episode_length)
+            # Only report min if games have completed (otherwise it's the initial large value)
+            min_reward = jnp.where(games_completed > 0, min_reward, 0.0)
+            min_length = jnp.where(games_completed > 0, min_length, 0)
+
+            metrics["buffer/avg_game_length"] = avg_game_length
+            metrics["collect/avg_episode_reward"] = avg_reward
+            metrics["collect/max_episode_reward"] = max_reward
+            metrics["collect/min_episode_reward"] = min_reward
+            metrics["collect/max_episode_length"] = max_length
+            metrics["collect/min_episode_length"] = min_length
 
             # Add MCTS tree statistics (sample from first device, first batch element)
             if hasattr(self.evaluator_train, 'get_tree_stats'):
@@ -868,7 +1038,7 @@ class Trainer:
                     test_start_time = time.time()
                     run_key, key = jax.random.split(key)
                     new_test_state, metrics, rendered = self.testers[i].run(
-                        key=run_key, epoch_num=cur_epoch, max_steps=self.max_episode_steps, num_devices=self.num_devices,
+                        key=run_key, epoch_num=cur_epoch, max_steps=self.max_test_steps, num_devices=self.num_devices,
                         env_step_fn=self.env_step_fn, env_init_fn=self.env_init_fn, evaluator=self.evaluator_test,
                         state=test_state, params=params)
                         

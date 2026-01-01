@@ -19,6 +19,7 @@ import jax
 import jax.numpy as jnp
 import chex
 
+from core.evaluators.evaluator import Evaluator
 from core.evaluators.mcts.action_selection import MCTSActionSelector
 from core.evaluators.mcts.state import (
     MCTSOutput, TraversalState,
@@ -115,7 +116,7 @@ class ExpandResult(NamedTuple):
     value: float
 
 
-class UnifiedMCTS:
+class UnifiedMCTS(Evaluator):
     """Unified MCTS implementation for all game types.
 
     Key features:
@@ -210,6 +211,12 @@ class UnifiedMCTS:
             return self._temperature_fn(self._current_epoch)
         return self._temperature_const
 
+    @temperature.setter
+    def temperature(self, value: float) -> None:
+        """Set temperature directly (overrides schedule)."""
+        self._temperature_const = value
+        self._temperature_fn = None  # Clear any schedule
+
     def set_epoch(self, epoch: int) -> None:
         """Set the current epoch for temperature annealing.
 
@@ -217,6 +224,16 @@ class UnifiedMCTS:
             epoch: Current epoch number (0-indexed)
         """
         self._current_epoch = epoch
+
+    @property
+    def handles_chance_nodes(self) -> bool:
+        """Whether this evaluator explicitly handles chance nodes (stochastic states).
+
+        For stochastic games, UnifiedMCTS handles chance nodes internally and
+        returns placeholder policy weights for them. The trainer should skip
+        policy loss for these samples.
+        """
+        return self.is_stochastic_game
 
     def get_config(self) -> Dict:
         """Returns configuration for logging."""
@@ -266,6 +283,7 @@ class UnifiedMCTS:
         env_state: chex.ArrayTree,
         root_metadata: StepMetadata,
         params: chex.ArrayTree,
+        **kwargs,  # Accept extra args like env_step_fn for compatibility
     ) -> MCTSOutput:
         """Perform MCTS evaluation from the given state.
 
@@ -341,10 +359,16 @@ class UnifiedMCTS:
         # Sample action from visit counts
         action, policy_weights = self._sample_root_action(sample_key, eval_state, root_metadata.action_mask)
 
+        # Compute MCTS stats
+        tree_size = eval_state.next_free_idx
+        root_visits = eval_state.data.n[eval_state.ROOT_INDEX]
+
         return MCTSOutput(
             eval_state=eval_state,
             action=action,
-            policy_weights=policy_weights[:self.policy_size]
+            policy_weights=policy_weights[:self.policy_size],
+            tree_size=tree_size,
+            root_visits=root_visits,
         )
 
     def _evaluate_stochastic_root(
@@ -381,10 +405,16 @@ class UnifiedMCTS:
         # Policy weights for stochastic root are just the probabilities
         policy_weights = jnp.zeros(self.policy_size)  # No decision policy for stochastic root
 
+        # Compute MCTS stats
+        tree_size = eval_state.next_free_idx
+        root_visits = eval_state.data.n[eval_state.ROOT_INDEX]
+
         return MCTSOutput(
             eval_state=eval_state,
             action=action,
-            policy_weights=policy_weights
+            policy_weights=policy_weights,
+            tree_size=tree_size,
+            root_visits=root_visits,
         )
 
     def _initialize_root(

@@ -29,8 +29,9 @@ This fork extends the original [lowrollr/turbozero](https://github.com/lowrollr/
 3. ✅ Always subtree persistence (removed `persist_tree` flag)
 4. ✅ Always Gumbel-Top-k at decision roots
 5. ✅ Handles both stochastic and deterministic games
-6. ⏳ Remove old MCTS files after migration complete
-7. ⏳ Update training code to use UnifiedMCTS
+6. ✅ Consolidated Trainer (removed StochasticTrainer)
+7. ✅ Policy loss masking for chance nodes
+8. ✅ Two-player baseline testing with first-player tracking
 
 
 ### 1. Implemented expectimax value calculation for stochastic nodes (stochastic_mcts.py:414-530)
@@ -46,9 +47,7 @@ This fork extends the original [lowrollr/turbozero](https://github.com/lowrollr/
 
 1. **Backpropagation child parameter**: The `backpropagate(tree, parent, child, value)` signature is correct - the child parameter is needed to calculate discount factors based on player changes, which can happen at any node (not just every transition like in base MCTS).
 
-2. **Zero policy weights at stochastic nodes**: `stochastic_evaluate()` returns `jnp.zeros(branching_factor)` for policy weights. This is acceptable because:
-   - Consistent return shape is required
-   - `StochasticTrainer.collect()` correctly skips stochastic states when adding to replay buffer , need to make sure trainer doesn't train policy on a stochastic node but can train on the value. 
+2. **Zero policy weights at stochastic nodes**: MCTS returns `jnp.zeros(branching_factor)` for policy weights at chance nodes. The `Trainer.collect()` correctly adds all samples to the buffer but marks chance nodes with `is_chance_node=True`. The loss function then masks policy loss for these samples while still training value on all samples. 
 
 3. **visit_node logic**: In `iterate()`, the node is visited once via `new_node()`/`visit_node()`, then backprop updates ancestors only (starting from parent). This is correct.
 
@@ -87,9 +86,8 @@ poetry add jax[cuda12]
   - `alphazero.py`: AlphaZero wrapper adding Dirichlet noise exploration
 
 - **`core/training/`**: Training infrastructure
-  - `train.py`: `Trainer` class implementing the AlphaZero training loop with self-play collection, replay buffer, and gradient updates
-  - `stochastic_train.py`: Training utilities for stochastic environments
-  - `loss_fns.py`: Loss functions for policy and value heads
+  - `train.py`: Unified `Trainer` class implementing the AlphaZero training loop with self-play collection, replay buffer, gradient updates, temperature scheduling, and curriculum support
+  - `loss_fns.py`: Loss functions for policy and value heads (with chance node masking)
 
 - **`core/memory/`**: Experience replay
   - `replay_memory.py`: `EpisodeReplayBuffer` storing trajectories with `BaseExperience` and `ReplayBufferState`
@@ -319,26 +317,12 @@ if experience.is_chance_node is not None:
 
 ### Training Data Collection Strategy
 
-**Problem**: Using `make_stochastic_aware_step_fn` collects samples from both decision nodes AND chance nodes. Since ~50% of samples are chance nodes (which have policy loss masked), this dilutes the training signal.
+The unified `Trainer` collects samples from both decision nodes and chance nodes, but:
+1. **Policy loss is masked for chance nodes** - the loss function skips policy loss for samples where `is_chance_node=True`
+2. **Value loss is computed for all samples** - the NN learns expected values even from noisy individual outcomes
+3. **UnifiedMCTS handles chance nodes properly** - stochastic outcomes are explored using delta-based selection to maintain balanced visit counts
 
-**Solution**: Use regular `env.step` for training data collection, which auto-resolves stochasticity with random sampling. This means:
-- All training samples are from decision nodes
-- Policy loss is computed for all samples
-- Value targets are cleaner (only for decision nodes)
-- StochasticMCTS still handles chance nodes properly during its internal MCTS search
-
-```python
-# StochasticMCTS training - use regular step function
-stoch_result = train_and_evaluate(
-    "StochasticMCTS",
-    stoch_evaluator,
-    stoch_evaluator_test,
-    env,
-    mlp_stoch,
-    step_fn=make_step_fn(env),  # Regular env.step, NOT stochastic_aware
-    num_epochs=num_epochs
-)
-```
+This approach is cleaner than filtering out chance nodes during collection, as it preserves the full game trajectory for potential future use (e.g., trajectory-based training).
 
 ### Comparison Results (Pig, 300 epochs, with Dirichlet noise)
 
@@ -406,28 +390,67 @@ flax.errors.ScopeParamShapeError: expected shape (3, 3, 2, 64), but got (1, 3, 3
 flax.errors.ScopeCollectionNotFound: Tried to access "kernel" from collection "params" but the collection is empty
 ```
 
-## Gumbel MCTS Implementation (2025-12-27)
+### Saving and Loading Model Weights
+
+**Saving** (Trainer handles this automatically with orbax):
+```python
+trainer = Trainer(
+    ...,
+    checkpoint_dir="./checkpoints",  # Enable checkpoint saving
+)
+# Checkpoints saved to ./checkpoints/epoch_{N}/
+```
+
+**Loading** for inference:
+```python
+import orbax.checkpoint as ocp
+from flax.training import orbax_utils
+
+# Load checkpoint
+ckpt_manager = ocp.CheckpointManager(checkpoint_dir)
+train_state = ckpt_manager.restore(ckpt_manager.latest_step())
+
+# Extract params for inference
+raw_params = jax.tree.map(lambda x: x[0], train_state['params'])
+params = {'params': raw_params}
+if 'batch_stats' in train_state:
+    raw_stats = jax.tree.map(lambda x: x[0], train_state['batch_stats'])
+    params['batch_stats'] = raw_stats
+
+# Use with evaluator
+evaluator.evaluate(key, eval_state, env_state, metadata, params=params)
+```
+
+**Simple save/load with pickle** (alternative):
+```python
+import pickle
+
+# Save
+with open('model.pkl', 'wb') as f:
+    pickle.dump(train_state.params, f)
+
+# Load
+with open('model.pkl', 'rb') as f:
+    params = pickle.load(f)
+```
+
+## Gumbel MCTS (Now part of UnifiedMCTS)
 
 ### Overview
 
-Implemented Gumbel MCTS variants based on "Policy improvement by planning with Gumbel" (ICLR 2022). The key insight is achieving same performance with 50-100x fewer simulations by using Gumbel-Top-k sampling at the root.
+Gumbel-Top-k sampling is now built into `UnifiedMCTS`. Based on "Policy improvement by planning with Gumbel" (ICLR 2022), it achieves same performance with 50-100x fewer simulations.
 
-### New Files
+### Gumbel Utilities
 
 - `core/evaluators/mcts/gumbel.py` - Core Gumbel utilities:
   - `gumbel_top_k()` - Sample k actions without replacement using Gumbel-Max trick
-  - `GumbelRootSelector` - Gumbel-based action selector for MCTS root
-  - `GumbelActionScheduler` - Schedules which actions to search
 
-- `core/evaluators/mcts/gumbel_mcts.py` - `GumbelMCTS` class for deterministic games
-- `core/evaluators/mcts/gumbel_stochastic_mcts.py` - `GumbelStochasticMCTS` for stochastic games
-
-### Usage
+### Usage (via UnifiedMCTS)
 
 ```python
-from core.evaluators.mcts.gumbel_stochastic_mcts import GumbelStochasticMCTS
+from core.evaluators.mcts import UnifiedMCTS, PUCTSelector
 
-evaluator = GumbelStochasticMCTS(
+evaluator = UnifiedMCTS(
     eval_fn=make_nn_eval_fn(network, state_to_nn_input),
     action_selector=PUCTSelector(),
     stochastic_action_probs=stochastic_probs,
