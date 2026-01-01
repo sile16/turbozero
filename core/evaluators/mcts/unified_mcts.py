@@ -379,8 +379,10 @@ class UnifiedMCTS(Evaluator):
         active_mask = jnp.ones(self.gumbel_k, dtype=bool)
 
         # Compute number of phases and iterations per phase
+        # Guard against divide-by-zero: if num_iterations < log2(gumbel_k),
+        # iters_per_phase could be 0. Ensure it's at least 1.
         num_phases = sequential_halving_phases(self.num_iterations, self.gumbel_k)
-        iters_per_phase = self.num_iterations // max(num_phases, 1)
+        iters_per_phase = max(1, self.num_iterations // max(num_phases, 1))
 
         # Run MCTS iterations with Sequential Halving
         def scan_body(carry, iteration):
@@ -1166,12 +1168,26 @@ class UnifiedMCTS(Evaluator):
 
         Args:
             tree: Current tree state
-            action: Action taken in the environment
+            action: Action taken in the environment. For stochastic roots,
+                   this is the outcome index in [0, stochastic_size).
+                   For decision roots, this is the action index in [0, policy_size).
 
         Returns:
             Updated tree with subtree rooted at action's child
         """
-        return tree.get_subtree(action)
+        # Check if the current root is a chance node (stochastic root)
+        # If so, the action is an outcome index and needs to be offset
+        is_chance_root = tree.data.is_chance_node[tree.ROOT_INDEX]
+
+        # For chance nodes, children are stored at policy_size + outcome_idx
+        # For decision nodes, children are stored at action index directly
+        tree_action = jax.lax.cond(
+            is_chance_root,
+            lambda: self.policy_size + action,
+            lambda: action
+        )
+
+        return tree.get_subtree(tree_action)
 
     def get_value(self, tree: StochasticMCTSTree) -> float:
         """Get value estimate from root node."""

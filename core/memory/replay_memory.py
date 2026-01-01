@@ -353,24 +353,55 @@ class EpisodeReplayBuffer:
         masked_weights = jnp.logical_and(
             state.populated,
             state.has_reward
-        ).reshape(-1)
+        ).reshape(-1).astype(jnp.float32)
 
         num_partitions = state.populated.shape[0]
         num_batches = state.populated.shape[1]
+        total_capacity = self.capacity * num_partitions * num_batches
 
-        indices = jax.random.choice(
-            key,
-            self.capacity * num_partitions * num_batches,
-            shape=(sample_size,),
-            replace=False,
-            p = masked_weights / masked_weights.sum()
+        # Count available samples and guard against edge cases
+        num_available = jnp.sum(masked_weights)
+
+        # Normalize weights, with fallback to uniform if no valid samples
+        # (should not happen in practice, but prevents NaN)
+        weights_sum = jnp.maximum(num_available, 1e-8)
+        normalized_weights = masked_weights / weights_sum
+
+        # If no samples available, use uniform weights (will sample garbage, but won't crash)
+        # This case should be prevented by warmup_steps in the trainer
+        normalized_weights = jnp.where(
+            num_available > 0,
+            normalized_weights,
+            jnp.ones_like(normalized_weights) / total_capacity
+        )
+
+        # Use replace=True if we don't have enough samples
+        # This allows early training to proceed, though samples will be repeated
+        use_replacement = num_available < sample_size
+
+        indices = jax.lax.cond(
+            use_replacement,
+            lambda: jax.random.choice(
+                key,
+                total_capacity,
+                shape=(sample_size,),
+                replace=True,
+                p=normalized_weights
+            ),
+            lambda: jax.random.choice(
+                key,
+                total_capacity,
+                shape=(sample_size,),
+                replace=False,
+                p=normalized_weights
+            )
         )
 
         partition_indices, batch_indices, item_indices = jnp.unravel_index(
             indices,
             (num_partitions, num_batches, self.capacity)
         )
-        
+
         sampled_buffer_items = jax.tree_util.tree_map(
             lambda x: x[partition_indices, batch_indices, item_indices],
             state.buffer
