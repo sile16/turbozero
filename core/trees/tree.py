@@ -26,6 +26,7 @@ class Tree(Generic[NodeType]):
     parents: chex.Array # (N)
     edge_map: chex.Array # (N, F)
     data: chex.ArrayTree # structured data with leaves of shape (N, ...)
+    max_nodes_hit: chex.Array # () count of add_node attempts when tree is full
 
     NULL_INDEX: ClassVar[int] = -1
     NULL_VALUE: ClassVar[int] = 0
@@ -133,6 +134,7 @@ class Tree(Generic[NodeType]):
         # ...
         return self.replace( #pylint: disable=no-member
             next_free_idx=jnp.where(in_bounds, self.next_free_idx + 1, self.next_free_idx),
+            max_nodes_hit=self.max_nodes_hit + jnp.where(in_bounds, 0, 1),
             parents=self.parents.at[self.next_free_idx].set(parent_index),
             edge_map=self.edge_map.at[parent_index, edge_index].set(edge_map_index),
             data=jax.tree_util.tree_map(
@@ -282,6 +284,7 @@ class Tree(Generic[NodeType]):
         """Resets the tree to its initial state."""
         return self.replace( #pylint: disable=no-member
             next_free_idx=0,
+            max_nodes_hit=jnp.zeros_like(self.max_nodes_hit),
             parents=jnp.full_like(self.parents, self.NULL_INDEX),
             edge_map=jnp.full_like(self.edge_map, self.NULL_INDEX),
             data=jax.tree_util.tree_map(jnp.zeros_like, self.data))
@@ -300,6 +303,7 @@ def init_tree(max_nodes: int, branching_factor: int, template_data: NodeType) ->
     """
     return Tree(
         next_free_idx=jnp.array(0, dtype=jnp.int32),
+        max_nodes_hit=jnp.array(0, dtype=jnp.int32),
         parents=jnp.full((max_nodes,), fill_value=Tree.NULL_INDEX, dtype=jnp.int32),
         edge_map=jnp.full((max_nodes, branching_factor), fill_value=Tree.NULL_INDEX, dtype=jnp.int32),
         data=jax.tree_util.tree_map(

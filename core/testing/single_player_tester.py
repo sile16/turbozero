@@ -75,12 +75,14 @@ class SinglePlayerTester(BaseTester):
             - Player IDs (zeros for single player)
         """
         # Create step function
+        # IMPORTANT: reset=False so we can detect termination instead of auto-resetting
         step_fn = partial(
             step_env_and_evaluator,
             evaluator=evaluator,
             env_step_fn=env_step_fn,
             env_init_fn=env_init_fn,
-            max_steps=max_steps
+            max_steps=max_steps,
+            reset=False
         )
 
         def run_episode(key):
@@ -103,7 +105,9 @@ class SinglePlayerTester(BaseTester):
                     params=params
                 )
 
-                # Accumulate reward (player 0 for single-player)
+                # Accumulate step rewards (player 0 for single-player)
+                # In pgx 2048, rewards[0] is the STEP reward (points from that move),
+                # so we need to sum them to get total score
                 step_reward = jnp.where(done, 0.0, rewards[0])
                 new_total_reward = total_reward + step_reward
                 new_length = jnp.where(done, length, length + 1)
@@ -128,6 +132,7 @@ class SinglePlayerTester(BaseTester):
         metrics = {
             f'{self.name}_avg_outcome': jnp.mean(rewards),
             f'{self.name}_max_outcome': jnp.max(rewards),
+            f'{self.name}_min_outcome': jnp.min(rewards),
             f'{self.name}_avg_length': jnp.mean(lengths),
         }
 

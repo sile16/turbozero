@@ -104,10 +104,28 @@ def state_to_nn_input(state):
 
 
 def compute_stochastic_probs():
+    """Static template for stochastic probs - actual probs computed dynamically."""
     probs = jnp.zeros(32)
     for pos in range(16):
         probs = probs.at[pos * 2].set(0.9 / 16)
         probs = probs.at[pos * 2 + 1].set(0.1 / 16)
+    return probs
+
+
+def compute_dynamic_stochastic_probs(state):
+    """Compute stochastic probabilities conditioned on empty cells."""
+    board = state._board  # Shape: (4, 4), values are log2(tile) or 0 for empty
+    flat_board = board.flatten()
+    empty_mask = (flat_board == 0).astype(jnp.float32)
+    num_empty = jnp.sum(empty_mask)
+    num_empty_safe = jnp.maximum(num_empty, 1.0)
+    prob_per_cell = 1.0 / num_empty_safe
+
+    probs = jnp.zeros(32)
+    for pos in range(16):
+        is_empty = empty_mask[pos]
+        probs = probs.at[pos * 2].set(is_empty * prob_per_cell * 0.9)
+        probs = probs.at[pos * 2 + 1].set(is_empty * prob_per_cell * 0.1)
     return probs
 
 
@@ -163,6 +181,7 @@ def main():
         eval_fn=make_nn_eval_fn(resnet, state_to_nn_input),
         action_selector=PUCTSelector(),
         stochastic_action_probs=stochastic_probs,
+        stochastic_probs_fn=compute_dynamic_stochastic_probs,
         policy_size=env.num_actions,
         num_iterations=config['mcts_iterations'],
         max_nodes=config['mcts_iterations'] + 100,
@@ -176,6 +195,7 @@ def main():
         eval_fn=make_nn_eval_fn(resnet, state_to_nn_input),
         action_selector=PUCTSelector(),
         stochastic_action_probs=stochastic_probs,
+        stochastic_probs_fn=compute_dynamic_stochastic_probs,
         policy_size=env.num_actions,
         num_iterations=config['mcts_iterations_test'],
         max_nodes=config['mcts_iterations_test'] + 100,

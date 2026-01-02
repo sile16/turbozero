@@ -149,6 +149,7 @@ class UnifiedMCTS(Evaluator):
         decision_step_fn: DecisionStepFn,
         stochastic_step_fn: Optional[StochasticStepFn] = None,
         stochastic_action_probs: Optional[chex.Array] = None,
+        stochastic_probs_fn: Optional[Callable[[chex.ArrayTree], chex.Array]] = None,
         gumbel_k: int = 16,
         temperature: Temperature = 1.0,
         c_visit: float = 50.0,
@@ -175,6 +176,10 @@ class UnifiedMCTS(Evaluator):
             decision_step_fn: Step function for decision nodes (state, action, key) -> (new_state, metadata)
             stochastic_step_fn: Step function for chance nodes. None for deterministic games.
             stochastic_action_probs: Probability distribution over stochastic outcomes. None for deterministic.
+                For games like 2048 where probabilities depend on state, use stochastic_probs_fn instead.
+            stochastic_probs_fn: Function (state) -> probs that computes stochastic probabilities dynamically.
+                Used for games like 2048 where tile placement probabilities depend on empty cells.
+                If provided, takes precedence over stochastic_action_probs for node-specific probabilities.
             gumbel_k: Number of actions to sample at decision roots (default: 16)
             temperature: Temperature for final action selection. Can be:
                 - float: constant temperature (0 = greedy)
@@ -204,12 +209,21 @@ class UnifiedMCTS(Evaluator):
         self._current_epoch = 0
 
         # Stochastic game support
-        self.is_stochastic_game = stochastic_action_probs is not None
+        self.is_stochastic_game = stochastic_action_probs is not None or stochastic_probs_fn is not None
+        self.stochastic_probs_fn = stochastic_probs_fn
 
         if self.is_stochastic_game:
-            self.stochastic_action_probs = stochastic_action_probs
+            if stochastic_action_probs is not None:
+                self.stochastic_action_probs = stochastic_action_probs
+                self.stochastic_size = len(stochastic_action_probs)
+            else:
+                # When using dynamic probs, we still need a default for initialization
+                # The actual probs will be computed per-state using stochastic_probs_fn
+                # Assume stochastic_step_fn defines the outcome space
+                # For 2048: 32 outcomes (16 positions × 2 tile values)
+                raise ValueError("When using stochastic_probs_fn, must also provide stochastic_action_probs "
+                                 "as a template for the probability array shape")
             self.stochastic_step_fn = stochastic_step_fn
-            self.stochastic_size = len(stochastic_action_probs)
             # Total branching factor = decision actions + stochastic outcomes
             self.branching_factor = policy_size + self.stochastic_size
         else:
@@ -778,9 +792,12 @@ class UnifiedMCTS(Evaluator):
         safe_indices = jnp.maximum(child_indices, 0)
         child_visits = tree.data.n[safe_indices]
 
+        # Use node-specific stochastic probabilities
+        node_probs = self._get_node_stochastic_probs(tree, node_idx)
+
         # Select by greatest delta (most under-visited relative to probability)
         total_visits = jnp.sum(child_visits)
-        expected_visits = self.stochastic_action_probs * total_visits
+        expected_visits = node_probs * total_visits
         delta = expected_visits - child_visits
 
         # Add small noise for tiebreaking
@@ -795,6 +812,26 @@ class UnifiedMCTS(Evaluator):
         Uses tree.data.is_chance_node field from StochasticMCTSNode.
         """
         return tree.data.is_chance_node[node_idx]
+
+    def _get_stochastic_probs(self, state: chex.ArrayTree) -> chex.Array:
+        """Get stochastic outcome probabilities for a state.
+
+        If stochastic_probs_fn is provided, computes probabilities dynamically.
+        Otherwise, returns the static stochastic_action_probs.
+
+        For games like 2048, this ensures probabilities are conditioned on
+        which cells are empty (only empty cells can receive new tiles).
+        """
+        if self.stochastic_probs_fn is not None:
+            return self.stochastic_probs_fn(state)
+        return self.stochastic_action_probs
+
+    def _get_node_stochastic_probs(self, tree: StochasticMCTSTree, node_idx: int) -> chex.Array:
+        """Get stochastic probabilities stored in a node.
+
+        Uses the node's outcome_probs field which was computed at expansion time.
+        """
+        return tree.data.outcome_probs[node_idx]
 
     def _expand_decision_child(
         self,
@@ -848,24 +885,28 @@ class UnifiedMCTS(Evaluator):
             )
             policy = jax.nn.softmax(policy_logits)
 
+            # Compute stochastic probabilities for this state (dynamic for games like 2048)
+            state_stochastic_probs = self._get_stochastic_probs(new_embedding)
+
             # Build full policy
             full_policy = jnp.zeros(self.branching_factor)
             full_policy = jax.lax.cond(
                 is_next_stochastic,
                 lambda: full_policy.at[self.policy_size:self.policy_size + self.stochastic_size].set(
-                    self.stochastic_action_probs if self.is_stochastic_game else jnp.zeros(max(1, self.stochastic_size))
+                    state_stochastic_probs if self.is_stochastic_game else jnp.zeros(max(1, self.stochastic_size))
                 ),
                 lambda: full_policy.at[:self.policy_size].set(policy)
             )
 
-            # Create the child node
+            # Create the child node with state-specific outcome probabilities
             node_data = self._new_node(
                 policy=full_policy,
                 value=scalar_value,
                 embedding=new_embedding,
                 terminated=metadata.terminated,
                 nn_value_estimate=scalar_value,
-                is_chance_node=is_next_stochastic
+                is_chance_node=is_next_stochastic,
+                outcome_probs=state_stochastic_probs,  # Dynamic probs for this state
             )
             new_tree = tree.add_node(parent_index=parent, edge_index=action, data=node_data)
             child_idx = new_tree.edge_map[parent, action]
@@ -873,7 +914,7 @@ class UnifiedMCTS(Evaluator):
             # If this is a chance node, immediately expand all stochastic outcomes
             def expand_all_outcomes():
                 return self._expand_all_stochastic_children(
-                    expand_key, new_tree, child_idx, new_embedding, params
+                    expand_key, new_tree, child_idx, new_embedding, params, state_stochastic_probs
                 )
 
             def keep_single():
@@ -894,6 +935,7 @@ class UnifiedMCTS(Evaluator):
         chance_node_idx: int,
         chance_node_embedding: chex.ArrayTree,
         params: chex.ArrayTree,
+        stochastic_probs: Optional[chex.Array] = None,
     ) -> ExpandResult:
         """Expand ALL stochastic outcomes from a chance node at once using vmap.
 
@@ -907,8 +949,15 @@ class UnifiedMCTS(Evaluator):
 
         This reduces latency from O(K) to O(1) for the expensive NN evaluations.
 
+        Args:
+            stochastic_probs: Probabilities for stochastic outcomes at this state.
+                For games like 2048, these are conditioned on empty cells.
+
         Returns weighted average value based on outcome probabilities.
         """
+        # Use provided probs or fall back to static default
+        if stochastic_probs is None:
+            stochastic_probs = self._get_stochastic_probs(chance_node_embedding)
         # Generate all keys upfront for parallel processing
         outcome_indices = jnp.arange(self.stochastic_size)
         step_keys = jax.random.split(key, self.stochastic_size)
@@ -939,8 +988,13 @@ class UnifiedMCTS(Evaluator):
             all_metadata.terminated, all_player_rewards, all_scalar_values
         )
 
+        # Compute dynamic probs for each child state (for games like 2048)
+        def get_child_probs(embedding):
+            return self._get_stochastic_probs(embedding)
+        all_child_probs = jax.vmap(get_child_probs)(all_embeddings)
+
         # Build policies for all outcomes in parallel
-        def build_policy(policy_logits, action_mask, is_next_stochastic):
+        def build_policy(policy_logits, action_mask, is_next_stochastic, child_probs):
             # Mask illegal actions
             masked_logits = jnp.where(
                 action_mask[:self.policy_size],
@@ -950,9 +1004,10 @@ class UnifiedMCTS(Evaluator):
             policy = jax.nn.softmax(masked_logits)
 
             # Build full policy based on whether next state is stochastic
+            # Use child-specific probabilities for stochastic children
             full_policy = jnp.zeros(self.branching_factor)
             stoch_policy = full_policy.at[self.policy_size:self.policy_size + self.stochastic_size].set(
-                self.stochastic_action_probs
+                child_probs
             )
             decision_policy = full_policy.at[:self.policy_size].set(policy)
 
@@ -961,7 +1016,7 @@ class UnifiedMCTS(Evaluator):
             return is_stoch_float * stoch_policy + (1.0 - is_stoch_float) * decision_policy
 
         all_is_next_stochastic = getattr(all_metadata, 'is_stochastic', jnp.zeros(self.stochastic_size, dtype=bool))
-        all_policies = jax.vmap(build_policy)(all_policy_logits, all_metadata.action_mask, all_is_next_stochastic)
+        all_policies = jax.vmap(build_policy)(all_policy_logits, all_metadata.action_mask, all_is_next_stochastic, all_child_probs)
 
         # Step 3: Sequential update - add all nodes to tree
         # Tree updates are inherently sequential, but the expensive computation is done
@@ -972,6 +1027,7 @@ class UnifiedMCTS(Evaluator):
             value = all_scalar_values[idx]
             terminated = all_metadata.terminated[idx]
             is_chance = all_is_next_stochastic[idx]
+            child_probs = all_child_probs[idx]
 
             node_data = self._new_node(
                 policy=policy,
@@ -979,7 +1035,8 @@ class UnifiedMCTS(Evaluator):
                 embedding=embedding,
                 terminated=terminated,
                 nn_value_estimate=value,
-                is_chance_node=is_chance
+                is_chance_node=is_chance,
+                outcome_probs=child_probs,  # Store child-specific probabilities
             )
 
             # Add to tree at action = policy_size + outcome_idx
@@ -993,8 +1050,8 @@ class UnifiedMCTS(Evaluator):
 
         final_tree, _ = jax.lax.scan(add_one_node, tree, outcome_indices)
 
-        # Compute weighted average value
-        weighted_value = jnp.sum(all_scalar_values * self.stochastic_action_probs)
+        # Compute weighted average value using the parent's stochastic probabilities
+        weighted_value = jnp.sum(all_scalar_values * stochastic_probs)
 
         return ExpandResult(tree=final_tree, child_idx=chance_node_idx, value=weighted_value)
 
@@ -1077,17 +1134,40 @@ class UnifiedMCTS(Evaluator):
         child: int,
         value: float,
     ) -> StochasticMCTSTree:
-        """Backpropagate value through tree with player perspective handling."""
+        """Backpropagate value through tree with expectimax at chance nodes.
+
+        For decision nodes: update Q as running average of sampled values
+        For chance nodes: compute Q as expected value over all stochastic children
+        """
         # Initial discount from parent to child
         initial_discount = self._calculate_discount_factor(tree, parent, child)
         value = value * initial_discount
 
         def body_fn(state: BackpropState) -> BackpropState:
             node_idx, val, t = state.node_idx, state.value, state.tree
-            t = self._update_node_stats(t, node_idx, val)
+
+            # Check if this is a chance node
+            is_chance = t.data.is_chance_node[node_idx]
+
+            # For chance nodes, compute expectimax over all children
+            # For decision nodes, use standard running average update
+            t = jax.lax.cond(
+                jnp.logical_and(is_chance, self.is_stochastic_game),
+                lambda: self._update_chance_node_expectimax(t, node_idx),
+                lambda: self._update_node_stats(t, node_idx, val)
+            )
+
             parent_idx = t.parents[node_idx]
+
+            # For value passed to parent: use expectimax Q-value for chance nodes
+            updated_val = jax.lax.cond(
+                jnp.logical_and(is_chance, self.is_stochastic_game),
+                lambda: t.data.q[node_idx],  # Use computed expectimax
+                lambda: val  # Use sampled value
+            )
+
             discount = self._calculate_discount_factor(t, parent_idx, node_idx)
-            return BackpropState(node_idx=parent_idx, value=val * discount, tree=t)
+            return BackpropState(node_idx=parent_idx, value=updated_val * discount, tree=t)
 
         state = jax.lax.while_loop(
             lambda s: s.node_idx != s.tree.ROOT_INDEX,
@@ -1095,8 +1175,60 @@ class UnifiedMCTS(Evaluator):
             BackpropState(node_idx=parent, value=value, tree=tree)
         )
 
-        # Update root
-        return self._update_node_stats(state.tree, state.tree.ROOT_INDEX, state.value)
+        # Update root - also handle chance root
+        is_root_chance = state.tree.data.is_chance_node[state.tree.ROOT_INDEX]
+        return jax.lax.cond(
+            jnp.logical_and(is_root_chance, self.is_stochastic_game),
+            lambda: self._update_chance_node_expectimax(state.tree, state.tree.ROOT_INDEX),
+            lambda: self._update_node_stats(state.tree, state.tree.ROOT_INDEX, state.value)
+        )
+
+    def _update_chance_node_expectimax(
+        self,
+        tree: StochasticMCTSTree,
+        node_idx: int,
+    ) -> StochasticMCTSTree:
+        """Update a chance node's Q-value as expectimax over all stochastic children.
+
+        Q(chance_node) = sum_i P(outcome_i) * Q(child_i)
+
+        This computes the expected value weighted by stochastic outcome probabilities.
+        """
+        # Get Q-values of all stochastic children
+        # Children are at edge indices: policy_size, policy_size+1, ..., policy_size+stochastic_size-1
+        child_q_values = jnp.zeros(self.stochastic_size)
+        child_visits = jnp.zeros(self.stochastic_size)
+
+        def get_child_stats(i):
+            edge_idx = self.policy_size + i
+            child_idx = tree.edge_map[node_idx, edge_idx]
+            # Check if child exists
+            exists = child_idx != tree.NULL_INDEX
+            q = jnp.where(exists, tree.data.q[child_idx], 0.0)
+            n = jnp.where(exists, tree.data.n[child_idx], 0.0)
+            return q, n
+
+        # Vectorized lookup of all children
+        child_q_values, child_visits = jax.vmap(get_child_stats)(jnp.arange(self.stochastic_size))
+
+        # Compute expectimax: weighted average of child Q-values
+        # Only include children that have been visited
+        total_child_visits = jnp.sum(child_visits)
+
+        # Weight by node-specific stochastic probabilities
+        node_probs = self._get_node_stochastic_probs(tree, node_idx)
+        expected_q = jnp.sum(child_q_values * node_probs)
+
+        # Update node stats
+        # Visit count = sum of child visits (each visit to any child counts as visiting the chance node)
+        new_n = total_child_visits
+        new_q = expected_q
+
+        new_data = tree.data.replace(
+            n=tree.data.n.at[node_idx].set(new_n),
+            q=tree.data.q.at[node_idx].set(new_q)
+        )
+        return tree.replace(data=new_data)
 
     def _calculate_discount_factor(self, tree: StochasticMCTSTree, node_idx: int, other_idx: int) -> float:
         """Calculate discount factor for two-player perspective."""
@@ -1217,6 +1349,7 @@ class UnifiedMCTS(Evaluator):
             "mcts/root_visits": float(root_visits),
             "mcts/max_nodes": float(self.max_nodes),
             "mcts/num_iterations": float(self.num_iterations),
+            "mcts/max_nodes_hit": float(tree.max_nodes_hit),
         }
 
     def _new_node(
@@ -1227,10 +1360,21 @@ class UnifiedMCTS(Evaluator):
         terminated: bool,
         nn_value_estimate: float = 0.0,
         is_chance_node: bool = False,
+        outcome_probs: Optional[chex.Array] = None,
     ) -> StochasticMCTSNode:
-        """Create a new MCTS node with stochastic game support."""
+        """Create a new MCTS node with stochastic game support.
+
+        Args:
+            outcome_probs: Stochastic outcome probabilities for this node's state.
+                If None, uses static stochastic_action_probs (for backwards compatibility).
+                For games like 2048, this should be computed dynamically based on empty cells.
+        """
         # Determine outcome probs size
         outcome_size = max(1, self.stochastic_size) if self.is_stochastic_game else 1
+
+        # Use provided probs or fall back to static default
+        if outcome_probs is None:
+            outcome_probs = self.stochastic_action_probs if self.is_stochastic_game else jnp.ones(1)
 
         return StochasticMCTSNode(
             n=jnp.array(1, dtype=jnp.int32),
@@ -1241,5 +1385,5 @@ class UnifiedMCTS(Evaluator):
             is_chance_node=jnp.array(is_chance_node, dtype=jnp.bool_),
             nn_value_estimate=jnp.array(nn_value_estimate, dtype=jnp.float32),
             expanded_outcomes=jnp.zeros(outcome_size, dtype=jnp.bool_),
-            outcome_probs=self.stochastic_action_probs if self.is_stochastic_game else jnp.ones(1)
+            outcome_probs=outcome_probs
         )

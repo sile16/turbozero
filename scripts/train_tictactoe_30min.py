@@ -42,10 +42,11 @@ from core.types import StepMetadata
 #   - 10 training epochs per iteration over full buffer
 #   - ~100,000+ total gradient updates
 #
-# Our matching config:
-#   - 100 epochs, 1000 train steps/epoch = 100,000 gradient updates
+# Our matching config (adjusted for memory constraints):
+#   - 1000 epochs × 100 train steps/epoch = 100,000 gradient updates
 #   - Buffer size 15,000 to match their replay size
 #   - 25 MCTS simulations per move
+#   - ~2,500 self-play games total
 # ============================================================================
 TRAINING_TIME_MINUTES = 30
 SEED = 42
@@ -67,20 +68,20 @@ TRAIN_GUMBEL_K = 9           # 9 possible actions in TicTacToe
 EVAL_MCTS_ITERATIONS = 25
 EVAL_MCTS_MAX_NODES = 50
 
-# Training - optimized for GPU memory constraints
-# 100 epochs × 100 steps × 64 batch = 640,000 samples seen
-BATCH_SIZE = 32              # Parallel games for data collection (reduced for memory)
+# Training - Matches alpha-zero-general baseline
+# 1000 epochs × 100 steps = 100,000 gradient updates (matches baseline)
+BATCH_SIZE = 8               # Parallel games for data collection (small to limit game count)
 TRAIN_BATCH_SIZE = 64        # Batch size for gradient updates
-TRAIN_STEPS_PER_EPOCH = 100  # Reduced from 1000 to fit in GPU memory
-COLLECTION_STEPS_PER_EPOCH = 10  # Collect more games each epoch
-WARMUP_STEPS = 50            # Fill buffer before training
-BUFFER_SIZE = 5000           # Reduced buffer size
+TRAIN_STEPS_PER_EPOCH = 100  # Steps per epoch (memory constrained)
+COLLECTION_STEPS_PER_EPOCH = 1   # 1 collection step per epoch
+WARMUP_STEPS = 100           # Fill buffer before training
+BUFFER_SIZE = 15000          # Match baseline buffer size
 MAX_EPISODE_STEPS = 10       # TicTacToe max 9 moves
-NUM_EPOCHS = 100             # 100 epochs
+NUM_EPOCHS = 1000            # 1000 epochs to get 100,000 gradient updates
 
 # Evaluation
 EVAL_EPISODES = 128    # Evaluation games
-EVAL_EVERY = 10        # Test every 10 epochs
+EVAL_EVERY = 100       # Test every 100 epochs (10 evals total)
 
 # Checkpointing
 CHECKPOINT_DIR = "./checkpoints/tictactoe"
@@ -261,7 +262,7 @@ def main():
     print("\nCreating trainer...")
 
     # Learning rate schedule: warmup + cosine decay
-    # Total: 100 epochs × 1000 steps = 100,000 gradient updates
+    # Total: 1000 epochs × 100 steps = 100,000 gradient updates
     total_train_steps = num_epochs * TRAIN_STEPS_PER_EPOCH  # 100,000
     lr_warmup_steps = 1000  # 1% warmup
     lr_schedule = optax.warmup_cosine_decay_schedule(
@@ -299,10 +300,11 @@ def main():
         wandb_project_name=WANDB_PROJECT,
     )
 
-    # Temperature schedule (linear decay from 1.0 to 0.1 over training)
+    # Temperature schedule: constant 1.0 during training (matches alpha-zero-general)
+    # Greedy selection (temp=0) is used during evaluation via mcts_test
     def temp_schedule(epoch):
-        progress = min(epoch / num_epochs, 1.0)
-        return 1.0 - 0.9 * progress  # 1.0 -> 0.1
+        # Constant temperature for exploration during self-play
+        return 1.0
 
     trainer.set_temp_fn(temp_schedule)
 

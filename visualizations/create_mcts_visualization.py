@@ -8,7 +8,6 @@ without relying on the actual MCTS implementation.
 import os
 import shutil
 from pathlib import Path
-from functools import partial
 import json
 import graphviz
 import numpy as np
@@ -20,10 +19,14 @@ import jax
 import jax.numpy as jnp
 
 import pgx.backgammon as bg
-from core.evaluators.mcts.stochastic_mcts import StochasticMCTS
+from core.evaluators.mcts.unified_mcts import UnifiedMCTS
 from core.evaluators.mcts.action_selection import PUCTSelector
 from core.types import StepMetadata
-from core.bgcommon import bg_pip_count_eval, bg_step_fn
+from core.bgcommon import (
+    bg_pip_count_eval,
+    make_bg_decision_step_fn,
+    make_bg_stochastic_step_fn,
+)
 
 # Check if graphviz 'dot' command is available
 GRAPHVIZ_AVAILABLE = shutil.which('dot') is not None
@@ -35,13 +38,19 @@ if not GRAPHVIZ_AVAILABLE:
 backgammon_env = bg.Backgammon(short_game=True)
 print("Backgammon environment initialized.")
 
-def tree_to_graph(eval_state, output_dir, boards_dir, max_nodes_to_render=50, verbose=False):
+def _is_chance_node(tree, node_idx: int) -> bool:
+    if hasattr(tree.data, "is_chance_node"):
+        return bool(np.asarray(tree.data.is_chance_node[node_idx]))
+    node_data = tree.data_at(node_idx)
+    return bool(np.asarray(getattr(node_data, "is_chance_node", False)))
+
+
+def tree_to_graph(eval_state, output_dir, policy_size, stochastic_size, max_nodes_to_render=50, verbose=False):
     """Convert a tree to a Graphviz graph.
 
     Args:
         eval_state: The MCTS tree state
         output_dir: Directory for output files
-        boards_dir: Directory for board SVG files
         max_nodes_to_render: Maximum number of nodes to render (for performance)
         verbose: Enable verbose debug output
     """
@@ -106,13 +115,13 @@ def tree_to_graph(eval_state, output_dir, boards_dir, max_nodes_to_render=50, ve
         if hasattr(node_data, 'p') and node_data.p is not None and visit_count > 0: # Only show for visited nodes with policy
             try:
                 # Ensure policy is numpy array for sorting
-                policy_array = np.array(node_data.p) 
+                policy_array = np.array(node_data.p)[:policy_size]
                 # Get indices of top k probabilities
                 top_k = 8
                 top_indices = np.argsort(policy_array)[-top_k:][::-1]
                 policy_str_parts = []
                 no_op = True
-                is_stochastic_node = StochasticMCTS.is_node_idx_stochastic(tree, node_idx)
+                is_stochastic_node = _is_chance_node(tree, node_idx)
                 if not is_stochastic_node:
                     for idx in top_indices:
                         if idx > 5: 
@@ -131,41 +140,21 @@ def tree_to_graph(eval_state, output_dir, boards_dir, max_nodes_to_render=50, ve
             except Exception as e:
                 label += "\\nPolicy: (Error)" # Indicate if policy parsing failed
         
-        # Set node style - simplified to just deterministic vs stochastic
-        is_stochastic = StochasticMCTS.is_node_idx_stochastic(tree, node_idx)
+        # Set node style - include player color for decision nodes
+        is_stochastic = _is_chance_node(tree, node_idx)
         if is_stochastic:
             fillcolor = 'lightcoral'  # Stochastic nodes
         elif node_data.terminated:
             fillcolor = 'grey'        # Terminal nodes
         else:
-            fillcolor = 'lightblue'   # Deterministic nodes
-        
-        # === Add Board SVG Tooltip ===
-        try:
-            if hasattr(node_data, 'embedding') and node_data.embedding is not None:
-                board_state = node_data.embedding
-                # Check if it looks like a valid state object (simple check)
-                if hasattr(board_state, 'to_svg'): 
-                    board_svg_str = board_state.to_svg()
-                    board_filename_rel = os.path.join("boards", f"board_node_{node_idx}.svg")
-                    board_filename_abs = os.path.join(output_dir, board_filename_rel)
-                    save_svg_string(board_svg_str, board_filename_abs)
-                    # Update the node with the tooltip
-                    graph.node(node_id, label=label, fillcolor=fillcolor, tooltip=board_filename_rel) 
-                else:
-                     # Add node without tooltip if embedding is not a state
-                     graph.node(node_id, label=label, fillcolor=fillcolor)
+            player_id = getattr(node_data.embedding, 'current_player', None)
+            if player_id is not None and int(player_id) == 1:
+                fillcolor = 'lightgoldenrod1'  # Player 1
             else:
-                 # Add node without tooltip if no embedding
-                 graph.node(node_id, label=label, fillcolor=fillcolor)
-        except Exception as e:
-             print(f"WARN: Failed to generate/save board SVG for node {node_idx}: {e}")
-             # Add node without tooltip on error
-             graph.node(node_id, label=label, fillcolor=fillcolor)
-        # === END Add Board SVG Tooltip ===
+                fillcolor = 'lightblue'   # Player 0/unknown
         
         graph.node(node_id, label=label, fillcolor=fillcolor)
-
+        
         # Add edges to children (only to nodes we're rendering)
         for action in range(tree.branching_factor):
             child_node_idx = int(tree.edge_map[node_idx, action])
@@ -174,11 +163,15 @@ def tree_to_graph(eval_state, output_dir, boards_dir, max_nodes_to_render=50, ve
                 
                 # Format edge label - REFINED LOGIC
                 try:
-                    is_parent_stochastic = StochasticMCTS.is_node_idx_stochastic(tree, node_idx)
+                    is_parent_stochastic = _is_chance_node(tree, node_idx)
                     if is_parent_stochastic:
                         # Parent is stochastic, action selects a stochastic outcome
                         try:
-                            action_str = bg.stochastic_action_to_str(action)
+                            outcome = action - policy_size
+                            if 0 <= outcome < stochastic_size:
+                                action_str = bg.stochastic_action_to_str(outcome)
+                            else:
+                                action_str = f"StochAction: {action} (Invalid Idx)"
                         except IndexError:
                              action_str = f"StochAction: {action} (Invalid Idx)" # Stochastic index out of range?
                         except Exception as inner_e:
@@ -203,15 +196,6 @@ def tree_to_graph(eval_state, output_dir, boards_dir, max_nodes_to_render=50, ve
     
     return graph
 
-def save_svg_string(svg_string, filepath):
-    """Saves an SVG string to a file."""
-    try:
-        with open(filepath, 'w') as f:
-            f.write(svg_string)
-    except Exception as e:
-        print(f"Error saving SVG to {filepath}: {e}")
-
-
 def render_graph_safely(graph, output_path_without_ext):
     """Render a graphviz graph to SVG, handling missing graphviz gracefully."""
     if GRAPHVIZ_AVAILABLE:
@@ -233,31 +217,30 @@ def render_graph_safely(graph, output_path_without_ext):
             f.write(placeholder_svg)
 
 def create_real_mcts_visualization(output_dir):
-    """Create visualizations of a real StochasticMCTS tree over multiple iterations and turns."""
-    print("Creating StochasticMCTS visualization...")
-    
-    # Ensure boards subdirectory exists
-    boards_dir = os.path.join(output_dir, "boards")
-    os.makedirs(boards_dir, exist_ok=True)
+    """Create visualizations of a real UnifiedMCTS tree over multiple iterations and turns."""
+    print("Creating UnifiedMCTS visualization...")
     
     # Set up environment
     key = jax.random.PRNGKey(48)
     
+    decision_step_fn = make_bg_decision_step_fn(backgammon_env)
+    stochastic_step_fn = make_bg_stochastic_step_fn(backgammon_env)
+
     # Set up MCTS with minimal iterations for visualization
-    mcts = StochasticMCTS(
+    mcts = UnifiedMCTS(
         eval_fn=bg_pip_count_eval,
         action_selector=PUCTSelector(),
-        branching_factor=backgammon_env.num_actions,
+        policy_size=backgammon_env.num_actions,
         max_nodes=200,  # Reduced for faster visualization
         num_iterations=1,  # Use 1 iteration per step for step-by-step visualization
+        decision_step_fn=decision_step_fn,
+        stochastic_step_fn=stochastic_step_fn,
         stochastic_action_probs=backgammon_env.stochastic_action_probs,
-        discount=-1.0,
         temperature=0.2,
-        persist_tree=True,  # Critical to preserve tree between steps
     )
     
     # Confirm the MCTS configuration
-    print(f"MCTS config: max_nodes={mcts.max_nodes}, persist_tree={mcts.persist_tree}")
+    print(f"MCTS config: max_nodes={mcts.max_nodes}, branching_factor={mcts.branching_factor}")
     
     # Initialize state
     key, init_key = jax.random.split(key)
@@ -274,7 +257,8 @@ def create_real_mcts_visualization(output_dir):
         action_mask=state.legal_action_mask,
         terminated=state.terminated,
         cur_player_id=state.current_player,
-        step=state._step_count
+        step=state._step_count,
+        is_stochastic=state._is_stochastic,
     )
 
     visualization_frames = []
@@ -284,24 +268,19 @@ def create_real_mcts_visualization(output_dir):
     render_every_n_iterations = 2  # Only render every Nth iteration for performance
     verbose = False  # Set to True for detailed debug output
 
-    # Keep track of the latest board SVG paths relative to output_dir
-    last_saved_curr_board_path = None
-    last_saved_prev_board_path = None
-
-    # Save initial board state
-    initial_board_filename = 'board_turn_0_initial.svg'
-    initial_board_path_abs = os.path.join(boards_dir, initial_board_filename)
-    save_svg_string(state.to_svg(), initial_board_path_abs)
-    last_saved_curr_board_path = os.path.join("boards", initial_board_filename) # Relative path
+    # Keep track of the latest board arrays for visualization
+    last_saved_curr_board = np.array(state._board).tolist()
+    last_saved_prev_board = None
 
     # Simulation loop
     for turn in range(total_turns):
         print(f"\n--- Processing Turn {turn + 1}/{total_turns} ---")
-        print(f"Initial state: Player {state.current_player}, Stochastic: {state.is_stochastic}")
+        is_state_stochastic = bool(getattr(state, "_is_stochastic", False))
+        print(f"Initial state: Player {state.current_player}, Stochastic: {is_state_stochastic}")
 
         current_iterations = 0
         # If the state is stochastic, MCTS handles it in one evaluate call
-        is_turn_stochastic = bool(state.is_stochastic) # Ensure it's a Python bool
+        is_turn_stochastic = is_state_stochastic  # Ensure it's a Python bool
 
         if is_turn_stochastic:
             key, eval_key, step_key = jax.random.split(key, 3)
@@ -314,7 +293,6 @@ def create_real_mcts_visualization(output_dir):
                 env_state=state,
                 root_metadata=metadata,
                 params={},
-                env_step_fn=partial(bg_step_fn, backgammon_env)
             )
             # Important: For stochastic nodes, the tree stays the same
             eval_state = mcts_output.eval_state
@@ -322,7 +300,13 @@ def create_real_mcts_visualization(output_dir):
             print(f"  Turn {turn+1}: Stochastic action selected: {action} ({bg.stochastic_action_to_str(action)})")
             
             # Add selected stochastic action to visualization
-            graph = tree_to_graph(eval_state, output_dir, boards_dir, verbose=verbose)
+            graph = tree_to_graph(
+                eval_state,
+                output_dir,
+                policy_size=mcts.policy_size,
+                stochastic_size=mcts.stochastic_size,
+                verbose=verbose,
+            )
             
             # Visualize MCTS tree for the stochastic root
             graph_filename = f'real_tree_turn_{turn}_stochastic_eval.svg'
@@ -336,8 +320,8 @@ def create_real_mcts_visualization(output_dir):
                 'turn': turn,
                 'graph_path': graph_path_rel,
                 'info': f'Turn {turn+1}: Evaluating stochastic state (Player {state.current_player})',
-                'current_board_path': last_saved_curr_board_path,
-                'previous_board_path': last_saved_prev_board_path,
+                'current_board': last_saved_curr_board,
+                'previous_board': last_saved_prev_board,
                 'action_str': '' # No action yet
             })
             frame_idx += 1
@@ -345,21 +329,25 @@ def create_real_mcts_visualization(output_dir):
             # --- Action Step ---
             action_str = bg.stochastic_action_to_str(action)
             previous_state = state
-            last_saved_prev_board_path = last_saved_curr_board_path  # Current becomes previous
+            last_saved_prev_board = last_saved_curr_board  # Current becomes previous
 
             # Step environment with the chosen stochastic action
-            state, metadata = bg_step_fn(backgammon_env, state, action, step_key)
+            state, metadata = stochastic_step_fn(state, action, step_key)
             # Step MCTS tree - always step after environment steps with stochastic actions
-            eval_state = mcts.step(eval_state, action)
+            tree_action = mcts.policy_size + int(action)
+            eval_state = mcts.step(eval_state, tree_action)
 
-            # Save current board state SVG
-            curr_board_filename = f'board_turn_{turn}_stochastic_curr.svg'
-            curr_board_path_abs = os.path.join(boards_dir, curr_board_filename)
-            save_svg_string(state.to_svg(), curr_board_path_abs)
-            last_saved_curr_board_path = os.path.join("boards", curr_board_filename) # Update last saved current board
+            # Save current board state
+            last_saved_curr_board = np.array(state._board).tolist()
 
             # Visualize MCTS tree *after* the stochastic step
-            graph_after_step = tree_to_graph(eval_state, output_dir, boards_dir, verbose=verbose)
+            graph_after_step = tree_to_graph(
+                eval_state,
+                output_dir,
+                policy_size=mcts.policy_size,
+                stochastic_size=mcts.stochastic_size,
+                verbose=verbose,
+            )
             graph_after_step_filename = f'real_tree_turn_{turn}_stochastic_after.svg'
             graph_after_step_path_abs = os.path.join(output_dir, graph_after_step_filename)
             graph_after_step_path_rel = graph_after_step_filename
@@ -372,8 +360,8 @@ def create_real_mcts_visualization(output_dir):
                 'action': int(action), # Ensure action is serializable
                 'action_str': action_str,
                 'graph_path': graph_after_step_path_rel,
-                'previous_board_path': last_saved_prev_board_path,
-                'current_board_path': last_saved_curr_board_path,
+                'previous_board': last_saved_prev_board,
+                'current_board': last_saved_curr_board,
                 'info': f'Turn {turn+1}: Applied stochastic action {action_str} (Player {previous_state.current_player}) -> Player {state.current_player}'
             })
             frame_idx += 1
@@ -397,7 +385,6 @@ def create_real_mcts_visualization(output_dir):
                     env_state=state,
                     root_metadata=metadata,
                     params={},
-                    env_step_fn=partial(bg_step_fn, backgammon_env)
                 )
                 eval_state = mcts_output.eval_state
                 current_iter_action = mcts_output.action  # Action MCTS would choose *if stopped now*
@@ -422,7 +409,13 @@ def create_real_mcts_visualization(output_dir):
                 should_render = (iteration + 1) % render_every_n_iterations == 0 or iteration == iterations_per_deterministic_turn - 1
                 if should_render:
                     # Visualize tree after this iteration
-                    graph = tree_to_graph(eval_state, output_dir, boards_dir, verbose=verbose)
+                    graph = tree_to_graph(
+                        eval_state,
+                        output_dir,
+                        policy_size=mcts.policy_size,
+                        stochastic_size=mcts.stochastic_size,
+                        verbose=verbose,
+                    )
                     graph_filename = f'real_tree_turn_{turn}_iter_{iteration:02d}.svg'
                     graph_path_abs = os.path.join(output_dir, graph_filename)
                     graph_path_rel = graph_filename
@@ -435,8 +428,8 @@ def create_real_mcts_visualization(output_dir):
                         'iteration': iteration,
                         'graph_path': graph_path_rel,
                         'info': f'Turn {turn+1}, Iteration {iteration+1}/{iterations_per_deterministic_turn} (Player {state.current_player})',
-                        'current_board_path': last_saved_curr_board_path,
-                        'previous_board_path': last_saved_prev_board_path,
+                        'current_board': last_saved_curr_board,
+                        'previous_board': last_saved_prev_board,
                         'action_str': ''  # No action during iteration
                     })
                     frame_idx += 1
@@ -448,23 +441,26 @@ def create_real_mcts_visualization(output_dir):
             action_str = bg.action_to_str(action)
             print(f"  Turn {turn+1}: Applying deterministic action: {action} ({action_str})")
             previous_state = state
-            last_saved_prev_board_path = last_saved_curr_board_path # Current becomes previous
+            last_saved_prev_board = last_saved_curr_board # Current becomes previous
             key, step_key = jax.random.split(key)
 
             # Step environment based on the chosen action 
-            state, metadata = bg_step_fn(backgammon_env, state, action, step_key)
+            state, metadata = decision_step_fn(state, action, step_key)
 
             # Step MCTS tree - always step after a deterministic action
             eval_state = mcts.step(eval_state, action)
 
-            # Save current board state SVG
-            curr_board_filename = f'board_turn_{turn}_deterministic_curr.svg'
-            curr_board_path_abs = os.path.join(boards_dir, curr_board_filename)
-            save_svg_string(state.to_svg(), curr_board_path_abs)
-            last_saved_curr_board_path = os.path.join("boards", curr_board_filename)  # Update last saved current board
+            # Save current board state
+            last_saved_curr_board = np.array(state._board).tolist()
 
             # Visualize MCTS tree *after* the step
-            graph_after_step = tree_to_graph(eval_state, output_dir, boards_dir, verbose=verbose)
+            graph_after_step = tree_to_graph(
+                eval_state,
+                output_dir,
+                policy_size=mcts.policy_size,
+                stochastic_size=mcts.stochastic_size,
+                verbose=verbose,
+            )
             graph_after_step_filename = f'real_tree_turn_{turn}_deterministic_after.svg'
             graph_after_step_path_abs = os.path.join(output_dir, graph_after_step_filename)
             graph_after_step_path_rel = graph_after_step_filename
@@ -477,8 +473,8 @@ def create_real_mcts_visualization(output_dir):
                 'action': int(action), # Ensure action is serializable
                 'action_str': action_str,
                 'graph_path': graph_after_step_path_rel,
-                'previous_board_path': last_saved_prev_board_path,
-                'current_board_path': last_saved_curr_board_path,
+                'previous_board': last_saved_prev_board,
+                'current_board': last_saved_curr_board,
                 'info': f'Turn {turn+1}: Applied move {action_str} (Player {previous_state.current_player}) -> Player {state.current_player}'
             })
             frame_idx += 1
@@ -491,8 +487,8 @@ def create_real_mcts_visualization(output_dir):
                 'type': 'terminal',
                 'turn': turn,
                 'graph_path': graph_after_step_path_rel, # Show last tree state
-                'previous_board_path': last_saved_prev_board_path, # Show board before final state
-                'current_board_path': last_saved_curr_board_path, # Show final board state
+                'previous_board': last_saved_prev_board, # Show board before final state
+                'current_board': last_saved_curr_board, # Show final board state
                 'info': f'Game Over at Turn {turn+1}. Final Reward: {state.rewards[0]:.2f}',
                 'action_str': 'Game Over'
              })
@@ -519,7 +515,7 @@ def create_single_page_visualization(output_dir, visualization_frames):
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Stochastic MCTS Visualization</title>
+    <title>UnifiedMCTS Visualization</title>
     <style>
         body {{
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
@@ -561,6 +557,11 @@ def create_single_page_visualization(output_dir, visualization_frames):
             flex-direction: column;
             align-items: center;
             justify-content: center; /* Center content vertically */
+        }}
+        .board-svg {{
+            width: 100%;
+            height: auto;
+            max-height: 260px;
         }}
         .board-container img {{
             max-width: 100%;
@@ -746,13 +747,12 @@ def create_single_page_visualization(output_dir, visualization_frames):
     </style>
 </head>
 <body>
-    <h1>Stochastic MCTS Visualization</h1>
+    <h1>UnifiedMCTS Visualization</h1>
 
     <div class="board-display-container">
         <div id="currBoardContainer" class="board-container">
             <h3>Current Board State</h3>
-            <div id="currBoardLoader" class="loader"></div>
-            <img id="currBoardImage" src="" alt="Current Board State">
+            <div id="currBoard" class="board-svg"></div>
         </div>
         <div class="action-display">
             <span id="actionArrow">&#11013;</span> <!-- Left arrow -->
@@ -760,8 +760,7 @@ def create_single_page_visualization(output_dir, visualization_frames):
         </div>
         <div id="prevBoardContainer" class="board-container">
             <h3>Previous Board State</h3>
-            <div id="prevBoardLoader" class="loader"></div>
-            <img id="prevBoardImage" src="" alt="Previous Board State">
+            <div id="prevBoard" class="board-svg"></div>
         </div>
     </div>
 
@@ -808,8 +807,8 @@ def create_single_page_visualization(output_dir, visualization_frames):
         
         // DOM elements
         const mctsImage = document.getElementById('mctsImage');
-        const prevBoardImage = document.getElementById('prevBoardImage');
-        const currBoardImage = document.getElementById('currBoardImage');
+        const prevBoardContainer = document.getElementById('prevBoard');
+        const currBoardContainer = document.getElementById('currBoard');
         const actionTextElement = document.getElementById('actionText');
         const slider = document.getElementById('frameSlider');
         const counter = document.getElementById('frameCounter');
@@ -821,20 +820,137 @@ def create_single_page_visualization(output_dir, visualization_frames):
         
         // Loaders
         const mctsLoader = document.getElementById('mctsLoader');
-        const prevBoardLoader = document.getElementById('prevBoardLoader');
-        const currBoardLoader = document.getElementById('currBoardLoader');
-
-        function showLoader(loaderElement, imageElement) {{
+        function showLoader(loaderElement) {{
             loaderElement.style.display = 'block';
-            imageElement.style.visibility = 'hidden'; // Hide image but keep space
         }}
 
-        function hideLoader(loaderElement, imageElement) {{
-            // Use requestAnimationFrame to ensure DOM update happens before showing image
+        function hideLoader(loaderElement) {{
             requestAnimationFrame(() => {{
                 loaderElement.style.display = 'none';
-                imageElement.style.visibility = 'visible';
             }});
+        }}
+
+        function renderBoard(container, board) {{
+            container.innerHTML = '';
+            if (!board || board.length < 28) {{
+                container.textContent = 'No board data';
+                return;
+            }}
+
+            const width = 520;
+            const height = 320;
+            const barWidth = 40;
+            const margin = 16;
+            const midY = height / 2;
+            const pointWidth = (width - barWidth) / 12;
+            const triangleHeight = (height - 2 * margin) / 2 - 6;
+            const checkerRadius = Math.max(6, Math.floor(pointWidth * 0.35));
+            const maxVisible = 5;
+
+            const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+            svg.setAttribute('viewBox', '0 0 ' + width + ' ' + height);
+            svg.setAttribute('width', '100%');
+            svg.setAttribute('height', '100%');
+
+            const addRect = (x, y, w, h, fill) => {{
+                const rect = document.createElementNS(svg.namespaceURI, 'rect');
+                rect.setAttribute('x', x);
+                rect.setAttribute('y', y);
+                rect.setAttribute('width', w);
+                rect.setAttribute('height', h);
+                rect.setAttribute('fill', fill);
+                svg.appendChild(rect);
+            }};
+
+            const addText = (x, y, text, color, size = 12, anchor = 'middle') => {{
+                const t = document.createElementNS(svg.namespaceURI, 'text');
+                t.setAttribute('x', x);
+                t.setAttribute('y', y);
+                t.setAttribute('fill', color);
+                t.setAttribute('font-size', size);
+                t.setAttribute('font-family', 'sans-serif');
+                t.setAttribute('text-anchor', anchor);
+                t.textContent = text;
+                svg.appendChild(t);
+            }};
+
+            addRect(0, 0, width, height, '#f2d6a2');
+            addRect(0, 0, width, margin, '#d4b17f');
+            addRect(0, height - margin, width, margin, '#d4b17f');
+            addRect(6 * pointWidth, 0, barWidth, height, '#c08c5a');
+
+            const pointStr = (x, y) => String(x) + ',' + String(y);
+            for (let col = 0; col < 12; col++) {{
+                const xBase = col < 6 ? col * pointWidth : barWidth + col * pointWidth;
+                const color = col % 2 === 0 ? '#d18b47' : '#f4e1bf';
+
+                const top = document.createElementNS(svg.namespaceURI, 'polygon');
+                top.setAttribute('points', [
+                    pointStr(xBase, margin),
+                    pointStr(xBase + pointWidth, margin),
+                    pointStr(xBase + pointWidth / 2, midY - 6)
+                ].join(' '));
+                top.setAttribute('fill', color);
+                svg.appendChild(top);
+
+                const bottom = document.createElementNS(svg.namespaceURI, 'polygon');
+                bottom.setAttribute('points', [
+                    pointStr(xBase, height - margin),
+                    pointStr(xBase + pointWidth, height - margin),
+                    pointStr(xBase + pointWidth / 2, midY + 6)
+                ].join(' '));
+                bottom.setAttribute('fill', color);
+                svg.appendChild(bottom);
+            }}
+
+            const drawStack = (idx, isTop) => {{
+                const count = board[idx];
+                if (!count) return;
+                const absCount = Math.abs(count);
+                const color = count > 0 ? '#fdfdfd' : '#2c2c2c';
+                const stroke = count > 0 ? '#666' : '#111';
+                const visible = Math.min(absCount, maxVisible);
+                const xCenter = (idx % 12) < 6
+                    ? (idx % 12) * pointWidth + pointWidth / 2
+                    : barWidth + (idx % 12) * pointWidth + pointWidth / 2;
+
+                for (let i = 0; i < visible; i++) {{
+                    const circle = document.createElementNS(svg.namespaceURI, 'circle');
+                    const y = isTop
+                        ? margin + checkerRadius + i * (checkerRadius * 2 + 2)
+                        : height - margin - checkerRadius - i * (checkerRadius * 2 + 2);
+                    circle.setAttribute('cx', xCenter);
+                    circle.setAttribute('cy', y);
+                    circle.setAttribute('r', checkerRadius);
+                    circle.setAttribute('fill', color);
+                    circle.setAttribute('stroke', stroke);
+                    circle.setAttribute('stroke-width', 1);
+                    svg.appendChild(circle);
+                }}
+
+                if (absCount > maxVisible) {{
+                    const textY = isTop
+                        ? margin + checkerRadius + (visible - 1) * (checkerRadius * 2 + 2) + 4
+                        : height - margin - checkerRadius - (visible - 1) * (checkerRadius * 2 + 2) - 4;
+                    addText(xCenter, textY, String(absCount), count > 0 ? '#111' : '#f5f5f5', 11);
+                }}
+            }};
+
+            for (let i = 0; i < 12; i++) {{
+                drawStack(i, true);
+            }}
+            for (let i = 12; i < 24; i++) {{
+                drawStack(i, false);
+            }}
+
+            const barCur = Math.max(board[24], 0);
+            const barOpp = Math.max(-board[25], 0);
+            const offCur = board[26];
+            const offOpp = Math.max(-board[27], 0);
+            addText(width / 2, margin + 12, 'Bar ' + barCur + '/' + barOpp, '#3b2f1c', 12);
+            addText(width / 2, height - margin - 6, 'Off ' + offCur + '/' + offOpp, '#3b2f1c', 12);
+
+            container.appendChild(svg);
         }}
 
         // Update the display based on the current frame index
@@ -850,10 +966,10 @@ def create_single_page_visualization(output_dir, visualization_frames):
             infoPanel.textContent = frame.info;
 
             // --- Update MCTS Graph ---
-            showLoader(mctsLoader, mctsImage);
-            mctsImage.onload = () => hideLoader(mctsLoader, mctsImage);
+            showLoader(mctsLoader);
+            mctsImage.onload = () => hideLoader(mctsLoader);
             mctsImage.onerror = () => {{
-                 hideLoader(mctsLoader, mctsImage);
+                 hideLoader(mctsLoader);
                  mctsImage.alt = "Error loading MCTS graph";
                  mctsImage.src = ""; // Clear src on error
                  console.error("Error loading MCTS image:", frame.graph_path);
@@ -863,29 +979,8 @@ def create_single_page_visualization(output_dir, visualization_frames):
             mctsImage.alt = frame.graph_path ? `MCTS Tree - ${{frame.info}}` : "MCTS Graph Unavailable";
 
             // --- Update Board Displays ---
-            // Current Board
-            showLoader(currBoardLoader, currBoardImage);
-            currBoardImage.onload = () => hideLoader(currBoardLoader, currBoardImage);
-            currBoardImage.onerror = () => {{
-                 hideLoader(currBoardLoader, currBoardImage);
-                 currBoardImage.alt = "Error loading current board";
-                 currBoardImage.src = ""; // Clear src
-                 console.error("Error loading current board image:", frame.current_board_path);
-             }};
-             currBoardImage.src = frame.current_board_path ? frame.current_board_path : "";
-             currBoardImage.alt = frame.current_board_path ? `Current Board State - ${{frame.info}}` : "Current Board Unavailable";
-
-            // Previous Board
-            showLoader(prevBoardLoader, prevBoardImage);
-            prevBoardImage.onload = () => hideLoader(prevBoardLoader, prevBoardImage);
-             prevBoardImage.onerror = () => {{
-                 hideLoader(prevBoardLoader, prevBoardImage);
-                 prevBoardImage.alt = "Error loading previous board";
-                 prevBoardImage.src = ""; // Clear src
-                 console.error("Error loading previous board image:", frame.previous_board_path);
-             }};
-            prevBoardImage.src = frame.previous_board_path ? frame.previous_board_path : ""; // Use path or empty string
-            prevBoardImage.alt = frame.previous_board_path ? `Previous Board State - ${{frame.info}}` : "Previous Board Unavailable";
+            renderBoard(currBoardContainer, frame.current_board);
+            renderBoard(prevBoardContainer, frame.previous_board);
 
             // --- Update Action Display ---
             if (frame.type === 'action' || frame.type === 'terminal') {{
@@ -985,7 +1080,7 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
     # Clean up old SVGs before generation to avoid confusion
     print(f"Cleaning old SVGs from {output_dir}...")
-    for file_pattern in ["*.svg", "boards/*.svg"]:
+    for file_pattern in ["*.svg"]:
         files_to_remove = glob.glob(os.path.join(output_dir, file_pattern))
         for f_path in files_to_remove:
             try:

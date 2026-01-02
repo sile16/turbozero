@@ -74,39 +74,48 @@ class TwoPlayerBaseline(BaseTester):
         player_outcomes = results[:, 0]
         num_games = player_outcomes.shape[0]
 
-        # Overall stats
-        avg = player_outcomes.mean()
-        wins = jnp.sum(player_outcomes > 0.5)
-        losses = jnp.sum(player_outcomes < -0.5)
-        draws = num_games - wins - losses
+        # Overall stats (min/avg/max for WandB grouping)
+        overall_avg = player_outcomes.mean()
+        overall_min = player_outcomes.min()
+        overall_max = player_outcomes.max()
 
         # Track by who went first
         # p_ids_all[:, 0] is our agent's player ID for each game
         # If player ID is 0, our agent went first
         agent_went_first = p_ids_all[:, 0] == 0
 
-        # Wins/losses when agent went first
+        # First player stats (when agent went first)
         first_mask = agent_went_first
         first_count = jnp.sum(first_mask)
-        first_wins = jnp.sum(jnp.where(first_mask, player_outcomes > 0.5, False))
-        first_losses = jnp.sum(jnp.where(first_mask, player_outcomes < -0.5, False))
+        first_outcomes = jnp.where(first_mask, player_outcomes, 0.0)
+        first_avg = jnp.where(first_count > 0, jnp.sum(first_outcomes) / first_count, 0.0)
+        first_min = jnp.where(first_count > 0, jnp.min(jnp.where(first_mask, player_outcomes, 1.0)), 0.0)
+        first_max = jnp.where(first_count > 0, jnp.max(jnp.where(first_mask, player_outcomes, -1.0)), 0.0)
 
-        # Wins/losses when agent went second
+        # Second player stats (when agent went second)
         second_mask = ~agent_went_first
         second_count = jnp.sum(second_mask)
-        second_wins = jnp.sum(jnp.where(second_mask, player_outcomes > 0.5, False))
-        second_losses = jnp.sum(jnp.where(second_mask, player_outcomes < -0.5, False))
+        second_outcomes = jnp.where(second_mask, player_outcomes, 0.0)
+        second_avg = jnp.where(second_count > 0, jnp.sum(second_outcomes) / second_count, 0.0)
+        second_min = jnp.where(second_count > 0, jnp.min(jnp.where(second_mask, player_outcomes, 1.0)), 0.0)
+        second_max = jnp.where(second_count > 0, jnp.max(jnp.where(second_mask, player_outcomes, -1.0)), 0.0)
 
+        # Metrics use slash notation for WandB grouping (min/avg/max on same graph)
         metrics = {
-            f"{self.name}_avg_outcome": avg,
-            f"{self.name}_win_rate": wins / num_games,
-            f"{self.name}_draw_rate": draws / num_games,
-            # First player stats (when agent went first)
-            f"{self.name}_first_win_rate": jnp.where(first_count > 0, first_wins / first_count, 0.0),
-            f"{self.name}_first_count": first_count,
-            # Second player stats (when agent went second)
-            f"{self.name}_second_win_rate": jnp.where(second_count > 0, second_wins / second_count, 0.0),
-            f"{self.name}_second_count": second_count,
+            # Overall reward (all games)
+            f"{self.name}_reward/min": overall_min,
+            f"{self.name}_reward/avg": overall_avg,
+            f"{self.name}_reward/max": overall_max,
+            # First player reward (when agent went first)
+            f"{self.name}_first_reward/min": first_min,
+            f"{self.name}_first_reward/avg": first_avg,
+            f"{self.name}_first_reward/max": first_max,
+            f"{self.name}_first_reward/count": first_count,
+            # Second player reward (when agent went second)
+            f"{self.name}_second_reward/min": second_min,
+            f"{self.name}_second_reward/avg": second_avg,
+            f"{self.name}_second_reward/max": second_max,
+            f"{self.name}_second_reward/count": second_count,
         }
 
         return state, metrics, frames, p_ids

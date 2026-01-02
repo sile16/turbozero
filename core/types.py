@@ -19,6 +19,7 @@ class StepMetadata:
     - `match_score`: optional match score context (e.g., (player_score, opp_score, match_length))
     - `cube_value`: current cube value for backgammon-style games
     - `is_stochastic`: whether current state is a chance node (for StochasticMCTS)
+    - `stochastic_action_mask`: mask of valid stochastic actions (for 2048: empty positions)
     """
     rewards: chex.Array
     action_mask: chex.Array
@@ -28,6 +29,7 @@ class StepMetadata:
     match_score: chex.ArrayTree | None = None
     cube_value: float = 1.0
     is_stochastic: bool = False
+    stochastic_action_mask: chex.Array | None = None
     
 
 EnvStepFn = Callable[[chex.ArrayTree, int], Tuple[chex.ArrayTree, StepMetadata]]

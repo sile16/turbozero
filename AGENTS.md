@@ -87,7 +87,7 @@ poetry add jax[cuda12]
 
 - **`core/training/`**: Training infrastructure
   - `train.py`: Unified `Trainer` class implementing the AlphaZero training loop with self-play collection, replay buffer, gradient updates, temperature scheduling, and curriculum support
-  - `loss_fns.py`: Loss functions for policy and value heads (with chance node masking)
+  - `loss_fns.py`: Loss functions for policy and value heads (policy masking for chance nodes)
 
 - **`core/memory/`**: Experience replay
   - `replay_memory.py`: `EpisodeReplayBuffer` storing trajectories with `BaseExperience` and `ReplayBufferState`
@@ -299,21 +299,11 @@ An untrained network will make poor decisions (e.g., holding at turn_total=2 ins
 
 **Status**: **FIXED in pgx 3.1.2** - `step_stochastic` now properly updates observations. No workaround needed.
 
-### Value Loss Must Be Masked for Chance Nodes
+### Value Loss on Chance Nodes (Paper-Aligned)
 
-**Problem**: Value targets at chance nodes depend on which random dice outcome was sampled during training, creating noisy targets. The same chance node observation might have value +1 or -1 depending on the sampled dice roll.
+**Stochastic MuZero guidance**: Train the value head on chance nodes as well as decision nodes. Although the targets are noisy (single sampled outcomes), the paper reports this improves performance in stochastic games.
 
-**Fix**: Mask out value loss for chance node samples in `core/training/loss_fns.py`:
-```python
-if experience.is_chance_node is not None:
-    is_decision_node = ~experience.is_chance_node
-    num_decision_samples = jnp.sum(is_decision_node)
-    value_loss = jnp.where(
-        num_decision_samples > 0,
-        jnp.sum(value_loss_per_sample * is_decision_node) / num_decision_samples,
-        0.0
-    )
-```
+**Current behavior**: `core/training/loss_fns.py` computes value loss on all samples (decision + chance) and only masks policy loss for chance nodes.
 
 ### Training Data Collection Strategy
 
@@ -612,6 +602,73 @@ mcts = UnifiedMCTS(
 When calling `step(tree, action)`, the subtree rooted at the child becomes the new tree. The root embedding is preserved from when the child was expanded, so it correctly matches the game state.
 
 **Important**: The caller should pass the matching `env_state` to the next `evaluate()` call.
+
+## Training Benchmarks & Goals
+
+Reference benchmarks from published research to validate our pipeline.
+
+### TicTacToe (Deterministic 2-Player)
+
+**Reference**: [alpha-zero-general](https://github.com/suragnair/alpha-zero-general)
+- Training: 3 iterations × 25 episodes = 750 games
+- MCTS: 25 simulations/move
+- Time: ~30 minutes on CPU (i5-4570)
+- Result: Perfect play after ~3000 games
+
+**Our Target**:
+- Win rate vs random: **≥95%** (NN alone, no MCTS at eval)
+- Win rate vs random with MCTS: **≥99%**
+- Training time: <30 minutes on GPU
+
+### 8x8 Othello (Deterministic 2-Player)
+
+**Reference**: [MiniZero](https://arxiv.org/abs/2310.11305) (IEEE ToG 2024)
+- Training: 300 iterations × 2000 games = 600,000 games
+- Batch size: 1,024
+- Training steps: 60,000
+- Simulations tested: 2, 16, 200
+
+**Key Findings**:
+- AlphaZero outperforms MuZero on Othello (opposite of Go)
+- Gumbel variants (n=16) match AlphaZero (n=200) with equivalent training time
+- Fewer simulations sufficient due to smaller legal move count
+
+**Our Target**:
+- Gumbel AlphaZero with 16 simulations should be competitive
+- Track Elo progression during training
+
+### 2048 (Stochastic 1-Player)
+
+**State-of-the-Art**:
+- [N-tuple networks](https://arxiv.org/abs/2212.11087): 625,377 avg score, 72% rate for 32768-tile
+- [Deep NN](https://tjwei.github.io/2048-NN/): 2048+ in 94%, 4096 in 78%, 8192 in 34%
+
+**Reference**: [LightZero](https://github.com/opendilab/LightZero) - Stochastic MuZero benchmark
+- Uses afterstate dynamics and chance codes
+
+**Our Target (Progressive)**:
+| Milestone | Avg Score | Max Tile Rate |
+|-----------|-----------|---------------|
+| Basic     | 10,000    | 2048 in 50%   |
+| Good      | 50,000    | 4096 in 50%   |
+| Strong    | 100,000   | 8192 in 30%   |
+| SOTA      | 500,000+  | 16384 in 10%  |
+
+### Gumbel AlphaZero Efficiency
+
+**Reference**: ["Policy improvement by planning with Gumbel"](https://openreview.net/forum?id=bERaNdoegnO) (ICLR 2022)
+
+**Key Parameters** (paper defaults for Go/Chess):
+- c_visit = 50, c_scale = 1.0
+- gumbel_k = 16-32
+
+**Low-Simulation Regime** (our tuning for <100 sims):
+- c_visit = 5, c_scale = 5 (for ~10-50 visits per action)
+- σ(Q) = c_scale * Q / (c_visit + max_N)
+
+**Efficiency Claim**:
+- Gumbel MuZero learns with just 2 simulations (vs 16+ for standard)
+- Same performance with 10-50x fewer simulations
 
 ## 2048 Symmetry Augmentation (2025-12-27)
 

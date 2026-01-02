@@ -12,13 +12,13 @@ class AZResnetConfig:
     - `num_blocks`: number of residual blocks
     - `num_channels`: number of channels in each residual block
     - `value_head_out_size`: output size of value head (1 for scalar, 4 for 4-way conditional)
-    - `value_head_type`: "scalar" for single tanh output, "4way" for 4-way conditional logits
+    - `value_head_type`: "scalar" for tanh output [-1,1], "linear" for unbounded output, "4way" for classification
     """
     policy_head_out_size: int
     num_blocks: int
     num_channels: int
     value_head_out_size: int = 1
-    value_head_type: Literal["scalar", "4way"] = "scalar"
+    value_head_type: Literal["scalar", "linear", "4way"] = "scalar"
 
 
 class ResidualBlock(nn.Module):
@@ -69,8 +69,9 @@ class AZResnet(nn.Module):
         # Apply activation based on value_head_type
         # Note: For "4way", we return logits (activation applied in loss/equity functions)
         # For "scalar", we apply tanh for backwards compatibility
+        # For "linear", we return raw output (for continuous reward prediction)
         if self.config.value_head_type == "scalar":
             value = nn.tanh(value)
-        # For "4way", return raw logits (sigmoid applied downstream)
+        # For "linear" and "4way", return raw logits/values
 
         return policy, value

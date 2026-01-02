@@ -127,13 +127,58 @@ def state_to_nn_input(state):
 
 
 def compute_stochastic_probs():
-    """Compute stochastic action probabilities for 2048.
+    """Compute static stochastic action probabilities for 2048.
     32 outcomes: position (0-15) × tile_value (2=90%, 4=10%)
+    This is used as a template/default - actual probs are computed dynamically.
     """
     probs = jnp.zeros(32)
     for pos in range(16):
         probs = probs.at[pos * 2].set(0.9 / 16)      # tile=2 (90%)
         probs = probs.at[pos * 2 + 1].set(0.1 / 16)  # tile=4 (10%)
+    return probs
+
+
+def compute_dynamic_stochastic_probs(state):
+    """Compute stochastic probabilities conditioned on empty cells.
+
+    In 2048, new tiles can only spawn in EMPTY cells.
+    Outcome indexing: outcome = pos * 2 + tile_idx
+    - tile_idx=0: tile value 2 (90% probability)
+    - tile_idx=1: tile value 4 (10% probability)
+
+    This ensures probabilities are correctly weighted by which cells are empty.
+    """
+    # Get the board - shape (4, 4), values are tile exponents (0 = empty)
+    # pgx 2048 uses observation of shape (4, 4, 31) one-hot encoded
+    # The raw board values are in state._board or state.observation
+    # For simplicity, we check if a cell is empty by looking at the first channel
+    # Actually pgx stores board as (4, 4) with log2 values, 0 = empty
+
+    # Access the internal board representation
+    board = state._board  # Shape: (4, 4), values are log2(tile) or 0 for empty
+
+    # Flatten board to (16,)
+    flat_board = board.flatten()
+
+    # Empty cells have value 0
+    empty_mask = (flat_board == 0).astype(jnp.float32)
+    num_empty = jnp.sum(empty_mask)
+
+    # Avoid division by zero - if no empty cells, uniform distribution
+    num_empty_safe = jnp.maximum(num_empty, 1.0)
+
+    # Probability per empty cell
+    prob_per_cell = 1.0 / num_empty_safe
+
+    # Build probability array (32 outcomes)
+    probs = jnp.zeros(32)
+
+    # For each position, set probabilities based on whether cell is empty
+    for pos in range(16):
+        is_empty = empty_mask[pos]
+        probs = probs.at[pos * 2].set(is_empty * prob_per_cell * 0.9)      # tile=2 (90%)
+        probs = probs.at[pos * 2 + 1].set(is_empty * prob_per_cell * 0.1)  # tile=4 (10%)
+
     return probs
 
 
@@ -162,7 +207,8 @@ def run_training(config: dict, num_epochs: int, seed: int = 42):
     az_evaluator = UnifiedMCTS(
         eval_fn=make_nn_eval_fn(resnet, state_to_nn_input),
         action_selector=PUCTSelector(),
-        stochastic_action_probs=stochastic_probs,
+        stochastic_action_probs=stochastic_probs,  # Template for shape
+        stochastic_probs_fn=compute_dynamic_stochastic_probs,  # Dynamic probs based on empty cells
         policy_size=env.num_actions,
         num_iterations=config['mcts_iterations'],
         max_nodes=config['mcts_iterations'] + 100,
@@ -174,7 +220,8 @@ def run_training(config: dict, num_epochs: int, seed: int = 42):
     az_evaluator_test = UnifiedMCTS(
         eval_fn=make_nn_eval_fn(resnet, state_to_nn_input),
         action_selector=PUCTSelector(),
-        stochastic_action_probs=stochastic_probs,
+        stochastic_action_probs=stochastic_probs,  # Template for shape
+        stochastic_probs_fn=compute_dynamic_stochastic_probs,  # Dynamic probs based on empty cells
         policy_size=env.num_actions,
         num_iterations=config['mcts_iterations_test'],
         max_nodes=config['mcts_iterations_test'] + 50,

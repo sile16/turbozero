@@ -302,14 +302,37 @@ def main():
         reward_scale=1.0,  # Pig rewards are already in [-1, 1]
     )
 
+    # Calculate approximate number of epochs (needed for LR schedule)
+    estimated_epochs_per_minute = 4  # Conservative estimate
+    num_epochs = int(TRAINING_TIME_MINUTES * estimated_epochs_per_minute)
+
     # Create trainer
     print("\nCreating trainer...")
+
+    # Learning rate schedule: warmup + cosine decay
+    # AlphaZero uses constant LR but modern practice suggests schedules help
+    lr_warmup_steps = 1000
+    total_train_steps = num_epochs * TRAIN_STEPS_PER_EPOCH
+    lr_schedule = optax.warmup_cosine_decay_schedule(
+        init_value=1e-5,        # Start low
+        peak_value=1e-3,        # Peak learning rate
+        warmup_steps=lr_warmup_steps,
+        decay_steps=total_train_steps,
+        end_value=1e-5,         # End low
+    )
+
+    # Optimizer: Adam with gradient clipping (L2 reg is in loss function)
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0),  # Gradient clipping for stability
+        optax.adam(learning_rate=lr_schedule),
+    )
+
     trainer = Trainer(
         evaluator=mcts_train,
         evaluator_test=mcts_test,
         nn=network,
         loss_fn=az_default_loss_fn,
-        optimizer=optax.adam(1e-3),
+        optimizer=optimizer,
         memory_buffer=replay_buffer,
         batch_size=BATCH_SIZE,
         train_batch_size=TRAIN_BATCH_SIZE,
@@ -334,10 +357,6 @@ def main():
 
     trainer.set_temp_fn(temp_schedule)
 
-    # Calculate approximate number of epochs
-    # This is a rough estimate - we'll break out early based on time
-    estimated_epochs_per_minute = 2  # Conservative
-    num_epochs = int(TRAINING_TIME_MINUTES * estimated_epochs_per_minute * 2)
     print(f"\nStarting training (target: {TRAINING_TIME_MINUTES} min, ~{num_epochs} epochs)...")
     print("=" * 60)
 

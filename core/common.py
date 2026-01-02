@@ -79,7 +79,7 @@ def step_env_and_evaluator(
         env_step_fn=env_step_fn
     )
     # take the selected action
-    step_key, key = jax.random.split(key) # Added for pgx > 2.0 requires key for the step 
+    step_key, key = jax.random.split(key) # Added for pgx > 2.0 requires key for the step
     env_state, env_state_metadata = env_step_fn(env_state, output.action, step_key)
     # check for termination and truncation
     terminated = env_state_metadata.terminated
